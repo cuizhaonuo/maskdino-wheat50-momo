@@ -245,11 +245,18 @@ class MaskDINO(nn.Module):
                     segments_info (list[dict]): Describe each segment in `panoptic_seg`.
                         Each dict contains keys "id", "category_id", "isthing".
         """
+        # import contextvars
+        # contextvars.ContextVar(batched_inputs)
+
         images = [x["image"].to(self.device) for x in batched_inputs]
         images = [(x - self.pixel_mean) / self.pixel_std for x in images]
         images = ImageList.from_tensors(images, self.size_divisibility)
 
         features = self.backbone(images.tensor)
+        # debug：可视化 backbone 热力图
+        # from maskdino.analysis.tool_lab import show_heatmap
+        # show_heatmap(features, batched_inputs,
+        #              save_path="/public/home/zncui/pycharm_project/MaskDINO/myscripts/output_heatmap/dinov3_mean_all_heatmaps.png")
 
         if self.training:
             # dn_args={"scalar":30,"noise_scale":0.4}
@@ -264,7 +271,7 @@ class MaskDINO(nn.Module):
                 targets = None
             outputs,mask_dict = self.sem_seg_head(features,targets=targets)
             # bipartite matching-based loss
-            losses = self.criterion(outputs, targets,mask_dict)
+            losses = self.criterion(outputs, targets, mask_dict)
 
             for k in list(losses.keys()):
                 if k in self.criterion.weight_dict:
@@ -274,7 +281,13 @@ class MaskDINO(nn.Module):
                     losses.pop(k)
             return losses
         else:
+            # 在推理过程中 aux_outputs.pred_masks 是 None，但是在训练的过程中是 (bs, num_queries, H/4, W/4)
             outputs, _ = self.sem_seg_head(features)
+            # test the outputs of interm_outputs and aux_outputs
+            # ...
+            # outputs = outputs['interm_outputs']
+            # outputs = outputs['aux_outputs'][0]
+            # ...
             mask_cls_results = outputs["pred_logits"]
             mask_pred_results = outputs["pred_masks"]
             mask_box_results = outputs["pred_boxes"]
@@ -319,7 +332,6 @@ class MaskDINO(nn.Module):
                     processed_results[-1]["panoptic_seg"] = panoptic_r
 
                 # instance segmentation inference
-
                 if self.instance_on:
                     mask_box_result = mask_box_result.to(mask_pred_result)
                     height = new_size[0]/image_size[0]*height
@@ -350,6 +362,7 @@ class MaskDINO(nn.Module):
                 }
             )
         return new_targets
+
 
     def prepare_targets_detr(self, targets, images):
         h_pad, w_pad = images.tensor.shape[-2:]
@@ -457,6 +470,7 @@ class MaskDINO(nn.Module):
         image_size = mask_pred.shape[-2:]
         scores = mask_cls.sigmoid()  # [100, 80]
         labels = torch.arange(self.sem_seg_head.num_classes, device=self.device).unsqueeze(0).repeat(self.num_queries, 1).flatten(0, 1)
+        # labels = torch.ones_like(self.sem_seg_head.num_classes, device=self.device).unsqueeze(0).repeat(self.num_queries, 1).flatten(0, 1)
         scores_per_image, topk_indices = scores.flatten(0, 1).topk(self.test_topk_per_image, sorted=False)  # select 100
         labels_per_image = labels[topk_indices]
         topk_indices = topk_indices // self.sem_seg_head.num_classes

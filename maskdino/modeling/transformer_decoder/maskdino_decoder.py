@@ -368,6 +368,12 @@ class MaskDINODecoder(nn.Module):
         :param masks: mask in the original image
         :param targets: used for denoising training
         """
+
+        # debug: encoder 输出的 feature 画热力图
+        # x: dict of feature maps Tensor (B, C, H, W)
+        # from maskdino.analysis.tool_lab import draw_encoder_heatmap
+        # draw_encoder_heatmap(x)
+
         assert len(x) == self.num_feature_levels
         device = x[0].device
         size_list = []
@@ -405,9 +411,16 @@ class MaskDINODecoder(nn.Module):
                 output_memory) + output_proposals  # (bs, \sum{hw}, 4) unsigmoid
             topk = self.num_queries
             topk_proposals = torch.topk(enc_outputs_class_unselected.max(-1)[0], topk, dim=1)[1]
+
+            # debug: 探索 topk 来自哪些 feature level
+            # from maskdino.analysis.tool_lab import check_topk_proposals
+            # check_topk_proposals(topk_proposals, level_start_index)
+
             refpoint_embed_undetach = torch.gather(enc_outputs_coord_unselected, 1,
                                                    topk_proposals.unsqueeze(-1).repeat(1, 1, 4))  # unsigmoid
             refpoint_embed = refpoint_embed_undetach.detach()
+
+
 
             tgt_undetach = torch.gather(output_memory, 1,
                                   topk_proposals.unsqueeze(-1).repeat(1, 1, self.hidden_dim))  # unsigmoid
@@ -420,6 +433,13 @@ class MaskDINODecoder(nn.Module):
             interm_outputs['pred_logits'] = outputs_class
             interm_outputs['pred_boxes'] = refpoint_embed_undetach.sigmoid()
             interm_outputs['pred_masks'] = outputs_mask
+
+            # debug: pred_boxes 中间结果绘制到图像上
+            # from maskdino.analysis.tool_lab import draw_bboxes_on_image
+            # draw_bboxes_on_image(interm_outputs['pred_boxes'][0])
+            # debug: pred_boxes 绘制到 heatmap 上
+            # from maskdino.analysis.tool_lab import draw_bboxes_on_heatmap
+            # draw_bboxes_on_heatmap(x, interm_outputs['pred_boxes'][0], topk_proposals, level_start_index)
 
             if self.initialize_box_type != 'no':
                 # convert masks into boxes to better initialize box in the decoder
@@ -435,10 +455,21 @@ class MaskDINODecoder(nn.Module):
                 refpoint_embed = box_ops.box_xyxy_to_cxcywh(refpoint_embed) / torch.as_tensor([w, h, w, h],
                                                                                               dtype=torch.float).to(device)
                 refpoint_embed = refpoint_embed.reshape(outputs_mask.shape[0], outputs_mask.shape[1], 4)
+
+                # debug 检查召回率
+                # from maskdino.analysis.tool_lab import check_recall
+                # check_recall(refpoint_embed, targets)
+
                 refpoint_embed = inverse_sigmoid(refpoint_embed)
         elif not self.two_stage:
             tgt = self.query_feat.weight[None].repeat(bs, 1, 1)
             refpoint_embed = self.query_embed.weight[None].repeat(bs, 1, 1)
+
+        # 此处，产生了几个重要的变量
+        # tgt: (bs, num_queries, hidden_dim), decoder 的 content query
+        # refpoint_embed: (bs, num_queries, 4), decoder 的 position query
+        # tgt, refpoint_embed 都是 learnable 的参数
+        # output_memory: (bs, \sum{hw}, hidden_dim), encoder 的输出
 
         tgt_mask = None
         mask_dict = None
@@ -448,15 +479,41 @@ class MaskDINODecoder(nn.Module):
                 self.prepare_for_dn(targets, None, None, x[0].shape[0])
             if mask_dict is not None:
                 tgt=torch.cat([input_query_label, tgt],dim=1)
+        # 此处 tgt 变成了 (bs, dn_pad + num_queries, hidden_dim)，content query + denoising query
+        # 增加了 dn_pad 个 denoising query
 
         # direct prediction from the matching and denoising part in the begining
         if self.initial_pred:
-            outputs_class, outputs_mask = self.forward_prediction_heads(tgt.transpose(0, 1), mask_features, self.training)
+            # 暂时注释
+            # outputs_class, outputs_mask = self.forward_prediction_heads(tgt.transpose(0, 1), mask_features, self.training)
+
+            # debug: 查看推理时每一层的预测结果
+            # outputs_class, outputs_mask = self.forward_prediction_heads(tgt.transpose(0, 1), mask_features, pred_mask=True)
+
             predictions_class.append(outputs_class)
             predictions_mask.append(outputs_mask)
         if self.dn != "no" and self.training and mask_dict is not None:
             refpoint_embed=torch.cat([input_query_bbox,refpoint_embed],dim=1)
+        # 此处 refpoint_embed 变成了 (bs, dn_pad + num_queries, 4)，position query + denoising query
+        # 增加了 dn_pad 个 denoising query
 
+        '''
+        Result 
+          hs: (num_layers, dn_pad + num_queries, bs, hidden_dim) output content | hidden states of decoder
+          解码器每一层的输出特征
+          references: (num_layers, dn_pad + num_queries, bs, 4) output
+          解码器每一层迭代优化后的参考点（reference points），即边界框的坐标
+        Q K V
+          tgt: (dn_pad + num_queries, bs, hidden_dim) content query
+          refpoint_embed: (dn_pad + num_queries, bs, 4) position query
+          memeory: (\sum{hw}, bs, hidden_dim) key and value
+          以上三个变量都是 transpose 过的，最为关键，是 Transformer decoder 的 Q K V
+        Mask
+          memory_key_padding_mask: (bs, \sum{hw}) padding mask for key and value 
+          此处的 memory_key_padding_mask 全是 False
+          tgt_mask: (dn_pad + num_queries, dn_pad + num_queries) attn mask for content query
+          此处的 tgt_mask 主要是为了让 matching query 看不到 denoising query 之间的信息，让 denoising query 之间也看不到彼此的信息
+        '''
         hs, references = self.decoder(
             tgt=tgt.transpose(0, 1),
             memory=src_flatten.transpose(0, 1),
@@ -468,13 +525,41 @@ class MaskDINODecoder(nn.Module):
             valid_ratios=valid_ratios,
             tgt_mask=tgt_mask
         )
+        # 为所有 decoder 层的输出，添加预测头，得到每一层的分类和掩码预测，所有的特征层共用一个预测头，也就是说参数是共享的
+        # PS：类别和掩码预测头的参数也是共享的，但是预测框的参数不共享
+        # 所有的 hs 都是包含了 denoising query 的
         for i, output in enumerate(hs):
+            # def forward_prediction_heads(self, output, mask_features, pred_mask=True) 这里 pred_mask 与 self.training or (i == len(hs)-1) 等价
+            # 因此只有在训练时，或者在最后一层解码器时，才会进行掩码预测，否则只进行类别预测
+            # 这样做的目的是减少计算量，因为掩码预测比较耗时
+
+            # 暂时注释
             outputs_class, outputs_mask = self.forward_prediction_heads(output.transpose(0, 1), mask_features, self.training or (i == len(hs)-1))
+
+            # debug: 查看推理时每一层的预测结果
+            # outputs_class, outputs_mask = self.forward_prediction_heads(output.transpose(0, 1), mask_features, pred_mask=True)
+
             predictions_class.append(outputs_class)
             predictions_mask.append(outputs_mask)
 
         # iteratively box prediction
+        '''
+        调用 self.pred_box 函数。该函数利用解码器每一层输出的隐藏状态 (hs) 和参考点 (references) 来迭代地优化和预测边界框坐标。
+        如果 self.initial_pred 为 True（表示在解码器之前有一次初始预测），则会将初始的参考点 refpoint_embed 作为优化的起点传入。
+        最终得到 out_boxes，它是一个包含了所有解码层（以及可能的初始预测层）预测的边界框的张量。
+        '''
         if self.initial_pred:
+            '''
+            reference: List num_layers + 1 -- (bsm dn_pad + num_queries, 4)
+            hs: List num_layers -- (bs, dn_pad + num_queries, hidden_dim)
+            refpoint_embed: (bs, dn_pad + num_queries, 4)
+            out_boxes: List num_layers + 1 -- (bs, dn_pad + num_queries, 4)
+            之所以 num_layers + 1，是因为加上了 initial_pred
+            这个 out_boxes 是解码器每一层的预测结果
+            这个 out_boxes 也是包含了 denoising query 的
+            这个 out_boxes 也是包含了 initial_pred 的
+            需要在后续的 loss 和 post-process 中去除
+            '''
             out_boxes = self.pred_box(references, hs, refpoint_embed.sigmoid())
             assert len(predictions_class) == self.num_layers + 1
         else:
@@ -482,12 +567,20 @@ class MaskDINODecoder(nn.Module):
         if mask_dict is not None:
             predictions_mask=torch.stack(predictions_mask)
             predictions_class=torch.stack(predictions_class)
+            # 包含中间的所有结果
+            # predictions_mask: (num_layers + 1, bs, dn_pad + num_queries, h, w)
+            # predictions_class: (num_layers + 1, bs, dn_pad + num_queries, num_classes)
+            # out_boxes: (num_layers + 1, bs, dn_pad + num_queries, 4)
             predictions_class, out_boxes,predictions_mask=\
                 self.dn_post_process(predictions_class,out_boxes,mask_dict,predictions_mask)
             predictions_class,predictions_mask=list(predictions_class),list(predictions_mask)
         elif self.training:  # this is to insure self.label_enc participate in the model
             predictions_class[-1] += 0.0*self.label_enc.weight.sum()
 
+        # 最终的返回结果
+        # 训练中，返回 9 个 decoder 的结果，加上 1 个 tgt 的结果：pred_logits, pred_masks, pred_boxes 是最后一层解码器的结果
+        # aux_outputs 按照顺序，第一个是 tgt 的结果，后面依次是每一层解码器的结果，也就是 1, 2 ... 8 层的结果
+        # 推理中，依然是返回全部的结果，但是不会计算 pred_masks，也就是所有的 pred_masks 都是 None，不论 tgt 还是 9 层解码器的结果
         out = {
             'pred_logits': predictions_class[-1],
             'pred_masks': predictions_mask[-1],

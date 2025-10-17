@@ -156,7 +156,10 @@ class HungarianMatcher(nn.Module):
                     align_corners=False,
                 ).squeeze(1)
 
-                with autocast(enabled=False):
+                # 旧版
+                # with autocast(enabled=False):
+                # 新版
+                with torch.amp.autocast('cuda', enabled=False):
                     out_mask = out_mask.float()
                     tgt_mask = tgt_mask.float()
                     # If there's no annotations

@@ -46,7 +46,7 @@ def get_parser():
     parser = argparse.ArgumentParser(description="maskdino demo for builtin configs")
     parser.add_argument(
         "--config-file",
-        default="configs/coco/instance-segmentation/maskdino_R50_bs16_50ep_3s.yaml",
+        default="../configs/coco/instance-segmentation/maskdino_R50_bs16_50ep_3s.yaml",
         metavar="FILE",
         help="path to config file",
     )

@@ -145,4 +145,20 @@ def add_maskdino_config(cfg):
     cfg.MODEL.SWIN.OUT_FEATURES = ["res2", "res3", "res4", "res5"]
     cfg.MODEL.SWIN.USE_CHECKPOINT = False
 
+    # dinov3_sta backbone
+    cfg.MODEL.DINOV3_STA = CN()
+    # dinov3
+    cfg.MODEL.DINOV3_STA.NAME = "dinov3_vit7b16"
+    cfg.MODEL.DINOV3_STA.WEIGHTS_PATH = "/public/home/zncui/pycharm_project/dinov3/checkpoints/dinov3_vit7b16_pretrain_lvd1689m-a955f4ea.pth"
+    cfg.MODEL.DINOV3_STA.INTERACTION_INDEXES = [9, 19, 29, 39]
+    cfg.MODEL.DINOV3_STA.FINETUNE = False
+    cfg.MODEL.DINOV3_STA.EMBED_DIM = 4096
+    cfg.MODEL.DINOV3_STA.HIDDEN_DIM = 256
+    # optional
+    cfg.MODEL.DINOV3_STA.NUM_HEADS = 3
+    cfg.MODEL.DINOV3_STA.PATCH_SIZE = 16
+    # STA
+    cfg.MODEL.DINOV3_STA.USE_STA = True
+    cfg.MODEL.DINOV3_STA.CONV_INPLANE = 32
+
     cfg.Default_loading=True  # a bug in my d2. resume use this; if first time ResNet load, set it false
