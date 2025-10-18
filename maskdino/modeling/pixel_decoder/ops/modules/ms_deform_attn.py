@@ -96,6 +96,7 @@ class MSDeformAttn(nn.Module):
         assert (input_spatial_shapes[:, 0] * input_spatial_shapes[:, 1]).sum() == Len_in
 
         value = self.value_proj(input_flatten)
+        # 将输入特征中所有被标记为填充（padding）的区域的特征向量都设置为零
         if input_padding_mask is not None:
             value = value.masked_fill(input_padding_mask[..., None], float(0))
         value = value.view(N, Len_in, self.n_heads, self.d_model // self.n_heads)

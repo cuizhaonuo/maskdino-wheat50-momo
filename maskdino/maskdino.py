@@ -269,6 +269,7 @@ class MaskDINO(nn.Module):
                     targets = self.prepare_targets(gt_instances, images)
             else:
                 targets = None
+            # 预处理时已经 pad 好了，不需要在这里 pad 了，因此不传入 mask，即 mask=None
             outputs,mask_dict = self.sem_seg_head(features,targets=targets)
             # bipartite matching-based loss
             losses = self.criterion(outputs, targets, mask_dict)

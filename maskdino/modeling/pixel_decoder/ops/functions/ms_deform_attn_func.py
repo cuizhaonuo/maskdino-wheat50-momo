@@ -63,10 +63,13 @@ def ms_deform_attn_core_pytorch(value, value_spatial_shapes, sampling_locations,
         # N_, Lq_, M_, P_, 2 -> N_, M_, Lq_, P_, 2 -> N_*M_, Lq_, P_, 2
         sampling_grid_l_ = sampling_grids[:, :, :, lid_].transpose(1, 2).flatten(0, 1)
         # N_*M_, D_, Lq_, P_
+        # (8, 32, 100, 100), (8, 300, 4, 2) --> (8, 32, 300, 4)
         sampling_value_l_ = F.grid_sample(value_l_, sampling_grid_l_,
                                           mode='bilinear', padding_mode='zeros', align_corners=False)
         sampling_value_list.append(sampling_value_l_)
     # (N_, Lq_, M_, L_, P_) -> (N_, M_, Lq_, L_, P_) -> (N_, M_, 1, Lq_, L_*P_)
     attention_weights = attention_weights.transpose(1, 2).reshape(N_*M_, 1, Lq_, L_*P_)
+    # (8, 32, 300, 12), (8, 1, 300, 12) --> (8, 32, 300, 12) --> (8, 32, 300) --> (1, 256, 300)
     output = (torch.stack(sampling_value_list, dim=-2).flatten(-2) * attention_weights).sum(-1).view(N_, M_*D_, Lq_)
+    # (1, 256, 300) -> (1, 300, 256)
     return output.transpose(1, 2).contiguous()

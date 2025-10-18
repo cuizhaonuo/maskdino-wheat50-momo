@@ -514,6 +514,8 @@ class MaskDINODecoder(nn.Module):
           tgt_mask: (dn_pad + num_queries, dn_pad + num_queries) attn mask for content query
           此处的 tgt_mask 主要是为了让 matching query 看不到 denoising query 之间的信息，让 denoising query 之间也看不到彼此的信息
         '''
+        # hs <-- intermediate, references <-- ref_points
+        # hs List 9, references List (9+1=10)
         hs, references = self.decoder(
             tgt=tgt.transpose(0, 1),
             memory=src_flatten.transpose(0, 1),

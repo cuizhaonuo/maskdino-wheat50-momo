@@ -116,6 +116,11 @@ class TransformerDecoder(nn.Module):
         device = tgt.device
 
         intermediate = []
+        # refpoints_unsigmoid (reference_points_unsigmoid) --> reference_points
+        # 一共 10 组参考点，也就是 10 组预测框，N=9，初始参考点 + 9 次迭代更新参考点
+        # 按照 decoder 逻辑，后面每一层 decoder 都会更新参考点，会更加精确一些
+        # ref_points [reference_points, new_reference_points0, new_reference_points1, ..., new_reference_pointsN]
+
         reference_points = refpoints_unsigmoid.sigmoid().to(device)
         ref_points = [reference_points]
 
@@ -124,31 +129,43 @@ class TransformerDecoder(nn.Module):
             if self.training and self.decoder_query_perturber is not None and layer_id != 0:
                 reference_points = self.decoder_query_perturber(reference_points)
 
+            # 该行代码此处其实不用考虑，前后数值没有变化，没有 padding 区域，valid_ratios 均为 1
+            # (300, 1, 1, 4) * (1, 1, 3, 4) -> (300, 1, 3, 4)
             reference_points_input = reference_points[:, :, None] \
                                          * torch.cat([valid_ratios, valid_ratios], -1)[None, :]  # nq, bs, nlevel, 4
+            # 位置编码的生成
+            # (300, 1, 4) --> (300, 1, 512)
             query_sine_embed = gen_sineembed_for_position(reference_points_input[:, :, 0, :]) # nq, bs, 256*2
-
+            # 位置编码经过 MLP 处理
+            # (300, 1, 512) --> (300, 1, 256)
             raw_query_pos = self.ref_point_head(query_sine_embed)  # nq, bs, 256
             pos_scale = self.query_scale(output) if self.query_scale is not None else 1
             query_pos = pos_scale * raw_query_pos
 
+            # 输入变量，有几个变量不必要过多关注
+            # tgt_query_sine_embed 此处没有被使用到，位置编码均为 tgt_query_pos
+            # tgt_key_padding_mask 为 None, memory_key_padding_mask 全是 False，没有 padding 区域
+            # memory_pos, cross_attn_mask 此处均为 None
+            # ---
+            # (300, 1, 256) --> (300, 1, 256)
             output = layer(
                 tgt=output,
                 tgt_query_pos=query_pos,
-                tgt_query_sine_embed=query_sine_embed,
-                tgt_key_padding_mask=tgt_key_padding_mask,
+                tgt_query_sine_embed=query_sine_embed, # 没有被使用到
+                tgt_key_padding_mask=tgt_key_padding_mask, # None
                 tgt_reference_points=reference_points_input,
 
                 memory=memory,
-                memory_key_padding_mask=memory_key_padding_mask,
+                memory_key_padding_mask=memory_key_padding_mask, # 无 padding 区域，全是 False
                 memory_level_start_index=level_start_index,
                 memory_spatial_shapes=spatial_shapes,
-                memory_pos=pos,
+                memory_pos=pos, # None
 
                 self_attn_mask=tgt_mask,
-                cross_attn_mask=memory_mask
+                cross_attn_mask=memory_mask # None
             )
-
+            # refinement of reference points
+            # reference_points (sigmoid) --> reference_before_sigmoid (logit) --> outputs_unsig (logit)--> new_reference_points (sigmoid)
             # iter update
             if self.bbox_embed is not None:
                 reference_before_sigmoid = inverse_sigmoid(reference_points)
@@ -162,6 +179,11 @@ class TransformerDecoder(nn.Module):
 
             intermediate.append(self.norm(output))
 
+        # 把 batch size 放到第 0 维度
+        # (300, 1, 256) --> (1, 300, 256)
+        # (300, 1, 4) --> (1, 300, 4)
+        # intermediate: [(nq, bs, d_model), ...] --> 【(bs, nq, d_model)， ...]
+        # ref_points: [(nq, bs, 4), ...] --> 【(bs, nq, 4)， ...]
         return [
             [itm_out.transpose(0, 1) for itm_out in intermediate],
             [itm_refpoint.transpose(0, 1) for itm_refpoint in ref_points]
@@ -237,11 +259,18 @@ class DeformableTransformerDecoderLayer(nn.Module):
                 self_attn_mask: Optional[Tensor] = None,  # mask used for self-attention
                 cross_attn_mask: Optional[Tensor] = None,  # mask used for cross-attention
                 ):
-        """
-        Input:
-            - tgt/tgt_query_pos: nq, bs, d_model
-            -
-        """
+        '''
+        tgt: nq, bs, d_model
+        tgt_query_pos: nq, bs, d_model
+        tgt_query_sine_embed: nq, bs, d_model
+        memory: hw, bs, d_model
+        需要注意，tgt_query_pos 和 tgt_query_sine_embed 虽然都表示位置 embedding，但是不一样的，前者是 MLP(Sine(pos))，后者是 Sine(pos)
+        '''
+        '''
+        self attention
+        query = key = tgt + tgt_query_pos
+        value = tgt
+        '''
         # self attention
         if self.self_attn is not None:
             q = k = self.with_pos_embed(tgt, tgt_query_pos)
@@ -257,6 +286,16 @@ class DeformableTransformerDecoderLayer(nn.Module):
                 tgt = tgt + self.key_aware_proj(memory).mean(0, keepdim=True)
             else:
                 raise NotImplementedError("Unknown key_aware_type: {}".format(self.key_aware_type))
+        '''
+        # cross attention
+        query = tgt + tgt_query_pos 
+        reference_points = tgt_reference_points
+        
+        value = input_flatten = memory
+        input_spatial_shapes = memory_spatial_shapes
+        input_level_start_index = memory_level_start_index 
+        input_padding_mask = memory_key_padding_mask # 全是 False，意思是没有 padding 区域
+        '''
         tgt2 = self.cross_attn(self.with_pos_embed(tgt, tgt_query_pos).transpose(0, 1),
                                tgt_reference_points.transpose(0, 1).contiguous(),
                                memory.transpose(0, 1), memory_spatial_shapes, memory_level_start_index,
