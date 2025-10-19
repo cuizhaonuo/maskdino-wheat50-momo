@@ -140,6 +140,23 @@ class MaskDINODecoder(nn.Module):
         self.label_enc=nn.Embedding(num_classes,hidden_dim)
         self.mask_embed = MLP(hidden_dim, hidden_dim, mask_dim, 3)
 
+        ##### De-Imbalance module #####
+        self.ti_layers = 3  # 补充
+
+        self.oldm_norm = oldm_norm = nn.LayerNorm(hidden_dim)
+        oldm_layer = Token_Interaction_Layer(hidden_dim, dropout, nhead, d_ffn=dim_feedforward,
+                                             activation=activation)
+        self.oldm = Object_Level_Detection_Module(oldm_layer, hidden_dim, oldm_norm, num_layers=self.ti_layers,
+                                                  dec_layer_share=dec_layer_share,
+                                                  second_selected_queries=self.num_queries)
+        self._oldm_bbox_embed = _oldm_bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
+        nn.init.constant_(_oldm_bbox_embed.layers[-1].weight.data, 0)
+        nn.init.constant_(_oldm_bbox_embed.layers[-1].bias.data, 0)
+        oldm_box_embed_layerlist = [_oldm_bbox_embed for i in range(self.ti_layers)]
+        self.oldm_bbox_embed = nn.ModuleList(oldm_box_embed_layerlist)
+        self.oldm.bbox_embed = self.oldm_bbox_embed
+        self.oldm.class_embed = self.class_embed
+
         # init decoder
         self.decoder_norm = decoder_norm = nn.LayerNorm(hidden_dim)
         decoder_layer = DeformableTransformerDecoderLayer(hidden_dim, dim_feedforward,
@@ -360,6 +377,22 @@ class MaskDINODecoder(nn.Module):
         outputs_coord_list = torch.stack(outputs_coord_list)
         return outputs_coord_list
 
+    def oldm_pred_box(self, reference, hs):
+        """
+        :param reference: reference box coordinates from each decoder layer
+        :param hs: content
+        """
+        outputs_coord_list = []
+        for dec_lid, (layer_ref_sig, layer_bbox_embed, layer_hs) in enumerate(zip(reference, self.oldm_bbox_embed, hs)):
+            layer_delta_unsig = layer_bbox_embed(layer_hs)
+            layer_outputs_unsig = layer_delta_unsig + inverse_sigmoid(layer_ref_sig)
+            layer_outputs_unsig = layer_outputs_unsig.sigmoid()
+            layer_outputs_unsig = layer_outputs_unsig.sigmoid()
+            outputs_coord_list.append(layer_outputs_unsig)
+            outputs_coord_list.append(layer_outputs_unsig)
+        outputs_coord_list = torch.stack(outputs_coord_list)
+        return outputs_coord_list
+
     def forward(self, x, mask_features, masks, targets=None):
         """
         :param x: input, a list of multi-scale feature
@@ -409,7 +442,9 @@ class MaskDINODecoder(nn.Module):
             enc_outputs_class_unselected = self.class_embed(output_memory)
             enc_outputs_coord_unselected = self._bbox_embed(
                 output_memory) + output_proposals  # (bs, \sum{hw}, 4) unsigmoid
-            topk = self.num_queries
+            # topk = self.num_queries
+            # the first selection
+            topk = first_selected_queries = self.num_queries * 2
             topk_proposals = torch.topk(enc_outputs_class_unselected.max(-1)[0], topk, dim=1)[1]
 
             # debug: 探索 topk 来自哪些 feature level
@@ -419,8 +454,6 @@ class MaskDINODecoder(nn.Module):
             refpoint_embed_undetach = torch.gather(enc_outputs_coord_unselected, 1,
                                                    topk_proposals.unsqueeze(-1).repeat(1, 1, 4))  # unsigmoid
             refpoint_embed = refpoint_embed_undetach.detach()
-
-
 
             tgt_undetach = torch.gather(output_memory, 1,
                                   topk_proposals.unsqueeze(-1).repeat(1, 1, self.hidden_dim))  # unsigmoid
@@ -465,6 +498,19 @@ class MaskDINODecoder(nn.Module):
             tgt = self.query_feat.weight[None].repeat(bs, 1, 1)
             refpoint_embed = self.query_embed.weight[None].repeat(bs, 1, 1)
 
+        #### De-Imbalanced ####
+        # token interaction and the second selection
+        oldm_predictions_class = []
+        tgt, refpoint_embed, oldm_output, ref_points = self.oldm(tgt.transpose(0, 1),
+                                                                 refpoint_embed.transpose(0, 1),
+                                                                 self_attn_mask=None, valid_ratios=valid_ratios, )
+        for i, output in enumerate(oldm_output):
+            outputs_class, outputs_mask = self.forward_prediction_heads(output.transpose(0, 1), mask_features,
+                                                                        pred_mask=False)
+            oldm_predictions_class.append(outputs_class)
+        oldm_out_boxes = self.oldm_pred_box(ref_points, oldm_output)
+        refpoint_embed = inverse_sigmoid(refpoint_embed)
+
         # 此处，产生了几个重要的变量
         # tgt: (bs, num_queries, hidden_dim), decoder 的 content query
         # refpoint_embed: (bs, num_queries, 4), decoder 的 position query
@@ -485,7 +531,7 @@ class MaskDINODecoder(nn.Module):
         # direct prediction from the matching and denoising part in the begining
         if self.initial_pred:
             # 暂时注释
-            # outputs_class, outputs_mask = self.forward_prediction_heads(tgt.transpose(0, 1), mask_features, self.training)
+            outputs_class, outputs_mask = self.forward_prediction_heads(tgt.transpose(0, 1), mask_features, self.training)
 
             # debug: 查看推理时每一层的预测结果
             # outputs_class, outputs_mask = self.forward_prediction_heads(tgt.transpose(0, 1), mask_features, pred_mask=True)
@@ -589,7 +635,8 @@ class MaskDINODecoder(nn.Module):
             'pred_boxes':out_boxes[-1],
             'aux_outputs': self._set_aux_loss(
                 predictions_class if self.mask_classification else None, predictions_mask,out_boxes
-            )
+            ),
+            'oldm_outputs': self._oldm_set_aux_loss(oldm_predictions_class, oldm_out_boxes)
         }
         if self.two_stage:
             out['interm_outputs'] = interm_outputs
@@ -622,3 +669,151 @@ class MaskDINODecoder(nn.Module):
                 {"pred_logits": a, "pred_masks": b, "pred_boxes":c}
                 for a, b, c in zip(outputs_class[:-1], outputs_seg_masks[:-1], out_boxes[:-1])
             ]
+
+    @torch.jit.unused
+    def _oldm_set_aux_loss(self, outputs_class, out_boxes=None):
+        if out_boxes is None:
+            return [
+                {"pred_logits": a}
+                for a in zip(outputs_class[:])
+            ]
+        else:
+            return [
+                {"pred_logits": a, "pred_boxes": b}
+                for a, b in zip(outputs_class[:], out_boxes[:])
+            ]
+
+from typing import Optional, List, Union
+from torch import nn, Tensor
+from torch.cuda.amp import autocast
+from ...utils.utils import _get_activation_fn, _get_clones, gen_sineembed_for_position
+
+class Object_Level_Detection_Module(nn.Module):
+    def __init__(self, oldm_layer, d_model=256, norm=None,
+                 num_layers=2, dec_layer_share=False, second_selected_queries=300,
+                 ):
+        super().__init__()
+        self.layers = _get_clones(oldm_layer, num_layers, layer_share=dec_layer_share)
+        self.d_model = d_model
+        self.num_layers = num_layers
+        self.ref_point_head = MLP(2 * d_model, d_model, d_model, 2)
+        self.query_scale = None
+        self.bbox_embed = None
+        self.class_embed = None
+        self.norm = norm
+        self.second_selected_queries = second_selected_queries
+    @autocast(enabled=False)
+    def forward(self,
+                tgt: Optional[Tensor],
+                tgt_refpoint_embed: Optional[Tensor] = None,
+                self_attn_mask: Optional[Tensor] = None,
+                valid_ratios: Optional[Tensor] = None,
+                ):
+        interm_output = []
+        ref_points = []
+        output = tgt
+        reference_points = tgt_refpoint_embed.sigmoid()
+        # token interaction
+        for layer_id, layer in enumerate(self.layers):
+            reference_points_input = reference_points[:, :, None] \
+                                     * torch.cat([valid_ratios, valid_ratios], -1)[None, :]
+            query_sine_embed = gen_sineembed_for_position(reference_points_input[:, :, 0, :])
+            raw_query_pos = self.ref_point_head(query_sine_embed)
+            pos_scale = self.query_scale(output) if self.query_scale is not None else 1
+            query_pos = pos_scale * raw_query_pos
+            output = layer(output, query_pos, self_attn_mask)
+            reference_before_sigmoid = inverse_sigmoid(reference_points)
+            delta_unsig = self.bbox_embed[layer_id](output)
+            outputs_unsig = delta_unsig + reference_before_sigmoid
+            new_reference_points = outputs_unsig.sigmoid()
+            reference_points = new_reference_points.detach()
+            ref_points.append(new_reference_points.transpose(0, 1))
+            interm_output.append(self.norm(output).transpose(0, 1))
+        tgt_score = self.class_embed(self.norm(output).transpose(0, 1))
+        # the second selection
+        topk = self.second_selected_queries
+        topk_proposals = torch.topk(tgt_score.max(-1)[0], topk, dim=1)[1]
+        select_output = torch.gather(output, 0, topk_proposals.unsqueeze(-1).repeat(1, 1, self.d_model).transpose(0, 1))
+        select_reference_points = torch.gather(new_reference_points, 0,
+                                               topk_proposals.unsqueeze(-1).repeat(1, 1, 4).transpose(0, 1))
+        return select_output.transpose(0, 1), select_reference_points.transpose(0, 1), interm_output, ref_points
+
+class Token_Interaction_Layer(nn.Module):
+    def __init__(self, d_model=256, dropout=0.1, n_heads=8, activation="relu", d_ffn=1024):
+        super().__init__()
+        self.d_model = d_model
+        # self attention
+        self.self_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout)
+        self.dropout1 = nn.Dropout(dropout)
+        self.norm1 = nn.LayerNorm(d_model)
+        # ffn
+        self.linear1 = nn.Linear(d_model, d_ffn)
+        self.activation = _get_activation_fn(activation)
+        self.dropout2 = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(d_ffn, d_model)
+        self.dropout3 = nn.Dropout(dropout)
+        self.norm2 = nn.LayerNorm(d_model)
+    def forward_ffn(self, tgt):
+        tgt2 = self.linear2(self.dropout2(self.activation(self.linear1(tgt))))
+        tgt = tgt + self.dropout3(tgt2)
+        tgt = self.norm2(tgt)
+        return tgt
+    @staticmethod
+    def with_pos_embed(tensor, pos):
+        return tensor if pos is None else tensor + pos
+    @autocast(enabled=False)
+    def forward(self,
+                tgt: Optional[Tensor],
+                tgt_query_pos: Optional[Tensor] = None,
+                self_attn_mask: Optional[Tensor] = None,
+                ):
+        # self attention
+        if self.self_attn is not None:
+            q = k = self.with_pos_embed(tgt, tgt_query_pos)
+            tgt2 = self.self_attn(q, k, tgt, attn_mask=self_attn_mask)[0]
+            tgt = tgt + self.dropout1(tgt2)
+            tgt = self.norm1(tgt)
+        # ffn
+        tgt = self.forward_ffn(tgt)
+        return tgt
+
+
+class Query_Guide_Feature_Update(nn.Module):
+    def __init__(self, d_model, nhead, dropout=0.0, activation="relu", d_ffn=1024):
+        super().__init__()
+        self.multihead_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        # ffn
+        self.linear1 = nn.Linear(d_model, d_ffn)
+        self.activation = _get_activation_fn(activation)
+        self.dropout2 = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(d_ffn, d_model)
+        self.dropout3 = nn.Dropout(dropout)
+        self.norm2 = nn.LayerNorm(d_model)
+        self._reset_parameters()
+    def _reset_parameters(self):
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+    def forward_ffn(self, tgt):
+        tgt2 = self.linear2(self.dropout2(self.activation(self.linear1(tgt))))
+        tgt = tgt + self.dropout3(tgt2)
+        tgt = self.norm2(tgt)
+        return tgt
+    def with_pos_embed(self, tensor, pos: Optional[Tensor]):
+        return tensor if pos is None else tensor + pos
+    def forward(self, tgt, memory,
+                memory_mask: Optional[Tensor] = None,
+                memory_key_padding_mask: Optional[Tensor] = None,
+                pos: Optional[Tensor] = None,
+                query_pos: Optional[Tensor] = None):
+        tgt2 = self.multihead_attn(query=self.with_pos_embed(tgt, query_pos),
+                                   key=self.with_pos_embed(memory, pos),
+                                   value=memory, attn_mask=memory_mask,
+                                   key_padding_mask=memory_key_padding_mask)[0]
+        tgt = tgt + self.dropout1(tgt2)
+        tgt = self.norm1(tgt)
+        # ffn
+        tgt = self.forward_ffn(tgt)
+        return tgt
