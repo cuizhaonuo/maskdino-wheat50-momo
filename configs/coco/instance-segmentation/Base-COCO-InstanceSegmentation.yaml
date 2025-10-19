@@ -20,7 +20,7 @@ DATASETS:
 #  TEST: ("wheat_coco_val",)
 
 SOLVER:
-  IMS_PER_BATCH: 2 # 8
+  IMS_PER_BATCH: 1 # 8
   BASE_LR: 0.0001
   STEPS: (327778, 355092)
   MAX_ITER: 368750

@@ -157,17 +157,41 @@ class MaskDINODecoder(nn.Module):
         self.oldm.bbox_embed = self.oldm_bbox_embed
         self.oldm.class_embed = self.class_embed
 
+        #####  Balance-Aware Tokens Optimization module #####
+        from ..pixel_decoder.position_encoding import PositionEmbeddingSine
+        from .balance_aware_decoder import BA_TransformerDecoder
+        num_guiding_tokens = 50
+
         # init decoder
+        N_steps = hidden_dim // 2
+        self.pe_layer = PositionEmbeddingSine(N_steps, normalize=True)
+        # Balance-Aware Tokens Optimization module
+        self.query_guide_feature_update = Query_Guide_Feature_Update(d_model=hidden_dim, nhead=nhead, dropout=dropout,
+                                                                     d_ffn=dim_feedforward, activation=activation)
         self.decoder_norm = decoder_norm = nn.LayerNorm(hidden_dim)
-        decoder_layer = DeformableTransformerDecoderLayer(hidden_dim, dim_feedforward,
-                                                          dropout, activation,
+        decoder_layer = DeformableTransformerDecoderLayer(hidden_dim, dim_feedforward, dropout, activation,
                                                           self.num_feature_levels, nhead, dec_n_points)
-        self.decoder = TransformerDecoder(decoder_layer, self.num_layers, decoder_norm,
-                                          return_intermediate=return_intermediate_dec,
-                                          d_model=hidden_dim, query_dim=query_dim,
-                                          num_feature_levels=self.num_feature_levels,
-                                          dec_layer_share=dec_layer_share,
-                                          )
+        self.decoder = BA_TransformerDecoder(decoder_layer, self.num_layers, self.query_guide_feature_update,
+                                             decoder_norm,
+                                             return_intermediate=return_intermediate_dec,
+                                             d_model=hidden_dim, query_dim=query_dim,
+                                             num_feature_levels=self.num_feature_levels,
+                                             dec_layer_share=dec_layer_share,
+                                             num_guiding_tokens=num_guiding_tokens,
+                                             num_queries=self.num_queries,
+                                             )
+
+        # init decoder
+        # self.decoder_norm = decoder_norm = nn.LayerNorm(hidden_dim)
+        # decoder_layer = DeformableTransformerDecoderLayer(hidden_dim, dim_feedforward,
+        #                                                   dropout, activation,
+        #                                                   self.num_feature_levels, nhead, dec_n_points)
+        # self.decoder = TransformerDecoder(decoder_layer, self.num_layers, decoder_norm,
+        #                                   return_intermediate=return_intermediate_dec,
+        #                                   d_model=hidden_dim, query_dim=query_dim,
+        #                                   num_feature_levels=self.num_feature_levels,
+        #                                   dec_layer_share=dec_layer_share,
+        #                                   )
 
         self.hidden_dim = hidden_dim
         self._bbox_embed = _bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
@@ -176,6 +200,9 @@ class MaskDINODecoder(nn.Module):
         box_embed_layerlist = [_bbox_embed for i in range(self.num_layers)]  # share box prediction each layer
         self.bbox_embed = nn.ModuleList(box_embed_layerlist)
         self.decoder.bbox_embed = self.bbox_embed
+        # badecoder add class and mask embed to decoder for convenience
+        self.decoder.class_embed = self.class_embed
+        self.decoder.mask_embed = self.mask_embed
 
 
     @classmethod
@@ -421,6 +448,7 @@ class MaskDINODecoder(nn.Module):
         src_flatten = []
         mask_flatten = []
         spatial_shapes = []
+        pos_flatten = []
         for i in range(self.num_feature_levels):
             idx=self.num_feature_levels-1-i
             bs, c , h, w=x[idx].shape
@@ -428,8 +456,12 @@ class MaskDINODecoder(nn.Module):
             spatial_shapes.append(x[idx].shape[-2:])
             src_flatten.append(self.input_proj[idx](x[idx]).flatten(2).transpose(1, 2))
             mask_flatten.append(masks[i].flatten(1))
+            pos = self.pe_layer(x[idx])
+            pos_embed = pos.flatten(2).transpose(1, 2)
+            pos_flatten.append(pos_embed)
         src_flatten = torch.cat(src_flatten, 1)  # bs, \sum{hxw}, c
         mask_flatten = torch.cat(mask_flatten, 1)  # bs, \sum{hxw}
+        pos_flatten = torch.cat(pos_flatten, 1)
         spatial_shapes = torch.as_tensor(spatial_shapes, dtype=torch.long, device=src_flatten.device)
         level_start_index = torch.cat((spatial_shapes.new_zeros((1,)), spatial_shapes.prod(1).cumsum(0)[:-1]))
         valid_ratios = torch.stack([self.get_valid_ratio(m) for m in masks], 1)
@@ -498,6 +530,12 @@ class MaskDINODecoder(nn.Module):
             tgt = self.query_feat.weight[None].repeat(bs, 1, 1)
             refpoint_embed = self.query_embed.weight[None].repeat(bs, 1, 1)
 
+        # 此处，产生了几个重要的变量
+        # tgt: (bs, num_queries, hidden_dim), decoder 的 content query
+        # refpoint_embed: (bs, num_queries, 4), decoder 的 position query
+        # tgt, refpoint_embed 都是 learnable 的参数
+        # output_memory: (bs, \sum{hw}, hidden_dim), encoder 的输出
+
         #### De-Imbalanced ####
         # token interaction and the second selection
         oldm_predictions_class = []
@@ -510,12 +548,6 @@ class MaskDINODecoder(nn.Module):
             oldm_predictions_class.append(outputs_class)
         oldm_out_boxes = self.oldm_pred_box(ref_points, oldm_output)
         refpoint_embed = inverse_sigmoid(refpoint_embed)
-
-        # 此处，产生了几个重要的变量
-        # tgt: (bs, num_queries, hidden_dim), decoder 的 content query
-        # refpoint_embed: (bs, num_queries, 4), decoder 的 position query
-        # tgt, refpoint_embed 都是 learnable 的参数
-        # output_memory: (bs, \sum{hw}, hidden_dim), encoder 的输出
 
         tgt_mask = None
         mask_dict = None
@@ -562,33 +594,64 @@ class MaskDINODecoder(nn.Module):
         '''
         # hs <-- intermediate, references <-- ref_points
         # hs List 9, references List (9+1=10)
-        hs, references = self.decoder(
+
+        # Decoder
+        # hs, references = self.decoder(
+        #     tgt=tgt.transpose(0, 1),
+        #     memory=src_flatten.transpose(0, 1),
+        #     memory_key_padding_mask=mask_flatten,
+        #     pos=None,
+        #     refpoints_unsigmoid=refpoint_embed.transpose(0, 1),
+        #     level_start_index=level_start_index,
+        #     spatial_shapes=spatial_shapes,
+        #     valid_ratios=valid_ratios,
+        #     tgt_mask=tgt_mask
+        # )
+
+        # Decoder + Prediction Heads
+        # # 为所有 decoder 层的输出，添加预测头，得到每一层的分类和掩码预测，所有的特征层共用一个预测头，也就是说参数是共享的
+        # # PS：类别和掩码预测头的参数也是共享的，但是预测框的参数不共享
+        # # 所有的 hs 都是包含了 denoising query 的
+        # for i, output in enumerate(hs):
+        #     # def forward_prediction_heads(self, output, mask_features, pred_mask=True) 这里 pred_mask 与 self.training or (i == len(hs)-1) 等价
+        #     # 因此只有在训练时，或者在最后一层解码器时，才会进行掩码预测，否则只进行类别预测
+        #     # 这样做的目的是减少计算量，因为掩码预测比较耗时
+        #
+        #     # 暂时注释
+        #     outputs_class, outputs_mask = self.forward_prediction_heads(output.transpose(0, 1), mask_features,
+        #                                                                 self.training or (i == len(hs) - 1))
+        #
+        #     # debug: 查看推理时每一层的预测结果
+        #     # outputs_class, outputs_mask = self.forward_prediction_heads(output.transpose(0, 1), mask_features, pred_mask=True)
+        #
+        #     predictions_class.append(outputs_class)
+        #     predictions_mask.append(outputs_mask)
+
+        # BA Decoder
+        hs, references, updated_mask_features = self.decoder(
             tgt=tgt.transpose(0, 1),
             memory=src_flatten.transpose(0, 1),
             memory_key_padding_mask=mask_flatten,
-            pos=None,
+            pos=pos_flatten,  # use for instance-aware query update feature
             refpoints_unsigmoid=refpoint_embed.transpose(0, 1),
             level_start_index=level_start_index,
             spatial_shapes=spatial_shapes,
             valid_ratios=valid_ratios,
-            tgt_mask=tgt_mask
+            tgt_mask=tgt_mask,
+            mask_features=mask_features,
         )
-        # 为所有 decoder 层的输出，添加预测头，得到每一层的分类和掩码预测，所有的特征层共用一个预测头，也就是说参数是共享的
-        # PS：类别和掩码预测头的参数也是共享的，但是预测框的参数不共享
-        # 所有的 hs 都是包含了 denoising query 的
+        # BA Decoder + Prediction Heads
         for i, output in enumerate(hs):
-            # def forward_prediction_heads(self, output, mask_features, pred_mask=True) 这里 pred_mask 与 self.training or (i == len(hs)-1) 等价
-            # 因此只有在训练时，或者在最后一层解码器时，才会进行掩码预测，否则只进行类别预测
-            # 这样做的目的是减少计算量，因为掩码预测比较耗时
-
-            # 暂时注释
-            outputs_class, outputs_mask = self.forward_prediction_heads(output.transpose(0, 1), mask_features, self.training or (i == len(hs)-1))
-
-            # debug: 查看推理时每一层的预测结果
-            # outputs_class, outputs_mask = self.forward_prediction_heads(output.transpose(0, 1), mask_features, pred_mask=True)
-
+            if i == 0:
+                outputs_class, outputs_mask = self.forward_prediction_heads(output.transpose(0, 1), mask_features,
+                                                                            self.training or (i == len(hs) - 1))
+            else:
+                outputs_class, outputs_mask = self.forward_prediction_heads(output.transpose(0, 1),
+                                                                            updated_mask_features,
+                                                                            self.training or (i == len(hs) - 1))
             predictions_class.append(outputs_class)
             predictions_mask.append(outputs_mask)
+
 
         # iteratively box prediction
         '''
