@@ -185,17 +185,30 @@ class SetCriterion(nn.Module):
         assert 'pred_logits' in outputs
         src_logits = outputs['pred_logits']
 
+        # (300 src, 37 tgt) --> (37, 37) 行 id, 列 id
+        # List[tuple(37, 37), (19, 19), (44, 44)] --> tuple(100, 100), 列 id concat，前者表示 batch id, 后者表示列 id，也就是 target id 其中 100 = sum(37,19,44)
         idx = self._get_src_permutation_idx(indices)
+        # (100,) target classes
         target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
+        # (3 batch_size, 300 num_queries) 填充 num_classes
         target_classes = torch.full(src_logits.shape[:2], self.num_classes,
                                     dtype=torch.int64, device=src_logits.device)
+        # 将 target_classes_o 填充到 target_classes 中对应的位置
+        # 300 个 query 中，有 100 个是有目标的，target_classes_o 存储的就是这 100 个 query 对应的类别
+        # (3, 300) ~ (100, 100) --> (100,) = target_classes_o (100,)
+        # (100, 100) --> (0, 37), (1, 19), (2, 44) 第 0 行填充 37 个， 第 1 行填充 19 个， 第 2 行填充 44 个
         target_classes[idx] = target_classes_o
 
+        # (3, 300, num_classes + 1) ～ (3, 300, 1)
         target_classes_onehot = torch.zeros([src_logits.shape[0], src_logits.shape[1], src_logits.shape[2]+1],
                                             dtype=src_logits.dtype, layout=src_logits.layout, device=src_logits.device)
         target_classes_onehot.scatter_(2, target_classes.unsqueeze(-1), 1)
-
+        # (3, 300, num_classes + 1) --> (3, 300, num_classes)
         target_classes_onehot = target_classes_onehot[:,:,:-1]
+
+        # 以上代码的作用是将目标类别转换为 one-hot 编码形式，方便后续计算 focal loss
+
+        # (3, 300, num_classes), (3, 300, num_classes), 100, 0.25, 2 --> 0.0039 * 300 = 1.17
         loss_ce = sigmoid_focal_loss(src_logits, target_classes_onehot, num_boxes, alpha=self.focal_alpha, gamma=2) * src_logits.shape[1]
         losses = {'loss_ce': loss_ce}
 
@@ -290,6 +303,8 @@ class SetCriterion(nn.Module):
             align_corners=False,
         ).squeeze(1)
 
+        # (N, num_points), (N, num_points), float --> 'loss_mask': 0.5
+        # (N, num_points), (N, num_points), float --> 'loss_dice': 0.3
         losses = {
             "loss_mask": sigmoid_ce_loss_jit(point_logits, point_labels, num_masks),
             "loss_dice": dice_loss_jit(point_logits, point_labels, num_masks),
@@ -365,6 +380,13 @@ class SetCriterion(nn.Module):
         num_masks = torch.clamp(num_masks / get_world_size(), min=1).item()
 
         # Compute all the requested losses
+        '''
+        loss: string
+        outputs: dict of tensors(pred_logits, pred_boxes, pred_masks) and dicts(aux_outputs list of dicts)
+        targets: list of dicts(labels, boxes, masks)
+        indices: list of tuples
+        num_masks: float
+        '''
         losses = {}
         for loss in self.losses:
             losses.update(self.get_loss(loss, outputs, targets, indices, num_masks))
