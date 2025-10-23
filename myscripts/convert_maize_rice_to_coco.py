@@ -233,14 +233,17 @@ def build_coco_annotation(category, ann_dir, filtered_dir):
         'licenses': [],
         'images': [],
         'annotations': [],
-        'categories': [{'id': 1, 'name': category}]
+        'categories': [{'id': 1 if category == 'maize' else 2, 'name': category}]
     }
 
     ann_start = 10000 if category == 'maize' else 20000
     image_start = 30000 if category == 'maize' else 40000
 
+    image_idx = image_start
+    ann_idx = ann_start
     for idx, ann in enumerate(tqdm(ann_list, desc='Visualizing grouped masks')):
         with open(ann, 'r') as f:
+            image_idx = image_idx + 1
             data = json.load(f)
             image_name = data[0]['image_name']
             img_path = os.path.join(filtered_dir, image_name)
@@ -257,8 +260,6 @@ def build_coco_annotation(category, ann_dir, filtered_dir):
             # 分组
             grouped_data = get_group_id_to_data(data)
 
-
-            image_idx = image_start + idx
             image_info = {
                 'file_name': image_name,
                 'height': h,
@@ -322,8 +323,8 @@ def build_coco_annotation(category, ann_dir, filtered_dir):
                 ann_info['area'] = int(maskUtils.area(coco_rle))
                 bbox = maskUtils.toBbox(coco_rle)
                 ann_info['bbox'] = [float(b) for b in bbox]
-                ann_start = ann_start + rle_idx
-                ann_info['id'] = ann_start + rle_idx
+                ann_idx = ann_idx + 1
+                ann_info['id'] = ann_idx
                 coco_annotation['annotations'].append(ann_info)
 
     coco_ann_path = os.path.join(target_dataset_dir, 'annotations', f'instances_total_{category}.json')
@@ -332,8 +333,8 @@ def build_coco_annotation(category, ann_dir, filtered_dir):
     print(f'Saved COCO annotation to {coco_ann_path}')
     return coco_ann_path
 
-coco_maize_ann_path = build_coco_annotation('maize', maize_ann_dir, filtered_maize_dir)
-coco_rice_ann_path = build_coco_annotation('rice',  rice_ann_dir,  filtered_rice_dir)
+# coco_maize_ann_path = build_coco_annotation('maize', maize_ann_dir, filtered_maize_dir)
+# coco_rice_ann_path = build_coco_annotation('rice',  rice_ann_dir,  filtered_rice_dir)
 
 # 将标注绘制到图像上进行可视化
 def visualize_coco_annotations(coco_ann_path, images_dir, out_dir):
@@ -454,11 +455,21 @@ def merge_coco_annotations(maize_ann_path, rice_ann_path, output_path):
 merged_ann_path = os.path.join(target_dataset_dir, 'annotations', 'instances_total_maize_rice.json')
 merge_coco_annotations(coco_maize_ann_path, coco_rice_ann_path, merged_ann_path)
 
+# 检查合并后的标注文件
+def collect_annids(coco_ann_path):
+    with open(coco_ann_path, 'r') as f:
+        coco_data = json.load(f)
+    ann_ids = []
+    for ann in coco_data['annotations']:
+        ann_id = ann['id']
+        ann_ids.append(ann_id)
+    print(f'Total annotations: {len(ann_ids)}')
+    print(f'Unique annotation IDs: {len(set(ann_ids))}')
+collect_annids(merged_ann_path)
+
 # images_dir = '/public/home/zncui/datasets/maize_rice_dataset/total/images/maize_rice'
 # visualize_coco_annotations(merged_ann_path, images_dir, os.path.join(target_dataset_dir, 'vis_coco', 'maize_rice'))
 # print('Visualization of merged annotations completed.')
-
-# 以上问题已经排除
 
 # 将训练集、验证集和测试集的划分也合并
 def merge_coco_splits(maize_ann_path, rice_ann_path, output_prefix):
