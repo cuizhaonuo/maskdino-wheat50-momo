@@ -14,9 +14,9 @@ MODEL:
     # NORM: "SyncBN"。
     RES5_MULTI_GRID: [1, 1, 1]  # not used
 DATASETS:
-
   TRAIN: ("wheat_coco_train",)
   TEST: ("wheat_coco_val",)
+
 
 SOLVER:
   IMS_PER_BATCH: 8

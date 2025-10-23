@@ -118,14 +118,14 @@ def visualize_split(
         file_name = img_info["file_name"]
         h, w = img_info["height"], img_info["width"]
         img_path = osp.join(img_root, file_name)
-        if not osp.isfile(img_path):
-            # 有些 COCO 标注可能 file_name 不含子目录，这里兜底再拼一次
-            alt = osp.join(img_root, osp.basename(file_name))
-            if osp.isfile(alt):
-                img_path = alt
-            else:
-                print(f"[WARN] missing image: {img_path}")
-                continue
+        # if not osp.isfile(img_path):
+        #     # 有些 COCO 标注可能 file_name 不含子目录，这里兜底再拼一次
+        #     alt = osp.join(img_root, osp.basename(file_name))
+        #     if osp.isfile(alt):
+        #         img_path = alt
+        #     else:
+        #         print(f"[WARN] missing image: {img_path}")
+        #         continue
 
         img_det = cv2.imread(img_path, cv2.IMREAD_COLOR)
         img_seg = cv2.imread(img_path, cv2.IMREAD_COLOR)
@@ -154,9 +154,33 @@ def visualize_split(
                 mask = polygon_to_mask(seg, h, w)
             elif isinstance(seg, dict) and "size" in seg and "counts" in seg:
                 # RLE
-                mask = rle_to_mask(seg)
+                # mask = rle_to_mask(seg)
+                from pycocotools import mask as maskUtils
+                def decode_coco_rle_to_mask(coco_rle):
+                    """
+                    将 COCO RLE 解码回二值掩码 (HxW)
+                    """
+                    rle = coco_rle.copy()
+                    # 确保 counts 是 bytes
+                    if isinstance(rle.get('counts'), str):
+                        rle['counts'] = rle['counts'].encode('ascii')
+                    return maskUtils.decode(rle).astype(np.uint8)
+                mask = decode_coco_rle_to_mask(seg)
             if mask is not None:
-                overlay_mask(img_seg, mask, color, alpha=alpha)
+                # overlay_mask(img_seg, mask, color, alpha=alpha)
+                def overlay_mask_on_image(img_bgr, mask, color_bgr=None, alpha=0.5):
+                    """
+                    在 BGR 图上叠加单个二值掩码（0/1），返回新图。
+                    """
+                    import random
+                    if color_bgr is None:
+                        color_bgr = (random.randint(0, 255), random.randint(0, 255), random.randint(0, 255))
+                    overlay = img_bgr.copy()
+                    overlay[mask.astype(bool)] = (
+                            overlay[mask.astype(bool)] * (1 - alpha) + np.array(color_bgr, dtype=np.float32) * alpha
+                    ).astype(np.uint8)
+                    return overlay
+                img_seg = overlay_mask_on_image(img_seg, mask, color_bgr=color, alpha=alpha)
 
         # ---- save ----
         out_det_path = osp.join(out_det_dir, osp.basename(file_name))
