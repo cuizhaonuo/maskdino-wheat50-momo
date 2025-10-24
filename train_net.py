@@ -11,6 +11,7 @@ try:
     import warnings
     warnings.filterwarnings('ignore', category=ShapelyDeprecationWarning)
     warnings.filterwarnings("ignore", category=FutureWarning)
+    warnings.filterwarnings("ignore", category=UserWarning)
 except:
     pass
 
