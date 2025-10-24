@@ -485,7 +485,7 @@ class MaskDINODecoder(nn.Module):
         # direct prediction from the matching and denoising part in the begining
         if self.initial_pred:
             # 暂时注释
-            # outputs_class, outputs_mask = self.forward_prediction_heads(tgt.transpose(0, 1), mask_features, self.training)
+            outputs_class, outputs_mask = self.forward_prediction_heads(tgt.transpose(0, 1), mask_features, self.training)
 
             # debug: 查看推理时每一层的预测结果
             # outputs_class, outputs_mask = self.forward_prediction_heads(tgt.transpose(0, 1), mask_features, pred_mask=True)
