@@ -62,8 +62,6 @@ MODEL:
     DN: "seg"
     DN_NUM: 100
     INITIALIZE_BOX_TYPE: 'bitmask'
-    # no bbox
-    BOX_LOSS: False
     TEST:
       SEMANTIC_ON: False
       INSTANCE_ON: True
