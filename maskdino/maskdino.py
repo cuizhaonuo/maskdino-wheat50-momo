@@ -43,6 +43,9 @@ class MaskDINO(nn.Module):
         sem_seg_postprocess_before_inference: bool,
         pixel_mean: Tuple[float],
         pixel_std: Tuple[float],
+        # maskrcnn
+        proposal_generator,
+        roi_heads,
         # inference
         semantic_on: bool,
         panoptic_on: bool,
@@ -96,6 +99,10 @@ class MaskDINO(nn.Module):
         self.sem_seg_postprocess_before_inference = sem_seg_postprocess_before_inference
         self.register_buffer("pixel_mean", torch.Tensor(pixel_mean).view(-1, 1, 1), False)
         self.register_buffer("pixel_std", torch.Tensor(pixel_std).view(-1, 1, 1), False)
+
+        # maskrcnn
+        self.proposal_generator = proposal_generator
+        self.roi_heads = roi_heads
 
         # additional args
         self.semantic_on = semantic_on
@@ -187,7 +194,16 @@ class MaskDINO(nn.Module):
             semantic_ce_loss=cfg.MODEL.MaskDINO.TEST.SEMANTIC_ON and cfg.MODEL.MaskDINO.SEMANTIC_CE_LOSS and not cfg.MODEL.MaskDINO.TEST.PANOPTIC_ON,
         )
 
+        from detectron2.layers import ShapeSpec
+        from detectron2.modeling.proposal_generator import build_proposal_generator
+        from detectron2.modeling.roi_heads import build_roi_heads
+        input_shape = {'res4': ShapeSpec(channels=1024, height=None, width=None, stride=16)}
+        proposal_generator = build_proposal_generator(cfg, backbone.output_shape())
+        roi_heads = build_roi_heads(cfg, input_shape)
+
         return {
+            "proposal_generator": proposal_generator,
+            "roi_heads": roi_heads,
             "backbone": backbone,
             "sem_seg_head": sem_seg_head,
             "criterion": criterion,
@@ -261,6 +277,7 @@ class MaskDINO(nn.Module):
         if self.training:
             # dn_args={"scalar":30,"noise_scale":0.4}
             # mask classification target
+            gt_instances = None
             if "instances" in batched_inputs[0]:
                 gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
                 if 'detr' in self.data_loader:
@@ -280,6 +297,14 @@ class MaskDINO(nn.Module):
                 else:
                     # remove this loss if not specified in `weight_dict`
                     losses.pop(k)
+
+            # add maskrcnn loss
+            rcnn_features = {'res4': features['res4']}
+            proposals, proposal_losses = self.proposal_generator(images, rcnn_features, gt_instances)
+            _, detector_losses = self.roi_heads(images, rcnn_features, proposals, gt_instances)
+            losses.update(detector_losses)
+            losses.update(proposal_losses)
+
             return losses
         else:
             # 在推理过程中 aux_outputs.pred_masks 是 None，但是在训练的过程中是 (bs, num_queries, H/4, W/4)
