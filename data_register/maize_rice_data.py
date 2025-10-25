@@ -5,12 +5,12 @@ from detectron2.data import MetadataCatalog
 # ====== 注册 maize_rice 数据集 ======
 register_coco_instances(
     "maize_rice_coco_train", {},
-    "/public/home/zncui/datasets/maize_rice_dataset/coco/annotations/instances_train2017.json",
+    "/public/home/zncui/datasets/maize_rice_dataset/coco/poly_annotations/instances_train2017.json",
     "/public/home/zncui/datasets/maize_rice_dataset/coco/train2017"
 )
 register_coco_instances(
     "maize_rice_coco_val", {},
-    "/public/home/zncui/datasets/maize_rice_dataset/coco/annotations/instances_val2017.json",
+    "/public/home/zncui/datasets/maize_rice_dataset/coco/poly_annotations/instances_val2017.json",
     "/public/home/zncui/datasets/maize_rice_dataset/coco/val2017"
 )
 

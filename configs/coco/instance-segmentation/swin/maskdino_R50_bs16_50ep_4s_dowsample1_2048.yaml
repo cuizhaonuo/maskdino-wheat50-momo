@@ -1,4 +1,4 @@
-_BASE_: ./Wheat-Swin-COCO-InstanceSegmentation.yaml
+_BASE_: ./Maize-Rice-Swin-COCO-InstanceSegmentation.yaml
 MODEL:
   META_ARCHITECTURE: "MaskDINO"
   BACKBONE:
