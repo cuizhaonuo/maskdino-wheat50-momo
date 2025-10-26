@@ -18,13 +18,13 @@ DATASETS:
   TRAIN: ("maize_rice_coco_train",)
   TEST: ("maize_rice_coco_val",)
 
-# 400 / 6 ims_per_batch --> 70 iters per epoch
-# 70 * 100 epoch = 7000 iters
+# 400 / 4 ims_per_batch --> 100 iters per epoch
+# 100 * 100 = 10000 iters for 100 epochs
 SOLVER:
-  IMS_PER_BATCH: 6
+  IMS_PER_BATCH: 4
   BASE_LR: 0.0001
-  MAX_ITER: 8000
-  STEPS: (6400, 6800)
+  MAX_ITER: 12000
+  STEPS: (9000, 9500)
   WARMUP_ITERS: 140        # 可以稍微拉长 warmup
   WEIGHT_DECAY: 0.05
   OPTIMIZER: "ADAMW"
