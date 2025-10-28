@@ -21,8 +21,8 @@ DATASETS:
 # 400 / 4 ims_per_batch --> 100 iters per epoch
 # 100 * 100 = 10000 iters for 100 epochs
 SOLVER:
-  IMS_PER_BATCH: 4
-  BASE_LR: 0.0001
+  IMS_PER_BATCH: 3
+  BASE_LR: 0.00001
   MAX_ITER: 12000
   STEPS: (9000, 9500)
   WARMUP_ITERS: 140        # 可以稍微拉长 warmup
@@ -30,7 +30,7 @@ SOLVER:
   OPTIMIZER: "ADAMW"
   BACKBONE_MULTIPLIER: 0.1
   CLIP_GRADIENTS:
-    ENABLED: True
+    ENABLED: False
     CLIP_TYPE: "full_model"
     CLIP_VALUE: 0.01
     NORM_TYPE: 2.0
