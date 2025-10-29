@@ -1,0 +1,1 @@
+guo score 0.3414 nms_iou 0.5586

@@ -1,0 +1,15 @@
+_BASE_: ./config.yaml
+
+
+MODEL:
+  SEM_SEG_HEAD:
+    NUM_CLASSES: 2
+  # 下面避免有坑
+  ROI_HEADS:
+    NUM_CLASSES: 2
+  RETINANET:
+    NUM_CLASSES: 2
+  ROI_BOX_HEAD:
+    FED_LOSS_NUM_CLASSES: 2
+
+
