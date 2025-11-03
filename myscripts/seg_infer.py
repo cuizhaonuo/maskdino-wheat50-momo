@@ -35,6 +35,15 @@ import numpy as np
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 
+try:
+    from shapely.errors import ShapelyDeprecationWarning
+    import warnings
+    warnings.filterwarnings('ignore', category=ShapelyDeprecationWarning)
+    warnings.filterwarnings("ignore", category=FutureWarning)
+    warnings.filterwarnings("ignore", category=UserWarning)
+except:
+    pass
+
 # ====== Detectron2 ======
 from detectron2.config import get_cfg
 from detectron2.engine import DefaultPredictor
@@ -84,7 +93,7 @@ def ensure_dir(p: str):
     os.makedirs(p, exist_ok=True)
 
 def list_images_in_dir(d: str) -> List[str]:
-    exts = ("*.jpg", "*.jpeg", "*.png", "*.bmp", "*.tif", "*.tiff")
+    exts = ("*.jpg", "*.jpeg", "*.png", "*.bmp", "*.tif", "*.tiff", "*.JPG", "*.JPEG", "*.PNG", "*.BMP", "*.TIF", "*.TIFF")
     files = []
     for e in exts:
         files.extend(glob.glob(os.path.join(d, e)))
@@ -211,6 +220,12 @@ class SegInferenceTemplate:
               f"score_thr={best_cfg['score_thr']:.4f}, nms_iou_thr={best_cfg['nms_iou_thr']:.4f}, "
               f"sum|GT-Pred|={best_sum_diff}")
 
+        # 将 print 输出保存到文件
+        with open(os.path.join(self.outputs.out_dir, "best_params_on_val.txt"), "w", encoding="utf-8") as f:
+            f.write(f"[Best on VAL] iou_type={best_cfg['iou_type'].value}, "
+                    f"score_thr={best_cfg['score_thr']:.4f}, nms_iou_thr={best_cfg['nms_iou_thr']:.4f}, "
+                    f"sum|GT-Pred|={best_sum_diff}\n")
+
         print("==> Running TEST with best parameters ...")
         self._run_on_split("test", best_cfg['iou_type'], best_cfg['score_thr'], best_cfg['nms_iou_thr'])
 
@@ -245,6 +260,22 @@ class SegInferenceTemplate:
             with open(csv_path, "w", encoding="utf-8") as f:
                 for r in rows: f.write(f"{r[0]},{r[1]},{r[2]}\n")
             print(f"[Saved] CSV -> {csv_path}")
+            # def diff_count(csv_path, out_dir):
+            #     import pandas as pd
+            #     df = pd.read_csv(csv_path)
+            #     df["abs_diff"] = (df["ins_counts"] - df["pred_counts"]).abs()
+            #     total_abs_diff = df["abs_diff"].sum()
+            #     total_ins = df["ins_counts"].sum()
+            #     percentage = (total_abs_diff / total_ins) * 100
+            #     print("总绝对差值:", total_abs_diff)
+            #     print("ins_counts 总数:", total_ins)
+            #     print(f"百分比: {percentage:.2f}%")
+            #     # 将 print 输出保存到文件
+            #     with open(os.path.join(out_dir, f"{split}_diff_count.txt"), "w", encoding="utf-8") as f:
+            #         f.write(f"总绝对差值: {total_abs_diff}\n")
+            #         f.write(f"ins_counts 总数: {total_ins}\n")
+            #         f.write(f"百分比: {percentage:.2f}%\n")
+            # diff_count(csv_path, self.outputs.out_dir)
 
         if self.outputs.draw_scatter and xs:
             self._draw_scatter(xs, ys, os.path.join(self.outputs.out_dir, f"scatter_{split}.png"))
@@ -266,6 +297,7 @@ class SegInferenceTemplate:
         x_list = list(range(0, max(1, W - tile + 1), stride))
         if x_list[-1] != max(0, W - tile): x_list.append(max(0, W - tile))
 
+        score_deleted = 0
         for y0 in y_list:
             for x0 in x_list:
                 tile_img = np.full((tile, tile, 3), padv, dtype=np.uint8)
@@ -275,9 +307,11 @@ class SegInferenceTemplate:
                 valid_mask = np.zeros((tile, tile), dtype=bool); valid_mask[:h, :w] = True
 
                 insts = self.infer_tile(tile_img)
+                # print(f"[Debug] Tile ({x0},{y0}) - got {len(insts)} instances")
                 for ins in insts:
                     score = float(ins["score"])
                     if score < self.search.base_keep_score:
+                        score_deleted += 1
                         continue
                     bbox = np.array(ins["bbox"], dtype=float)
                     mask = np.logical_and(ins["mask"].astype(bool), valid_mask)
@@ -310,29 +344,51 @@ class SegInferenceTemplate:
                         left=int(gx1),
                         area=area
                     ))
+        # print(f"[Debug] Total proposals before NMS: {len(proposals)}, deleted by base score: {score_deleted}")
         return proposals
 
     def _grid_search(self, val_cache: Dict[str, List[DetProposal]],
-                     val_gt_counts: Dict[str, int]) -> Tuple[Dict[str, Any], int]:
-        score_list = linspace_inclusive(*self.search.score_thr_range)
-        nms_list = linspace_inclusive(*self.search.nms_iou_thr_range)
-        iou_types = [IOUType(t) for t in self.search.iou_types]
-        best_cfg, best_sum = None, 1 << 62
-        total = len(score_list) * len(nms_list) * len(iou_types)
-        pbar = tqdm(total=total, desc="Grid search")
-        for iout in iou_types:
-            for s_thr in score_list:
-                for n_thr in nms_list:
-                    sum_diff = 0
-                    for img_path, props in val_cache.items():
-                        pred = len(self._apply_thresh_nms(props, s_thr, n_thr, iout))
-                        sum_diff += abs(val_gt_counts[img_path] - pred)
-                    if sum_diff < best_sum:
-                        best_sum = sum_diff
-                        best_cfg = {"iou_type": iout, "score_thr": s_thr, "nms_iou_thr": n_thr}
-                    pbar.update(1)
-        pbar.close()
-        return best_cfg, best_sum
+                         val_gt_counts: Dict[str, int]) -> Tuple[Dict[str, Any], int]:
+            score_list = linspace_inclusive(*self.search.score_thr_range)
+            nms_list = linspace_inclusive(*self.search.nms_iou_thr_range)
+            iou_types = [IOUType(t) for t in self.search.iou_types]
+            best_cfg, best_sum = None, 1 << 62
+            total = len(score_list) * len(nms_list) * len(iou_types)
+            pbar = tqdm(total=total, desc="Grid search")
+
+            # 保存所有搜索结果
+            results = []
+
+            for iout in iou_types:
+                for s_thr in score_list:
+                    for n_thr in nms_list:
+                        sum_diff = 0
+                        for img_path, props in val_cache.items():
+                            pred = len(self._apply_thresh_nms(props, s_thr, n_thr, iout))
+                            sum_diff += abs(val_gt_counts[img_path] - pred)
+
+                        results.append({
+                            "iou_type": iout.value,
+                            "score_thr": s_thr,
+                            "nms_thr": n_thr,
+                            "sum_diff": sum_diff
+                        })
+
+                        if sum_diff < best_sum:
+                            best_sum = sum_diff
+                            best_cfg = {"iou_type": iout, "score_thr": s_thr, "nms_iou_thr": n_thr}
+                        pbar.update(1)
+            pbar.close()
+
+            # 保存到 CSV
+            csv_path = os.path.join(self.outputs.out_dir, "grid_search_results.csv")
+            with open(csv_path, "w", encoding="utf-8") as f:
+                f.write("iou_type,score_thr,nms_thr,sum_diff\n")
+                for r in results:
+                    f.write(f"{r['iou_type']},{r['score_thr']:.4f},{r['nms_thr']:.4f},{r['sum_diff']}\n")
+            print(f"[Saved] Grid search results -> {csv_path}")
+
+            return best_cfg, best_sum
 
     def _apply_thresh_nms(self, proposals: List[DetProposal],
                           score_thr: float, nms_thr: float, iou_type: IOUType) -> List[DetProposal]:
@@ -346,17 +402,42 @@ class SegInferenceTemplate:
         overlay = img.copy()
         rng = np.random.default_rng(12345)
         for d in dets:
-            color = rng.integers(0, 255, size=3, dtype=np.uint8).tolist()
+            color = rng.integers(30, 255, size=3, dtype=np.uint8).tolist()
             y1, y2 = d.top, int(d.top + d.mask.shape[0])
             x1, x2 = d.left, int(d.left + d.mask.shape[1])
-            roi = overlay[y1:y2, x1:x2]
+            # roi = overlay[y1:y2, x1:x2]
             m = d.mask
-            roi[m] = (0.6 * roi[m] + 0.4 * np.array(color, dtype=np.uint8)).astype(np.uint8)
+            # roi[m] = (0.2 * roi[m] + 0.8 * np.array(color, dtype=np.uint8)).astype(np.uint8)
             if draw_contour:
                 m8 = (m.astype(np.uint8) * 255)
                 contours, _ = cv2.findContours(m8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                 cv2.drawContours(img[y1:y2, x1:x2], contours, -1, color, 2)
-        vis = cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0)
+
+            draw_center = True
+            if draw_center:
+                ys, xs = np.where(m > 0)
+                if len(xs) > 0 and len(ys) > 0:
+                    cx = int(x1 + np.mean(xs))
+                    cy = int(y1 + np.mean(ys))
+                    cv2.circle(img, (cx, cy), radius=6, color=(0, 0, 255), thickness=-1)  # 红色点
+
+        # vis = cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0)
+
+        # 在 img 上绘制 5x3 的网格
+        h, w = img.shape[:2]
+        # 可配置的网格与样式
+        grid_rows = 5
+        grid_cols = 3
+        line_color = (255, 0, 0)  # BGR 中的蓝色
+        thickness = 2
+        for i in range(1, grid_rows):
+            y = i * h // grid_rows
+            cv2.line(img, (0, y), (w, y), color=line_color, thickness=thickness)
+        for j in range(1, grid_cols):
+            x = j * w // grid_cols
+            cv2.line(img, (x, 0), (x, h), color=line_color, thickness=thickness)
+
+        vis = img
         ensure_dir(out_dir)
         cv2.imwrite(os.path.join(out_dir, os.path.basename(img_path)), vis)
 
@@ -519,19 +600,19 @@ def build_argparser():
 
     # Search space (used only in --mode search)
     p.add_argument("--score_start", type=float, default=0.1)
-    p.add_argument("--score_end", type=float, default=0.8)
-    p.add_argument("--score_num", type=int, default=30)
+    p.add_argument("--score_end", type=float, default=0.6)
+    p.add_argument("--score_num", type=int, default=6)
     p.add_argument("--nms_start", type=float, default=0.1)
-    p.add_argument("--nms_end", type=float, default=0.8)
-    p.add_argument("--nms_num", type=int, default=30)
+    p.add_argument("--nms_end", type=float, default=0.6)
+    p.add_argument("--nms_num", type=int, default=12)
     p.add_argument("--iou_types", type=str, nargs="+", default=["IOU", "IOU_Min"])
     p.add_argument("--base_keep_score", type=float, default=0.01)
 
     # Infer-only fixed params
     p.add_argument("--infer_split", choices=["test", "val", "train"], default="test")
-    p.add_argument("--fix_iou_type", choices=["IOU", "IOU_Min"], default="IOU")
-    p.add_argument("--fix_score_thr", type=float, default=0.3414)
-    p.add_argument("--fix_nms_iou_thr", type=float, default=0.5586)
+    p.add_argument("--fix_iou_type", choices=["IOU", "IOU_Min"], default="IOU_Min")
+    p.add_argument("--fix_score_thr", type=float, default=0.5)
+    p.add_argument("--fix_nms_iou_thr", type=float, default=0.6)
 
     # Outputs
     p.add_argument("--out_dir", type=str, default="./swinl_guo_big_images")
