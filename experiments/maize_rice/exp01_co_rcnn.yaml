@@ -4,12 +4,22 @@ _BASE_: ./config.yaml
 MODEL:
   SEM_SEG_HEAD:
     NUM_CLASSES: 2
-  # 下面避免有坑
-  ROI_HEADS:
-    NUM_CLASSES: 2
   RETINANET:
     NUM_CLASSES: 2
   ROI_BOX_HEAD:
     FED_LOSS_NUM_CLASSES: 2
+#  # add maskrcnn loss
+#  RPN:
+#    PRE_NMS_TOPK_TEST: 6000
+#    POST_NMS_TOPK_TEST: 1000
+#  ROI_HEADS:
+#    NAME: "Res5ROIHeads"
+#    NUM_CLASSES: 2
+#  # bug 主要是为了适配 swinl
+#  RESNETS:
+#    RES2_OUT_CHANNELS: 192
 
-
+SOLVER:
+  IMS_PER_BATCH: 2
+  MAX_ITER: 15000
+  STEPS: (10000, 13000)

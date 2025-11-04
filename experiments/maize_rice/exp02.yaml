@@ -1,0 +1,28 @@
+_BASE_: ./config.yaml
+
+MODEL:
+  SEM_SEG_HEAD:
+    NUM_CLASSES: 2
+  RETINANET:
+    NUM_CLASSES: 2
+  ROI_BOX_HEAD:
+    FED_LOSS_NUM_CLASSES: 2
+  MaskDINO:
+#    TRAIN_NUM_POINTS: 19600      # 12544 → 19600，提升边界采样密度
+#    COST_CLASS_WEIGHT: 2.0       # 4.0 → 2.0
+#    CLASS_WEIGHT: 2.0            # 4.0 → 2.0
+#    COST_MASK_WEIGHT: 6.0        # 5.0 → 6.0
+#    COST_DICE_WEIGHT: 6.0        # 5.0 → 6.0
+    NUM_OBJECT_QUERIES: 800     # 500 → 700（若每图显著>300实例）
+    NO_OBJECT_WEIGHT: 0.2       # 0.1 → 0.2（假阳性多就加大负类权重）
+#    TEST:
+#      OBJECT_MASK_THRESHOLD: 0.20    # 0.25 → 0.20，保召回
+#      OVERLAP_THRESHOLD: 0.50
+
+#INPUT:
+#  IMAGE_SIZE: 1280
+
+#SOLVER:
+#  IMS_PER_BATCH: 2
+#  MAX_ITER: 15000
+#  STEPS: (10000, 13000)
