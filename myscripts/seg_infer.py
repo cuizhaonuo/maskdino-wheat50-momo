@@ -181,6 +181,115 @@ def mask_nms(proposals: List[DetProposal], iou_thr: float, iou_type: IOUType) ->
                 suppressed[j_idx] = True
     return [proposals[i] for i in keep]
 
+def _merge_two_proposals(a: DetProposal, b: DetProposal, score_mode: str = "keep_max") -> DetProposal:
+    """
+    将 proposal b 合并进 proposal a，返回新的 proposal
+    - 掩码：做布尔并集（OR）
+    - 位置：在全局坐标构建并集包围框，拼接两者 mask，再裁剪到 mask 的紧致外接框
+    - bbox/top/left/area：按合并后掩码重算
+    - score：'keep_max' 保留较大分数；'area_weighted' 用面积加权平均
+    - label：沿用 a 的 label（若需要也可改为面积/分数多数表决）
+    """
+    # 1) 计算全局并集包围框
+    ax1, ay1 = a.left, a.top
+    ax2, ay2 = a.left + a.mask.shape[1], a.top + a.mask.shape[0]
+    bx1, by1 = b.left, b.top
+    bx2, by2 = b.left + b.mask.shape[1], b.top + b.mask.shape[0]
+
+    ux1, uy1 = min(ax1, bx1), min(ay1, by1)
+    ux2, uy2 = max(ax2, bx2), max(ay2, by2)
+    U_w, U_h = int(ux2 - ux1), int(uy2 - uy1)
+
+    # 2) 将两个局部 mask 放到并集坐标的大画布上
+    canvas = np.zeros((U_h, U_w), dtype=bool)
+    # a 的偏移
+    ay_off, ax_off = a.top - uy1, a.left - ux1
+    canvas[ay_off:ay_off + a.mask.shape[0], ax_off:ax_off + a.mask.shape[1]] |= a.mask
+    # b 的偏移
+    by_off, bx_off = b.top - uy1, b.left - ux1
+    canvas[by_off:by_off + b.mask.shape[0], bx_off:bx_off + b.mask.shape[1]] |= b.mask
+
+    # 3) 对合成后的 mask 做紧致裁剪（去掉全零边框）
+    if not canvas.any():
+        # 理论上不会发生（因为 a、b 至少一个有像素）
+        new_mask = canvas
+        tight_x1 = tight_y1 = 0
+    else        :
+        ys, xs = np.where(canvas)
+        tight_x1, tight_x2 = xs.min(), xs.max() + 1
+        tight_y1, tight_y2 = ys.min(), ys.max() + 1
+        new_mask = canvas[tight_y1:tight_y2, tight_x1:tight_x2]
+
+    # 4) 组合后的全局左上角、bbox、面积
+    new_left = int(ux1 + tight_x1)
+    new_top  = int(uy1 + tight_y1)
+    new_h, new_w = new_mask.shape[0], new_mask.shape[1]
+    new_bbox = np.array([new_left, new_top, new_left + new_w, new_top + new_h], dtype=float)
+    new_area = int(new_mask.sum())
+
+    # 5) 分数策略
+    if score_mode == "area_weighted":
+        # 面积加权（更平滑）：注意避免除零
+        denom = max(1, a.area + b.area)
+        new_score = float((a.score * a.area + b.score * b.area) / denom)
+    else:
+        # 默认：保留较大分数（保持“以高分实例为主”的语义）
+        new_score = float(max(a.score, b.score))
+
+    return DetProposal(
+        bbox=new_bbox,
+        score=new_score,
+        label=a.label,          # 如需也可做多数表决
+        mask=new_mask.astype(bool),
+        top=int(new_top),
+        left=int(new_left),
+        area=int(new_area),
+    )
+
+
+def mask_nms_with_merge(proposals: List[DetProposal],
+                        iou_thr: float,
+                        iou_type: IOUType,
+                        score_mode: str = "keep_max") -> List[DetProposal]:
+    """
+    合并版 Mask-NMS：
+    - 先按 score 从高到低排序
+    - 取当前最高分为“基准实例”，将与其 IOU/IOU_Min ≥ 阈值的其他实例合并到它上面（mask 取并，重算 bbox/area/score）
+    - 合并完成后，得到新的“基准实例”，继续扫描余下实例是否还与它重叠，直到无可合并为止
+    - 进入下一高分实例重复上述过程
+    """
+    if not proposals:
+        return []
+
+    # 按分数从大到小
+    order = sorted(range(len(proposals)), key=lambda i: proposals[i].score, reverse=True)
+    used = np.zeros(len(proposals), dtype=bool)
+    merged_results: List[DetProposal] = []
+
+    for idx in order:
+        if used[idx]:
+            continue
+
+        # 以当前最高分为“基准实例”，逐步把可合并的并进来
+        base = proposals[idx]
+        used[idx] = True
+
+        changed = True
+        # 因为 base 在合并过程中会变化，这里迭代扫描直到不再发生合并
+        while changed:
+            changed = False
+            for j in order:
+                if used[j]:
+                    continue
+                iou = mask_iou_between(base, proposals[j], iou_type)
+                if iou >= iou_thr:
+                    base = _merge_two_proposals(base, proposals[j], score_mode=score_mode)
+                    used[j] = True
+                    changed = True  # 发生了合并，需要再扫一遍（新的 base 可能与更多实例相交）
+
+        merged_results.append(base)
+
+    return merged_results
 
 # -----------------------------
 # Template base
@@ -253,7 +362,7 @@ class SegInferenceTemplate:
             rows.append((os.path.basename(img_path), gt_count, pred_count))
             xs.append(gt_count); ys.append(pred_count)
             if self.outputs.vis:
-                self._visualize_and_save(img_path, final_dets, self.outputs.out_dir)
+                self._visualize_and_save(img_path, final_dets, self.outputs.out_dir, draw_contour=True)
 
         if self.outputs.excel:
             csv_path = os.path.join(self.outputs.out_dir, f"{split}_pred_vs_gt.csv")
@@ -297,7 +406,6 @@ class SegInferenceTemplate:
         x_list = list(range(0, max(1, W - tile + 1), stride))
         if x_list[-1] != max(0, W - tile): x_list.append(max(0, W - tile))
 
-        score_deleted = 0
         for y0 in y_list:
             for x0 in x_list:
                 tile_img = np.full((tile, tile, 3), padv, dtype=np.uint8)
@@ -307,11 +415,9 @@ class SegInferenceTemplate:
                 valid_mask = np.zeros((tile, tile), dtype=bool); valid_mask[:h, :w] = True
 
                 insts = self.infer_tile(tile_img)
-                # print(f"[Debug] Tile ({x0},{y0}) - got {len(insts)} instances")
                 for ins in insts:
                     score = float(ins["score"])
                     if score < self.search.base_keep_score:
-                        score_deleted += 1
                         continue
                     bbox = np.array(ins["bbox"], dtype=float)
                     mask = np.logical_and(ins["mask"].astype(bool), valid_mask)
@@ -344,7 +450,6 @@ class SegInferenceTemplate:
                         left=int(gx1),
                         area=area
                     ))
-        # print(f"[Debug] Total proposals before NMS: {len(proposals)}, deleted by base score: {score_deleted}")
         return proposals
 
     def _grid_search(self, val_cache: Dict[str, List[DetProposal]],
@@ -393,7 +498,9 @@ class SegInferenceTemplate:
     def _apply_thresh_nms(self, proposals: List[DetProposal],
                           score_thr: float, nms_thr: float, iou_type: IOUType) -> List[DetProposal]:
         fil = [p for p in proposals if p.score >= score_thr]
-        return mask_nms(fil, nms_thr, iou_type) if fil else []
+        # return mask_nms(fil, nms_thr, iou_type) if fil else []
+        # 'keep_max'：合并后保留较大 score；想更平滑可改 'area_weighted'
+        return mask_nms_with_merge(fil, nms_thr, iou_type, score_mode="keep_max") if fil else []
 
     def _visualize_and_save(self, img_path: str, dets: List[DetProposal],
                             out_dir: str, alpha: float = 0.8, draw_contour: bool = False):
@@ -423,19 +530,19 @@ class SegInferenceTemplate:
 
         # vis = cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0)
 
-        # 在 img 上绘制 5x3 的网格
-        h, w = img.shape[:2]
-        # 可配置的网格与样式
-        grid_rows = 5
-        grid_cols = 3
-        line_color = (255, 0, 0)  # BGR 中的蓝色
-        thickness = 2
-        for i in range(1, grid_rows):
-            y = i * h // grid_rows
-            cv2.line(img, (0, y), (w, y), color=line_color, thickness=thickness)
-        for j in range(1, grid_cols):
-            x = j * w // grid_cols
-            cv2.line(img, (x, 0), (x, h), color=line_color, thickness=thickness)
+        # # 在 img 上绘制 5x3 的网格
+        # h, w = img.shape[:2]
+        # # 可配置的网格与样式
+        # grid_rows = 5
+        # grid_cols = 3
+        # line_color = (255, 0, 0)  # BGR 中的蓝色
+        # thickness = 2
+        # for i in range(1, grid_rows):
+        #     y = i * h // grid_rows
+        #     cv2.line(img, (0, y), (w, y), color=line_color, thickness=thickness)
+        # for j in range(1, grid_cols):
+        #     x = j * w // grid_cols
+        #     cv2.line(img, (x, 0), (x, h), color=line_color, thickness=thickness)
 
         vis = img
         ensure_dir(out_dir)
@@ -611,7 +718,7 @@ def build_argparser():
     # Infer-only fixed params
     p.add_argument("--infer_split", choices=["test", "val", "train"], default="test")
     p.add_argument("--fix_iou_type", choices=["IOU", "IOU_Min"], default="IOU_Min")
-    p.add_argument("--fix_score_thr", type=float, default=0.5)
+    p.add_argument("--fix_score_thr", type=float, default=0.1)
     p.add_argument("--fix_nms_iou_thr", type=float, default=0.6)
 
     # Outputs
