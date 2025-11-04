@@ -354,13 +354,18 @@ class SegInferenceTemplate:
 
         rows = [("filename", "ins_counts", "pred_counts")]
         xs, ys = [], []
-        for img_path in tqdm(images, desc=f"{split.upper()} images"):
+        for idx, img_path in tqdm(enumerate(images, 1), desc=f"{split.upper()} images"):
             proposals = self._proposals_for_image(img_path)
             final_dets = self._apply_thresh_nms(proposals, score_thr, nms_iou_thr, iou_type)
             pred_count = len(final_dets)
             gt_count = yolo_count_instances(yolo_label_path_for_image(img_path, self.dataset.yolo_root))
             rows.append((os.path.basename(img_path), gt_count, pred_count))
             xs.append(gt_count); ys.append(pred_count)
+            save_coco = True
+            if save_coco:
+                img_id = idx * 100000
+                start_ins_id = img_id
+                self._save_coco_annotation(img_id, start_ins_id, img_path, final_dets, self.outputs.out_dir)
             if self.outputs.vis:
                 self._visualize_and_save(img_path, final_dets, self.outputs.out_dir, draw_contour=True)
 
@@ -502,6 +507,83 @@ class SegInferenceTemplate:
         # 'keep_max'：合并后保留较大 score；想更平滑可改 'area_weighted'
         return mask_nms_with_merge(fil, nms_thr, iou_type, score_mode="keep_max") if fil else []
 
+    def _save_coco_annotation(self, img_id, start_ins_id, img_path: str, dets: List[DetProposal], out_dir: str):
+            """
+            将检测结果保存为 COCO 格式的标注文件
+            segmentation 使用 polygon 形式
+            """
+            import json
+
+            img = cv2.imread(img_path)
+            if img is None:
+                return
+
+            H, W = img.shape[:2]
+            img_name = os.path.basename(img_path)
+
+            # COCO 格式结构
+            coco_output = {
+                "info": {},
+                "licenses": [],
+                "images": [{
+                    "id": img_id,
+                    "file_name": img_name,
+                    "width": W,
+                    "height": H
+                }],
+                "annotations": [],
+                "categories": [{"id": 1, "name": "wheat"}]
+            }
+
+            ins_id = start_ins_id
+            for idx, d in enumerate(dets, start=1):
+                # 获取 mask 的轮廓
+                mask_uint8 = (d.mask.astype(np.uint8) * 255)
+                contours, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+                if not contours:
+                    continue
+
+                # 转换为 COCO polygon 格式 (全局坐标)
+                segmentation = []
+                for contour in contours:
+                    if len(contour) < 3:  # 至少需要3个点
+                        continue
+                    polygon = []
+                    for point in contour:
+                        x = float(d.left + point[0][0])
+                        y = float(d.top + point[0][1])
+                        polygon.extend([x, y])
+
+                    if len(polygon) >= 6:  # 至少3个点(6个坐标值)
+                        segmentation.append(polygon)
+
+                if not segmentation:
+                    continue
+
+                # 计算 bbox (COCO 格式: [x, y, width, height])
+                x1, y1, x2, y2 = d.bbox
+                bbox = [float(x1), float(y1), float(x2 - x1), float(y2 - y1)]
+
+                annotation = {
+                    "id": ins_id + idx,
+                    "image_id": img_id,
+                    "category_id": 1,
+                    "segmentation": segmentation,
+                    "area": float(d.area),
+                    "bbox": bbox,
+                    "iscrowd": 0,
+                }
+                coco_output["annotations"].append(annotation)
+
+            # 保存 JSON 文件
+            ensure_dir(out_dir)
+            json_name = os.path.splitext(img_name)[0] + ".json"
+            json_path = os.path.join(out_dir, json_name)
+
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(coco_output, f, indent=2, ensure_ascii=False)
+
     def _visualize_and_save(self, img_path: str, dets: List[DetProposal],
                             out_dir: str, alpha: float = 0.8, draw_contour: bool = False):
         img = cv2.imread(img_path)
@@ -519,14 +601,27 @@ class SegInferenceTemplate:
                 m8 = (m.astype(np.uint8) * 255)
                 contours, _ = cv2.findContours(m8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                 cv2.drawContours(img[y1:y2, x1:x2], contours, -1, color, 2)
-
+            score = d.score
             draw_center = True
             if draw_center:
                 ys, xs = np.where(m > 0)
+                # if len(xs) > 0 and len(ys) > 0:
+                #     cx = int(x1 + np.mean(xs))
+                #     cy = int(y1 + np.mean(ys))
+                #     cv2.circle(img, (cx, cy), radius=6, color=(0, 0, 255), thickness=-1)  # 红色点
+
+                # score > 0.5 红色， 0.2~0.5 黄色，<0.2 绿色
                 if len(xs) > 0 and len(ys) > 0:
                     cx = int(x1 + np.mean(xs))
                     cy = int(y1 + np.mean(ys))
-                    cv2.circle(img, (cx, cy), radius=6, color=(0, 0, 255), thickness=-1)  # 红色点
+                    if score > 0.5:
+                        point_color = (0, 0, 255)  # 红色
+                    elif score > 0.2:
+                        point_color = (0, 255, 255)  # 黄色
+                    else:
+                        point_color = (0, 255, 0)  # 绿色
+                    cv2.circle(img, (cx, cy), radius=6, color=point_color, thickness=-1)
+
 
         # vis = cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0)
 
@@ -718,8 +813,8 @@ def build_argparser():
     # Infer-only fixed params
     p.add_argument("--infer_split", choices=["test", "val", "train"], default="test")
     p.add_argument("--fix_iou_type", choices=["IOU", "IOU_Min"], default="IOU_Min")
-    p.add_argument("--fix_score_thr", type=float, default=0.1)
-    p.add_argument("--fix_nms_iou_thr", type=float, default=0.6)
+    p.add_argument("--fix_score_thr", type=float, default=0.4)
+    p.add_argument("--fix_nms_iou_thr", type=float, default=0.372)
 
     # Outputs
     p.add_argument("--out_dir", type=str, default="./swinl_guo_big_images")
@@ -766,6 +861,8 @@ def main():
             score_thr=args.fix_score_thr,
             nms_iou_thr=args.fix_nms_iou_thr
         )
+
+
 
 if __name__ == "__main__":
     # 延迟导入 torch（仅在需要时），避免无 GPU 环境卡顿
