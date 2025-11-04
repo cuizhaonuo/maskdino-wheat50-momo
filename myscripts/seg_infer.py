@@ -591,7 +591,8 @@ class SegInferenceTemplate:
         overlay = img.copy()
         rng = np.random.default_rng(12345)
         for d in dets:
-            color = rng.integers(30, 255, size=3, dtype=np.uint8).tolist()
+            # color = rng.integers(30, 255, size=3, dtype=np.uint8).tolist()
+            color = (255, 0, 0)  # 蓝色(BGR)
             y1, y2 = d.top, int(d.top + d.mask.shape[0])
             x1, x2 = d.left, int(d.left + d.mask.shape[1])
             # roi = overlay[y1:y2, x1:x2]
@@ -602,7 +603,7 @@ class SegInferenceTemplate:
                 contours, _ = cv2.findContours(m8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                 cv2.drawContours(img[y1:y2, x1:x2], contours, -1, color, 2)
             score = d.score
-            draw_center = True
+            draw_center = False
             if draw_center:
                 ys, xs = np.where(m > 0)
                 # if len(xs) > 0 and len(ys) > 0:
