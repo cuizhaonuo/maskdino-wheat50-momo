@@ -224,6 +224,10 @@ class DeformableTransformerDecoderLayer(nn.Module):
         self.key_aware_type = key_aware_type
         self.key_aware_proj = None
 
+        # attn score
+        self.d_model = d_model
+        self.query_embed = nn.Linear(self.d_model, self.d_model * 2)
+
     def rm_self_attn_modules(self):
         self.self_attn = None
         self.dropout2 = None
@@ -278,6 +282,12 @@ class DeformableTransformerDecoderLayer(nn.Module):
         # if debug:
             q = k = self.with_pos_embed(tgt, tgt_query_pos)
             tgt2 = self.self_attn(q, k, tgt, attn_mask=self_attn_mask)[0]
+
+            # gated attention
+            tgt, score = self.query_embed(tgt).split([self.d_model, self.d_model], dim=-1)
+            q = k = self.with_pos_embed(tgt, tgt_query_pos)
+            tgt2 = self.self_attn(q, k, tgt, attn_mask=self_attn_mask)[0]
+            tgt2 = tgt2 * score.sigmoid()
 
             # debug: 可视化 attention weights
             # tgt2, attn_output_weights = self.self_attn(q, k, tgt, attn_mask=self_attn_mask, average_attn_weights=False)
