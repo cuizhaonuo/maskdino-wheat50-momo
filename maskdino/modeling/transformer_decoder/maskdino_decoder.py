@@ -376,7 +376,7 @@ class MaskDINODecoder(nn.Module):
 
         assert len(x) == self.num_feature_levels
         device = x[0].device
-        size_list = []
+        # size_list = []
         # disable mask, it does not affect performance
         enable_mask = 0
         if masks is not None:
@@ -385,13 +385,13 @@ class MaskDINODecoder(nn.Module):
                     enable_mask = 1
         if enable_mask == 0:
             masks = [torch.zeros((src.size(0), src.size(2), src.size(3)), device=src.device, dtype=torch.bool) for src in x]
-        src_flatten = []
-        mask_flatten = []
-        spatial_shapes = []
+        src_flatten = [] # h_idx x w_idx，逆序列增加
+        mask_flatten = [] # h_i x w_i，正序列增加，此处可以不考虑该变量的作用，因为 mask 全部是 False，不影响结果
+        spatial_shapes = [] # (h_idx, w_idx)，逆序列增加
         for i in range(self.num_feature_levels):
             idx=self.num_feature_levels-1-i
             bs, c , h, w=x[idx].shape
-            size_list.append(x[i].shape[-2:])
+            # size_list.append(x[i].shape[-2:])
             spatial_shapes.append(x[idx].shape[-2:])
             src_flatten.append(self.input_proj[idx](x[idx]).flatten(2).transpose(1, 2))
             mask_flatten.append(masks[i].flatten(1))
@@ -400,6 +400,10 @@ class MaskDINODecoder(nn.Module):
         spatial_shapes = torch.as_tensor(spatial_shapes, dtype=torch.long, device=src_flatten.device)
         level_start_index = torch.cat((spatial_shapes.new_zeros((1,)), spatial_shapes.prod(1).cumsum(0)[:-1]))
         valid_ratios = torch.stack([self.get_valid_ratio(m) for m in masks], 1)
+        # 以上的代码主要是为了将多尺度的 feature map 展平，并计算相关的空间形状和有效比例
+        # 主要关注：src_flatten, level_start_index
+        # 其中 size_list 没有用到，而 mask_flatten 全为 False，valid_ratios 全是 1 可以不必过多关注
+        # 此处的 mask_flatten 和 valid_ratios 是为了解决解决图像 padding 后的无效区域对注意力机制的影响，但在这里由于没有 padding，所以它们不会影响结果
 
         predictions_class = []
         predictions_mask = []
@@ -409,8 +413,13 @@ class MaskDINODecoder(nn.Module):
             enc_outputs_class_unselected = self.class_embed(output_memory)
             enc_outputs_coord_unselected = self._bbox_embed(
                 output_memory) + output_proposals  # (bs, \sum{hw}, 4) unsigmoid
+            # enc_outputs_coord_unselected = output_proposals
             topk = self.num_queries
             topk_proposals = torch.topk(enc_outputs_class_unselected.max(-1)[0], topk, dim=1)[1]
+
+            # debug: 查看 enc_outputs_class_unselected 类别热力图
+            # from maskdino.analysis.tool_lab import draw_encoder_class_heatmap
+            # draw_encoder_class_heatmap(enc_outputs_class_unselected.max(-1)[0][0], level_start_index, spatial_shapes)
 
             # debug: 探索 topk 来自哪些 feature level
             # from maskdino.analysis.tool_lab import check_topk_proposals
@@ -420,6 +429,11 @@ class MaskDINODecoder(nn.Module):
                                                    topk_proposals.unsqueeze(-1).repeat(1, 1, 4))  # unsigmoid
             refpoint_embed = refpoint_embed_undetach.detach()
 
+            # debug: 观察偏移点
+            # from maskdino.analysis.tool_lab import draw_center_point_on_image
+            # proposal_boxes = torch.gather(output_proposals, 1,
+            #                                        topk_proposals.unsqueeze(-1).repeat(1, 1, 4))
+            # draw_center_point_on_image(refpoint_embed.sigmoid()[0], proposal_boxes.sigmoid()[0])
 
 
             tgt_undetach = torch.gather(output_memory, 1,
@@ -439,7 +453,7 @@ class MaskDINODecoder(nn.Module):
             # draw_bboxes_on_image(interm_outputs['pred_boxes'][0])
             # debug: pred_boxes 绘制到 heatmap 上
             # from maskdino.analysis.tool_lab import draw_bboxes_on_heatmap
-            # draw_bboxes_on_heatmap(x, interm_outputs['pred_boxes'][0], topk_proposals, level_start_index)
+            # draw_bboxes_on_heatmap(x, refpoint_embed.sigmoid()[0], proposal_boxes.sigmoid()[0], topk_proposals[0], level_start_index)
 
             if self.initialize_box_type != 'no':
                 # convert masks into boxes to better initialize box in the decoder
