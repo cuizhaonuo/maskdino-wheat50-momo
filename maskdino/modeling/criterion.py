@@ -355,6 +355,10 @@ class SetCriterion(nn.Module):
                     output_idx = tgt_idx = torch.tensor([]).long().cuda()
                 exc_idx.append((output_idx, tgt_idx))
         indices = self.matcher(outputs_without_aux, targets)
+        # debug: 可视化正负样本匹配结果
+        # from maskdino.analysis.tool_lab import visualize_matching
+        # visualize_matching(indices, outputs, targets)
+
         # Compute the average number of target boxes accross all nodes, for normalization purposes
         num_masks = sum(len(t["labels"]) for t in targets)
         num_masks = torch.as_tensor(
