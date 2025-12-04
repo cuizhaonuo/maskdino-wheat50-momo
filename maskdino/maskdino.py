@@ -248,22 +248,22 @@ class MaskDINO(nn.Module):
         images = [x["image"].to(self.device) for x in batched_inputs]
 
         # debug: 处理过的图像名保存到一个 txt 文件中
-        with open("/public/home/zncui/pycharm_project/MaskDINO/myscripts/processed_image_names.txt", "a") as f:
-            for x in batched_inputs:
-                if "file_name" in x:
-                    f.write(x["file_name"] + "\n")
+        # with open("/public/home/zncui/pycharm_project/MaskDINO/myscripts/processed_image_names.txt", "a") as f:
+        #     for x in batched_inputs:
+        #         if "file_name" in x:
+        #             f.write(x["file_name"] + "\n")
 
         # debug: 可视化 transformed image
         # 将张量从 GPU 移至 CPU，并转换为 NumPy 数组
         # Detectron2 加载的图像通常是 BGR 格式，范围是 [0, 255]
         # cv2.imwrite 也需要 BGR 格式的图像
-        import cv2
-        import numpy as np
-        img = images[0].detach().cpu().permute(1, 2, 0).numpy()
-        img = np.clip(img, 0, 255).astype(np.uint8)
-        img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-        save_path = "/public/home/zncui/pycharm_project/MaskDINO/myscripts/transformed_image.jpg"
-        cv2.imwrite(save_path, img_bgr)
+        # import cv2
+        # import numpy as np
+        # img = images[0].detach().cpu().permute(1, 2, 0).numpy()
+        # img = np.clip(img, 0, 255).astype(np.uint8)
+        # img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        # save_path = "/public/home/zncui/pycharm_project/MaskDINO/myscripts/transformed_image.jpg"
+        # cv2.imwrite(save_path, img_bgr)
 
         images = [(x - self.pixel_mean) / self.pixel_std for x in images]
         images = ImageList.from_tensors(images, self.size_divisibility)

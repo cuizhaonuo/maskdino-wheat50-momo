@@ -26,6 +26,7 @@ from detectron2.utils.logger import setup_logger
 from maskdino import add_maskdino_config
 from predictor import VisualizationDemo
 
+from data_register import uav_register_datasets
 
 # constants
 WINDOW_NAME = "mask2former demo"
@@ -116,6 +117,7 @@ if __name__ == "__main__":
             img = read_image(path, format="BGR")
             start_time = time.time()
             predictions, visualized_output = demo.run_on_image(img)
+
             logger.info(
                 "{}: {} in {:.2f}s".format(
                     path,
