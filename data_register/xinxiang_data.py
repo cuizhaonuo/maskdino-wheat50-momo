@@ -4,13 +4,13 @@ from detectron2.data import MetadataCatalog
 # ====== 注册 wheat 数据集 ======
 register_coco_instances(
     "xinxiang_coco_train", {},
-    "/public/home/zncui/datasets/xinxiang/coco/annotations/instances_train2017.json",
-    "/public/home/zncui/datasets/xinxiang/coco/train2017"
+    "/public/home/zncui/datasets/xinxiang/backup/coco/annotations/instances_train2017.json",
+    "/public/home/zncui/datasets/xinxiang/backup/coco/train2017"
 )
 register_coco_instances(
     "xinxiang_coco_val", {},
-    "/public/home/zncui/datasets/xinxiang/coco/annotations/instances_val2017.json",
-    "/public/home/zncui/datasets/xinxiang/coco/val2017"
+    "/public/home/zncui/datasets/xinxiang/backup/coco/annotations/instances_val2017.json",
+    "/public/home/zncui/datasets/xinxiang/backup/coco/val2017"
 )
 
 MetadataCatalog.get("xinxiang_coco_train").set(

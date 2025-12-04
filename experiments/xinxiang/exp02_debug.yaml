@@ -1,0 +1,6 @@
+_BASE_: ./config.yaml
+TEST:
+  DETECTIONS_PER_IMAGE: 200
+
+SOLVER:
+  IMS_PER_BATCH: 1

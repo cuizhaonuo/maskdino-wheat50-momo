@@ -9,6 +9,14 @@ import os
 import sys
 sys.path.insert(1, os.path.join(sys.path[0], '..'))
 # fmt: on
+try:
+    from shapely.errors import ShapelyDeprecationWarning
+    import warnings
+    warnings.filterwarnings('ignore', category=ShapelyDeprecationWarning)
+    warnings.filterwarnings("ignore", category=FutureWarning)
+    warnings.filterwarnings("ignore", category=UserWarning)
+except:
+    pass
 
 import tempfile
 import time

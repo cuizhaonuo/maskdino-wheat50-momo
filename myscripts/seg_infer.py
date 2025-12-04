@@ -367,7 +367,7 @@ class SegInferenceTemplate:
                 start_ins_id = img_id
                 self._save_coco_annotation(img_id, start_ins_id, img_path, final_dets, self.outputs.out_dir)
             if self.outputs.vis:
-                self._visualize_and_save(img_path, final_dets, self.outputs.out_dir, draw_contour=True)
+                self._visualize_and_save(img_path, final_dets, self.outputs.out_dir, draw_contour=False)
 
         if self.outputs.excel:
             csv_path = os.path.join(self.outputs.out_dir, f"{split}_pred_vs_gt.csv")
@@ -603,25 +603,25 @@ class SegInferenceTemplate:
                 contours, _ = cv2.findContours(m8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                 cv2.drawContours(img[y1:y2, x1:x2], contours, -1, color, 2)
             score = d.score
-            draw_center = False
+            draw_center = True
             if draw_center:
                 ys, xs = np.where(m > 0)
-                # if len(xs) > 0 and len(ys) > 0:
-                #     cx = int(x1 + np.mean(xs))
-                #     cy = int(y1 + np.mean(ys))
-                #     cv2.circle(img, (cx, cy), radius=6, color=(0, 0, 255), thickness=-1)  # 红色点
-
-                # score > 0.5 红色， 0.2~0.5 黄色，<0.2 绿色
                 if len(xs) > 0 and len(ys) > 0:
                     cx = int(x1 + np.mean(xs))
                     cy = int(y1 + np.mean(ys))
-                    if score > 0.5:
-                        point_color = (0, 0, 255)  # 红色
-                    elif score > 0.2:
-                        point_color = (0, 255, 255)  # 黄色
-                    else:
-                        point_color = (0, 255, 0)  # 绿色
-                    cv2.circle(img, (cx, cy), radius=6, color=point_color, thickness=-1)
+                    cv2.circle(img, (cx, cy), radius=6, color=(0, 0, 255), thickness=-1)  # 红色点
+
+                # score > 0.5 红色， 0.2~0.5 黄色，<0.2 绿色
+                # if len(xs) > 0 and len(ys) > 0:
+                #     cx = int(x1 + np.mean(xs))
+                #     cy = int(y1 + np.mean(ys))
+                #     if score > 0.5:
+                #         point_color = (0, 0, 255)  # 红色
+                #     elif score > 0.2:
+                #         point_color = (0, 255, 255)  # 黄色
+                #     else:
+                #         point_color = (0, 255, 0)  # 绿色
+                #     cv2.circle(img, (cx, cy), radius=6, color=point_color, thickness=-1)
 
 
         # vis = cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0)

@@ -1,0 +1,14 @@
+_BASE_: ./exp01.yaml
+
+MaskDINO:
+  NUM_OBJECT_QUERIES: 500   # 300 → 500
+  NO_OBJECT_WEIGHT: 0.2     # 0.1 → 0.2（先小步，过大可能掉召回）
+  DN_NUM: 200               # 100 → 200（更多DN噪声样本，增强鲁棒）
+  DN_NOISE_SCALE: 0.5       # 0.4 → 0.5
+  IMPORTANCE_SAMPLE_RATIO: 0.9  # 0.75 → 0.9，更偏向边界/小物体采样
+  TRAIN_NUM_POINTS: 16384   # 12544 → 16384
+  TEST:
+    OBJECT_MASK_THRESHOLD: 0.20   # 0.25 → 0.20，便于召回“黄点”
+    OVERLAP_THRESHOLD: 0.60       # 0.8 → 0.6，降低重复抑制的过度合并
+
+

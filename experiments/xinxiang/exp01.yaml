@@ -1,0 +1,30 @@
+_BASE_: ./config.yaml
+
+
+MODEL:
+  SEM_SEG_HEAD:
+    NUM_CLASSES: 1
+  RETINANET:
+    NUM_CLASSES: 1
+  ROI_BOX_HEAD:
+    FED_LOSS_NUM_CLASSES: 1
+
+DATASETS:
+  TEST:
+    - xinxiang_coco_train
+  TRAIN:
+    - xinxiang_coco_val
+
+# 640 images / 2 --> 320 iterations per epoch
+# 320 * 80 = 25600 iterations for 80 epochs
+SOLVER:
+  BASE_LR: 0.00001
+  IMS_PER_BATCH: 2
+  MAX_ITER: 25600
+  STEPS: (19200, 22400)
+  WARMUP_ITERS: 1000
+  CLIP_GRADIENTS:
+    CLIP_TYPE: full_model
+    CLIP_VALUE: 0.01
+    ENABLED: False
+    NORM_TYPE: 2.0

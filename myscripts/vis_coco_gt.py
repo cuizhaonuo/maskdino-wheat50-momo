@@ -140,7 +140,8 @@ def visualize_split(
         for ann in anns:
             cid = ann.get("category_id", 1)
             cname = id2name.get(cid, str(cid))
-            color = id2color.get(cid, (0, 0, 255))
+            # color = id2color.get(cid, (0, 0, 255))
+            color = tuple(np.random.randint(0, 256, 3).tolist())
 
             # detection
             if "bbox" in ann:

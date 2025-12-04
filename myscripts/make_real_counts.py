@@ -6,12 +6,12 @@ import pandas as pd
 
 def main():
     # 输入路径
-    pred_csv = "/public/home/zncui/pycharm_project/MaskDINO/myscripts/swinl_xinxiang_0.6_0.01/test_pred_vs_gt.csv"
-    blue_csv = "/public/home/zncui/datasets/xinxiang/34images/blue_out/counts.csv"
+    pred_csv = "/public/home/zncui/pycharm_project/MaskDINO/myscripts/swinl_xinxiang_infer_iou_min_0.4_0.372_anotherAreas/test_pred_vs_gt.csv"
+    blue_csv = "/public/home/zncui/datasets/xinxiang/174Plot/174blue.csv"
 
     # 输出路径
     out_dir = "/public/home/zncui/datasets/xinxiang"
-    out_csv = os.path.join(out_dir, "real.csv")
+    out_csv = os.path.join(out_dir, "174real.csv")
     os.makedirs(out_dir, exist_ok=True)
 
     # 读取 CSV
