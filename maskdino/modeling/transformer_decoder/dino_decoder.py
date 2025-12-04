@@ -272,9 +272,28 @@ class DeformableTransformerDecoderLayer(nn.Module):
         value = tgt
         '''
         # self attention
+
         if self.self_attn is not None:
+        # debug = False
+        # if debug:
             q = k = self.with_pos_embed(tgt, tgt_query_pos)
             tgt2 = self.self_attn(q, k, tgt, attn_mask=self_attn_mask)[0]
+
+            # debug: 可视化 attention weights
+            # tgt2, attn_output_weights = self.self_attn(q, k, tgt, attn_mask=self_attn_mask, average_attn_weights=False)
+            # from maskdino.analysis.tool_lab import visualize_attn_weights
+            # visualize_attn_weights(attn_output_weights[0], average_attn_weights=False)
+
+            # debug: 可视化每个 head 的最大 attention 权重对应的索引
+            # from maskdino.analysis.tool_lab import visualize_attn_indices
+            # visualize_attn_indices(attn_output_weights[0])
+            # from maskdino.analysis.tool_lab import visualize_attn_indices_heatmap
+            # visualize_attn_indices_heatmap(attn_output_weights[0])
+
+            # debug: 将 attn_indices 保存到 csv 文件中，一行一行写入
+            # from maskdino.analysis.tool_lab import save_attn_indices_to_csv
+            # save_attn_indices_to_csv(attn_output_weights[0])
+
             tgt = tgt + self.dropout2(tgt2)
             tgt = self.norm2(tgt)
 
