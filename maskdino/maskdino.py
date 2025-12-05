@@ -296,6 +296,9 @@ class MaskDINO(nn.Module):
                 else:
                     # remove this loss if not specified in `weight_dict`
                     losses.pop(k)
+            # # debug: loss 的组成部分
+            # from maskdino.analysis.tool_lab import vis_loss_bar
+            # vis_loss_bar(losses, title="Example loss", save_path="loss_bar.png")
             return losses
         else:
 

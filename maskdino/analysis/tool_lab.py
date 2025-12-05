@@ -1579,6 +1579,177 @@ def save_attn_indices_to_csv(attn_output_weights):
         for head_idx, row in enumerate(indices):
             writer.writerow([head_idx] + row.tolist())
 
+def vis_loss_bar(losses, title="Loss by layer (suffix)", save_path=None):
+    """
+    参数
+    ----
+    losses: dict
+        形如 {"loss_ce": 1.2, "loss_dice_0": 0.6, "dn_loss_ce": 0.3, ...}
+        会自动按后缀分组，例如:
+            loss_xxx      -> suffix = "base"
+            loss_xxx_0    -> suffix = "0"
+            loss_xxx_1    -> suffix = "1"
+        同时会把 loss_xxx_0 / loss_xxx_1 合并为同一个 loss type: loss_xxx
+
+    title: str
+        图片总标题
+
+    save_path: str or None
+        若给定路径，则保存图片到该路径；否则直接 plt.show()
+    """
+    import re
+    from collections import defaultdict
+    import numpy as np
+    import matplotlib.pyplot as plt
+    import math
+
+    # 1. 先按 suffix 分组
+    grouped_losses = defaultdict(list)
+
+    for loss_key, loss_value in losses.items():
+        # 跳过中间层和 dn 相关的 loss（按你的需求）
+        if "interm" in loss_key:
+            continue
+        if "dn" in loss_key:
+            continue
+
+        # 以结尾的 _数字 作为后缀，例如 loss_ce_0 -> suffix="0"
+        m = re.search(r"_(\d+)$", loss_key)
+        suffix = m.group(1) if m else "base"
+        grouped_losses[suffix].append((loss_key, float(loss_value)))
+
+    if not grouped_losses:
+        print("No valid losses to plot.")
+        return
+
+    # 2. 组内按 key 字典序排序（方便阅读）
+    for suffix in grouped_losses:
+        grouped_losses[suffix].sort(key=lambda x: x[0])
+
+    # 3. 在每个 suffix 内，再按 loss 类型汇总（忽略末尾数字）
+    #    agg[suffix][loss_type] = sum(value)
+    agg = defaultdict(lambda: defaultdict(float))
+
+    for suffix, items in grouped_losses.items():
+        for loss_key, loss_value in items:
+            parts = loss_key.split("_")
+            # 若最后一段是数字，去掉这段作为 "loss 类型"
+            if parts[-1].isdigit():
+                base_name = "_".join(parts[:-1])  # loss_ce_0 -> loss_ce
+            else:
+                base_name = loss_key             # loss_ce -> loss_ce
+
+            agg[suffix][base_name] += float(loss_value)
+
+    # 4. 决定 suffix 的顺序：先 base，再数字，最后其他
+    def suffix_sort_key(s):
+        if s == "base":
+            return (0, 0)
+        if s.isdigit():
+            return (1, int(s))
+        return (2, s)
+
+    suffixes = sorted(agg.keys(), key=suffix_sort_key)
+    if not suffixes:
+        print("No valid suffixes to plot.")
+        return
+
+    # 所有 loss 类型（loss_ce, loss_dice, ...），为了 legend 和颜色统一
+    loss_types = sorted({lt for d in agg.values() for lt in d.keys()})
+    if not loss_types:
+        print("No loss types to plot.")
+        return
+
+    x = np.arange(len(suffixes))
+
+    # 计算所有值最大值，用于统一各子图的 y 轴
+    max_val = 0.0
+    for lt in loss_types:
+        vals = [agg[s].get(lt, 0.0) for s in suffixes]
+        if vals:
+            max_val = max(max_val, max(vals))
+    if max_val == 0:
+        max_val = 1.0  # 避免全 0 的情况
+
+    # ===== 5. 准备子图布局：每个 loss type 一个 subplot + 1 个堆叠 subplot =====
+    n_types = len(loss_types)
+    total_plots = n_types + 1  # 多出来的 1 个是堆叠柱状图
+
+    n_cols = min(3, total_plots)   # 每行最多放 3 个
+    n_rows = math.ceil(total_plots / n_cols)
+
+    fig, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=(4 * n_cols, 3 * n_rows),
+        squeeze=False
+    )
+
+    # ===== 6. 每个 loss type 单独一个柱状图 subplot =====
+    for idx, lt in enumerate(loss_types):
+        row = idx // n_cols
+        col = idx % n_cols
+        ax = axes[row][col]
+
+        values = np.array([agg[s].get(lt, 0.0) for s in suffixes], dtype=float)
+
+        ax.bar(x, values)
+        ax.set_title(lt)
+        ax.set_xticks(x)
+        ax.set_xticklabels(suffixes, rotation=45, ha="right")
+        ax.set_ylim(0, max_val * 1.1)
+
+        if col == 0:
+            ax.set_ylabel("Loss value")
+        if row == n_rows - 1:
+            ax.set_xlabel("Suffix / layer")
+
+    # ===== 7. 堆叠柱状图 subplot（放在最后一个位置） =====
+    stack_idx = n_types  # 第 n_types 个 subplot
+    row = stack_idx // n_cols
+    col = stack_idx % n_cols
+    ax = axes[row][col]
+
+    bottoms = np.zeros(len(suffixes), dtype=float)
+    cmap = plt.get_cmap("tab10")
+    colors = {lt: cmap(i % 10) for i, lt in enumerate(loss_types)}
+
+    for lt in loss_types:
+        vals = np.array([agg[s].get(lt, 0.0) for s in suffixes], dtype=float)
+        ax.bar(
+            x,
+            vals,
+            bottom=bottoms,
+            label=lt,
+            color=colors[lt],
+        )
+        bottoms += vals
+
+    ax.set_title("Stacked losses")
+    ax.set_xticks(x)
+    ax.set_xticklabels(suffixes, rotation=45, ha="right")
+    ax.set_ylabel("Loss sum")
+    ax.legend(fontsize=8)
+
+    # ===== 8. 如果布局里有多余 subplot，把它们关掉 =====
+    for idx in range(total_plots, n_rows * n_cols):
+        r = idx // n_cols
+        c = idx % n_cols
+        axes[r][c].axis("off")
+
+    # ===== 9. 总标题 + 保存 / 显示 =====
+    fig.suptitle(title, fontsize=14)
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+
+    if save_path is not None:
+        plt.savefig(save_path, dpi=200, bbox_inches="tight")
+        plt.close(fig)
+    else:
+        plt.show()
+
+
+
+
 
 
 
