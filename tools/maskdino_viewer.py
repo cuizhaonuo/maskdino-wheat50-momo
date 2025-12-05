@@ -178,17 +178,17 @@ class GUI:
         }
         pack_opts = {'side': tk.LEFT, 'padx': 5}
 
-        tk.Button(top_frame, text="选择图片", command=self.choose_image, **btn_style).pack(**pack_opts)
-        tk.Button(top_frame, text="选择目录", command=self.choose_directory, **btn_style).pack(**pack_opts)
+        tk.Button(top_frame, text="Select Image", command=self.choose_image, **btn_style).pack(**pack_opts)
+        tk.Button(top_frame, text="Select Directory", command=self.choose_directory, **btn_style).pack(**pack_opts)
 
         # 间隔
         tk.Frame(top_frame, width=30).pack(side=tk.LEFT)
 
-        tk.Button(top_frame, text="选择输出目录", command=self.choose_output_dir, **btn_style).pack(**pack_opts)
+        tk.Button(top_frame, text="Select Output Directory", command=self.choose_output_dir, **btn_style).pack(**pack_opts)
 
         # 特殊颜色的按钮
-        tk.Button(top_frame, text="推理 (当前)", command=self.run_inference, bg="#e1f5fe", **btn_style).pack(**pack_opts)
-        tk.Button(top_frame, text="推理 (全部)", command=self.run_inference_all, bg="#ffebee", **btn_style).pack(**pack_opts)
+        tk.Button(top_frame, text="Inference (Current)", command=self.run_inference, bg="#e1f5fe", **btn_style).pack(**pack_opts)
+        tk.Button(top_frame, text="Inference (Total)", command=self.run_inference_all, bg="#ffebee", **btn_style).pack(**pack_opts)
 
         # ===== 2. 主体区域 (PanedWindow 分割：上部分是图，下部分是表) =====
         self.main_paned = tk.PanedWindow(self.root, orient=tk.VERTICAL, sashwidth=4)
@@ -202,7 +202,7 @@ class GUI:
         list_frame = tk.Frame(top_content_frame, width=200)
         list_frame.pack(side=tk.LEFT, fill=tk.Y)
 
-        tk.Label(list_frame, text="文件列表").pack(anchor=tk.W)
+        tk.Label(list_frame, text="File List").pack(anchor=tk.W)
 
         list_scroll = tk.Scrollbar(list_frame, orient=tk.VERTICAL)
         self.listbox = tk.Listbox(list_frame, yscrollcommand=list_scroll.set, width=25)
@@ -228,14 +228,14 @@ class GUI:
         # self.orig_label = create_img_container(images_frame, "原图", "#eeeeee")
         # self.overlay_label = create_img_container(images_frame, "推理叠加 (Overlay)", "#e3f2fd")
 
-        self.orig_label = create_img_container(images_frame, "", "#eeeeee")
-        self.overlay_label = create_img_container(images_frame, "", "#e3f2fd")
+        self.orig_label = create_img_container(images_frame, "Original Image", "#eeeeee")
+        self.overlay_label = create_img_container(images_frame, "Inferred Image", "#e3f2fd")
 
         # --- 下半部分：CSV 数据展示区 ---
         bottom_content_frame = tk.Frame(self.main_paned)
         self.main_paned.add(bottom_content_frame)
 
-        tk.Label(bottom_content_frame, text="Results.csv 数据预览").pack(anchor=tk.W)
+        tk.Label(bottom_content_frame, text="Results.csv Data Preview").pack(anchor=tk.W)
 
         # Treeview 表格：显示 filename 和 counts
         cols = ("filename", "counts")
@@ -256,7 +256,7 @@ class GUI:
         status_frame = tk.Frame(self.root)
         status_frame.pack(fill=tk.X, pady=2, padx=10)
 
-        self.path_label = tk.Label(status_frame, text="当前图片：无", fg="blue")
+        self.path_label = tk.Label(status_frame, text="Current Image：None", fg="blue")
         self.path_label.pack(side=tk.LEFT)
 
         self.status_label = tk.Label(status_frame, text="", fg="purple")
@@ -268,12 +268,12 @@ class GUI:
         """确保有一个 MaskDINO 分割模型实例"""
         if self.model is None:
             try:
-                self.status_label.config(text="正在初始化 MaskDINO 模型...")
+                self.status_label.config(text="Initializing MaskDINO Model...")
                 self.root.update()
                 self.model = SegModel()
-                self.status_label.config(text="MaskDINO 模型初始化完成")
+                self.status_label.config(text="MaskDINO Model Ready")
             except Exception as e:
-                messagebox.showerror("错误", f"模型初始化失败：{e}")
+                messagebox.showerror("Error", f"Model Initialization Failed：{e}")
 
     def choose_image(self):
         path = filedialog.askopenfilename(filetypes=[("Images", "*.jpg *.jpeg *.png *.bmp")])
@@ -289,7 +289,7 @@ class GUI:
             files = sorted([os.path.join(d, f) for f in os.listdir(d)
                             if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp'))])
             if not files:
-                messagebox.showinfo("提示", "该目录下无图片")
+                messagebox.showinfo("Tip", "There is no image file in the selected directory.")
                 return
             self.image_paths = files
             self.current_index = 0
@@ -300,7 +300,7 @@ class GUI:
         d = filedialog.askdirectory()
         if d:
             self.output_dir = d
-            self.status_label.config(text=f"输出目录: {d}")
+            self.status_label.config(text=f"Output Directory: {d}")
             # 选择目录后，尝试加载一下CSV
             self.refresh_csv_table()
             # 如果当前有图，尝试重新加载结果图
@@ -332,14 +332,14 @@ class GUI:
 
         path = self.image_paths[idx]
         self.current_path = path
-        self.path_label.config(text=f"当前: {path}")
+        self.path_label.config(text=f"Current: {path}")
 
         # 1. 加载原图
         try:
             self.raw_img_orig = Image.open(path)
             self.update_single_image(self.raw_img_orig, self.orig_label, is_result=False)
         except Exception as e:
-            print(f"原图加载失败: {e}")
+            print(f"Model Initialization Failed: {e}")
 
         # 2. 尝试寻找 Overlay
         self.raw_img_overlay = None
@@ -360,7 +360,7 @@ class GUI:
     def update_single_image(self, pil_img, label_widget, is_result=False):
         """通用更新单个Label图片的函数"""
         if pil_img is None:
-            label_widget.config(image="", text="无结果" if is_result else "无法加载")
+            label_widget.config(image="", text="No Result" if is_result else "Load Failed")
             label_widget.image = None  # keep ref
             return
 
@@ -412,12 +412,12 @@ class GUI:
                 # 这里使用 counts 字段
                 self.tree.insert("", tk.END, values=(row['filename'], row['counts']))
         except Exception as e:
-            print(f"读取 CSV 失败: {e}")
+            print(f"Read CSV Failed: {e}")
 
     # --- 推理 ---
     def run_inference(self):
         if not self.current_path or not self.output_dir:
-            messagebox.showwarning("警告", "请先选择图片和输出目录")
+            messagebox.showwarning("Warning", "Please select images and output directory first.")
             return
 
         self.ensure_model()
@@ -428,12 +428,12 @@ class GUI:
             base = os.path.basename(self.current_path)
             out_file_base = os.path.join(self.output_dir, base)
 
-            self.status_label.config(text="正在推理中...")
+            self.status_label.config(text="Inferencing...")
             self.root.update()
 
             self.model.infer_and_save(self.current_path, out_file_base)
 
-            self.status_label.config(text="推理完成")
+            self.status_label.config(text="Inference Completed")
 
             # 刷新结果显示
             self.load_image_by_index(self.current_index)
@@ -441,11 +441,11 @@ class GUI:
             self.refresh_csv_table()
 
         except Exception as e:
-            messagebox.showerror("错误", str(e))
+            messagebox.showerror("Error", str(e))
 
     def run_inference_all(self):
         if not self.image_paths or not self.output_dir:
-            messagebox.showwarning("警告", "请先选择图片列表和输出目录")
+            messagebox.showwarning("Warning", "Please select images and output directory first.")
             return
 
         self.ensure_model()
@@ -459,7 +459,7 @@ class GUI:
             base = os.path.basename(path)
             out_file_base = os.path.join(self.output_dir, base)
 
-            self.status_label.config(text=f"正在处理 ({i + 1}/{total}): {base}")
+            self.status_label.config(text=f"Processing ({i + 1}/{total}): {base}")
             self.root.update()
 
             try:
@@ -468,7 +468,7 @@ class GUI:
             except Exception as e:
                 print(f"Error {base}: {e}")
 
-        self.status_label.config(text=f"批量推理完成，共 {count} 张")
+        self.status_label.config(text=f"Batch inferencing completed，total of {count} images processed.")
         self.refresh_csv_table()
         # 刷新当前显示
         if self.current_index >= 0:
