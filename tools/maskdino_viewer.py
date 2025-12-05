@@ -225,8 +225,11 @@ class GUI:
             lbl.pack(expand=True, fill=tk.BOTH)
             return lbl
 
-        self.orig_label = create_img_container(images_frame, "原图", "#eeeeee")
-        self.overlay_label = create_img_container(images_frame, "推理叠加 (Overlay)", "#e3f2fd")
+        # self.orig_label = create_img_container(images_frame, "原图", "#eeeeee")
+        # self.overlay_label = create_img_container(images_frame, "推理叠加 (Overlay)", "#e3f2fd")
+
+        self.orig_label = create_img_container(images_frame, "", "#eeeeee")
+        self.overlay_label = create_img_container(images_frame, "", "#e3f2fd")
 
         # --- 下半部分：CSV 数据展示区 ---
         bottom_content_frame = tk.Frame(self.main_paned)
