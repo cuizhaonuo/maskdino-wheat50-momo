@@ -5,8 +5,14 @@ from tkinter import filedialog, messagebox, ttk
 from PIL import Image, ImageTk
 import pandas as pd
 import numpy as np
-
+import colorsys
+import random
 from typing import List
+
+# 过滤 UserWarning 和 FutureWarning
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 from detectron2.config import get_cfg
 from detectron2.projects.deeplab import add_deeplab_config
@@ -77,8 +83,30 @@ class SegModel:
         csv_path = os.path.join(dir_path, "results.csv")
 
         # 这里 overlay 与 mask 先都保存为可视化图（你之后想改 mask 逻辑可以再改）
-        visualized_output.save(overlay_path)
-        visualized_output.save(mask_path)
+        # visualized_output.save(overlay_path)
+        # visualized_output.save(mask_path)
+
+        def vis_only_wheat(predictions, img):
+            def random_color():
+                h = random.random()  # 色相随意
+                s = random.uniform(0.7, 1.0)  # 高饱和
+                v = random.uniform(0.3, 0.6)  # 限制亮度，保证偏暗
+                r, g, b = colorsys.hsv_to_rgb(h, s, v)
+                return int(r * 255), int(g * 255), int(b * 255)
+
+            panoptic_seg, segment_info = predictions['panoptic_seg']
+            panoptic_map = panoptic_seg.cpu().numpy().astype(np.int32)
+            for segment in segment_info:
+                if segment['category_id'] == 0:  # wheat
+                    board_mask = (panoptic_map == segment['id']).astype(np.uint8) * 255
+                    color = random_color()
+                    colored_mask = np.zeros((*board_mask.shape, 3), dtype=np.uint8)
+                    colored_mask[board_mask == 255] = color
+                    img = cv2.addWeighted(img, 1.0, colored_mask, 1, 0)
+            return img
+
+        vis_img = vis_only_wheat(predictions, img.copy())
+        cv2.imwrite(overlay_path, vis_img)
 
         counts = self.count_spike_from_panoptic(predictions)
 
@@ -114,7 +142,7 @@ class SegModel:
 class GUI:
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title('禾本科作物可控环境生物量测量工具')
+        self.root.title('麦穗计数工具')
         self.root.geometry("1400x900")  # 稍微加大窗口尺寸以容纳图和表格
 
         # --- 状态变量 ---
@@ -142,7 +170,12 @@ class GUI:
         top_frame.pack(fill=tk.X, pady=5, padx=10)
 
         # 将样式参数(传给Button)和布局参数(传给pack)分开
-        btn_style = {'font': ("Arial", 10)}
+        btn_style = {
+            'font': ("Arial", 28),  # 字体变大
+            'padx': 12,  # 内边距：左右
+            'pady': 6,  # 内边距：上下
+            'height': 2  # 按钮高度（字符单位）
+        }
         pack_opts = {'side': tk.LEFT, 'padx': 5}
 
         tk.Button(top_frame, text="选择图片", command=self.choose_image, **btn_style).pack(**pack_opts)
@@ -163,7 +196,7 @@ class GUI:
 
         # --- 上半部分：图片展示区 (左列表 + 右两图：原图 + overlay) ---
         top_content_frame = tk.Frame(self.main_paned)
-        self.main_paned.add(top_content_frame, height=600)  # 初始高度
+        self.main_paned.add(top_content_frame, height=500)  # 初始高度
 
         # 左侧列表
         list_frame = tk.Frame(top_content_frame, width=200)
@@ -204,8 +237,8 @@ class GUI:
         # Treeview 表格：显示 filename 和 counts
         cols = ("filename", "counts")
         self.tree = ttk.Treeview(bottom_content_frame, columns=cols, show='headings', height=8)
-        self.tree.heading("filename", text="文件名")
-        self.tree.heading("counts", text="穗数")
+        self.tree.heading("filename", text="filename")
+        self.tree.heading("counts", text="counts")
 
         self.tree.column("filename", width=300)
         self.tree.column("counts", width=150)
