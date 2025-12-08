@@ -278,6 +278,12 @@ class DeformableTransformerDecoderLayer(nn.Module):
         # if debug:
             q = k = self.with_pos_embed(tgt, tgt_query_pos)
             tgt2 = self.self_attn(q, k, tgt, attn_mask=self_attn_mask)[0]
+            # tgt2, attn_output_weights = self.self_attn(q, k, tgt, attn_mask=self_attn_mask, average_attn_weights=True)
+            # debug: 可视化一个 num_queries x num_queries 的 attention mask 矩阵
+            # from maskdino.analysis.tool_lab import vis_attention_matrix
+            # vis_attention_matrix(attn_output_weights[0])
+            # from maskdino.ctx import attn_output_weights_ctx
+            # attn_output_weights_ctx.set(attn_output_weights)
 
             # debug: 可视化 attention weights
             # tgt2, attn_output_weights = self.self_attn(q, k, tgt, attn_mask=self_attn_mask, average_attn_weights=False)

@@ -428,7 +428,7 @@ class SetCriterion(nn.Module):
                 l_dict = {k + f'_interm': v for k, v in l_dict.items()}
                 losses.update(l_dict)
 
-        return losses
+        return losses, indices
 
     def __repr__(self):
         head = "Criterion " + self.__class__.__name__

@@ -248,10 +248,10 @@ class MaskDINO(nn.Module):
         images = [x["image"].to(self.device) for x in batched_inputs]
 
         # debug: 处理过的图像名保存到一个 txt 文件中
-        with open("/public/home/zncui/pycharm_project/MaskDINO/myscripts/processed_image_names.txt", "a") as f:
-            for x in batched_inputs:
-                if "file_name" in x:
-                    f.write(x["file_name"] + "\n")
+        # with open("/public/home/zncui/pycharm_project/MaskDINO/myscripts/processed_image_names.txt", "a") as f:
+        #     for x in batched_inputs:
+        #         if "file_name" in x:
+        #             f.write(x["file_name"] + "\n")
 
         # debug: 可视化 transformed image
         # 将张量从 GPU 移至 CPU，并转换为 NumPy 数组
@@ -285,10 +285,42 @@ class MaskDINO(nn.Module):
                     targets = self.prepare_targets(gt_instances, images)
             else:
                 targets = None
+
+            # from maskdino.ctx import indices_ctx
+            # indices_ctx.set(None)
+
             # 预处理时已经 pad 好了，不需要在这里 pad 了，因此不传入 mask，即 mask=None
             outputs,mask_dict = self.sem_seg_head(features,targets=targets)
+
             # bipartite matching-based loss
-            losses = self.criterion(outputs, targets, mask_dict)
+            losses, indices = self.criterion(outputs, targets, mask_dict)
+            # bid = 0
+            # target_index = torch.where(indices[bid][1] == 22)[0]  # 这里 target_id = 22
+            # # target_id = indices[0][1][target_index]
+            # pred_id = indices[bid][0][target_index]
+            # print('pred_id: ', pred_id)
+
+            # from maskdino.analysis.tool_lab import vis_attention_bar_from_csv
+            # vis_attention_bar_from_csv(
+            #     pred_id=pred_id,
+            #     save_path="/public/home/zncui/pycharm_project/MaskDINO/myscripts/attn_query_bar.jpg"
+            # )
+
+            # from maskdino.ctx import draw_encoder_class_vars_ctx
+            # encoder_class_vars = draw_encoder_class_vars_ctx.get()
+            # from maskdino.ctx import attn_output_weights_ctx
+            # attn_output_weights_var = attn_output_weights_ctx.get()
+            # query_id = 200
+            # selected_attn_output_weights = attn_output_weights_var[bid][query_id].squeeze()
+            # # selected_attn_output_weights = attn_output_weights_var[bid][pred_id].squeeze()
+            # from maskdino.analysis.tool_lab import draw_encoder_class_heatmap
+            # draw_encoder_class_heatmap(encoder_class_vars[0], encoder_class_vars[1], encoder_class_vars[2], query_id, selected_attn_output_weights)
+            # # 另外观察废弃 query 在关注什么
+
+            # debug
+            # print('debug -----> indices: ', )
+            # indices_ctx.set(indices)  # 设置值
+            # outputs, mask_dict = self.sem_seg_head(features, targets=targets)
 
             for k in list(losses.keys()):
                 if k in self.criterion.weight_dict:

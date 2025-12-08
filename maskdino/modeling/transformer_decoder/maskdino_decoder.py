@@ -417,9 +417,23 @@ class MaskDINODecoder(nn.Module):
             topk = self.num_queries
             topk_proposals = torch.topk(enc_outputs_class_unselected.max(-1)[0], topk, dim=1)[1]
 
+            # from maskdino.ctx import indices_ctx
+            # indices = indices_ctx.get()
+
+            # debug: 检查预测 target_id = 22 实例的位点
+            # if indices is not None:
+            #     target_index = torch.where(indices[0][1] == 22)[0]  # 这里 target_id = 22
+            #     # target_id = indices[0][1][target_index]
+            #     pred_id = indices[0][0][target_index]
+            #     print('pred_id: ', pred_id)
+
             # debug: 查看 enc_outputs_class_unselected 类别热力图
             # from maskdino.analysis.tool_lab import draw_encoder_class_heatmap
             # draw_encoder_class_heatmap(enc_outputs_class_unselected.max(-1)[0][0], level_start_index, spatial_shapes)
+
+            # from maskdino.ctx import draw_encoder_class_vars_ctx
+            # draw_encoder_class_vars = (enc_outputs_class_unselected.max(-1)[0][0], level_start_index, spatial_shapes)
+            # draw_encoder_class_vars_ctx.set(draw_encoder_class_vars)
 
             # debug: 探索 topk 来自哪些 feature level
             # from maskdino.analysis.tool_lab import check_topk_proposals

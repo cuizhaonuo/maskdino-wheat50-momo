@@ -407,48 +407,135 @@ def draw_center_point_on_image(pred_bboxes, proposals):
     save_path = "/public/home/zncui/pycharm_project/MaskDINO/myscripts/center_points_and_lines.jpg"
     mmcv.imwrite(image, save_path)
 
-def draw_encoder_class_heatmap(class_logits, level_start_indices, spatial_shapes):
-    '''
-    class_logits: Tensor, 形状为 (num_queries,)
-    level_start_indices: List[int], 每个特征层的起始索引
-    spatial_shapes, Tensor (
-    '''
-    # 根据 level_start_indices 将 class_logits 分成多个部分，分别绘制热力图
-    num_feature_levels = 5
-    split_logits = []
-    for i in range(num_feature_levels):
-        start_idx = level_start_indices[i]
-        end_idx = level_start_indices[i + 1] if i + 1 < len(level_start_indices) else class_logits.shape[0]
-        split_logits.append(class_logits[start_idx:end_idx])
-    class_features = []
-    spatial_shapes = list(spatial_shapes)
-    for logit, shape in zip(split_logits, spatial_shapes):
-        h, w = shape
-        logit_reshaped = logit.reshape(h, w)
-        class_features.append(logit_reshaped)
+import torch
+
+import torch
+
+def draw_encoder_class_heatmap(class_logits, level_start_indices, spatial_shapes, *vars):
+    """
+    class_logits: Tensor, (num_tokens,)
+    level_start_indices: list[int]
+    spatial_shapes: Tensor or list, [(h1,w1), (h2,w2), ...]
+    """
 
     import mmcv
     import numpy as np
     from mmengine.visualization import Visualizer
-    image = mmcv.imread(IMG_PATH, channel_order='rgb')
+    import cv2
+    from matplotlib import pyplot as plt
+
+    # ====== 1. dtype & device 统一 ======
+    class_logits = class_logits.detach().float().cpu()
+
+    if isinstance(level_start_indices, torch.Tensor):
+        level_start_indices = level_start_indices.tolist()
+    if isinstance(spatial_shapes, torch.Tensor):
+        spatial_shapes = spatial_shapes.tolist()
+
+    num_feature_levels = len(spatial_shapes)
+
+    # ====== 2. TopK proposals ======
+    TOPK = 300
+    topk_indices = torch.topk(class_logits, TOPK)[1].tolist()
+    # topk_indices = topk_indices[-1:]
+    query_id = vars[0]
+    selected_attn_output_weights = vars[1]
+
+    # ====== 3. token index -> (level, y, x) 映射 ======
+    token_map = []   # 每个 token => (level, y, x)
+    for lvl, (h, w) in enumerate(spatial_shapes):
+        start = level_start_indices[lvl]
+        for idx in range(h * w):
+            y = idx // w
+            x = idx % w
+            token_map.append((lvl, y, x))
+
+    # ====== 4. split + reshape ======
+    class_features = []
+    for lvl, (h, w) in enumerate(spatial_shapes):
+        start = level_start_indices[lvl]
+        end = start + h * w
+        fmap = class_logits[start:end].reshape(h, w)
+        class_features.append(fmap)
+
+    # ====== 5. 读取原图 ======
+    image_path = '/public/home/zncui/pycharm_project/MaskDINO/myscripts/transformed_image.jpg'
+    image = mmcv.imread(image_path, channel_order="rgb")
     image = image.astype(np.uint8)
+
     visualizer = Visualizer()
     drawn_images = []
-    for idx, feat in enumerate(class_features):
-        feat = feat.unsqueeze(0)  # chw
-        drawn_image = visualizer.draw_featmap(feat, image, channel_reduction='squeeze_mean')
-        drawn_images.append(drawn_image)
-    from matplotlib import pyplot as plt
+
+    # ====== 6. 每层画热力图 & overlay 蓝色 top-k ======
+
+    score = selected_attn_output_weights
+    # 获取 score 最大的 10 个数值的索引
+    topk_score_indices = torch.topk(score, 10)[1]
+
+    for lvl, fmap in enumerate(class_features):
+
+        fmap = fmap.unsqueeze(0).float().cpu()  # (1,H,W)
+
+        drawn = visualizer.draw_featmap(
+            fmap,
+            image,
+            channel_reduction="squeeze_mean"
+        )
+        if hasattr(drawn, "get_image"):
+            drawn = drawn.get_image()
+
+        # ---- 在图上叠加蓝点 ----
+        img = drawn.copy()
+        H, W = fmap.shape[-2], fmap.shape[-1]
+        H_img, W_img = img.shape[:2]
+
+        sx = W_img / W
+        sy = H_img / H
+
+        for i, tidx in enumerate(topk_indices):
+            lvl0, y, x = token_map[tidx]
+            if lvl0 != lvl:
+                continue
+
+            # 映射到像素坐标
+            px = int((x + 0.5) * sx)
+            py = int((y + 0.5) * sy)
+
+            cv2.circle(img, (px, py), radius=3, color=(255, 0, 0), thickness=-1)  # 蓝点(BGR)
+
+            if i == query_id:
+                cv2.circle(img, (px, py), radius=10, color=(0, 255, 0), thickness=-1)
+
+            if i in topk_score_indices:
+                cv2.circle(img, (px, py), radius=8, color=(0, 0, 255), thickness=-1)
+
+
+            # if score > 0.001:
+            #     cv2.putText(img, f"{score:.3f}", (px + 5, py - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1, cv2.LINE_AA)
+            # 将 i 也画上去
+            # cv2.putText(img, str(i), (px + 5, py - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1, cv2.LINE_AA)
+        drawn_images.append(img)
+
+    # ====== 7. plot 保存 ======
     rows, cols = 1, num_feature_levels
-    fig, axes = plt.subplots(rows, cols, figsize=(4*cols, 4*rows))
+    fig, axes = plt.subplots(1, cols, figsize=(4 * cols, 4))
+
+    if cols == 1:
+        axes = [axes]
+
     for i, img in enumerate(drawn_images):
-        idx = len(drawn_images) - i
+        lvl = num_feature_levels - i
         axes[i].imshow(img)
-        axes[i].set_title(f"level_{idx}")
+        axes[i].set_title(f"level_{lvl}")
         axes[i].axis("off")
+
     plt.tight_layout()
     save_path = "/public/home/zncui/pycharm_project/MaskDINO/myscripts/encoder_class_heatmap.jpg"
     plt.savefig(save_path, dpi=200)
+    plt.close(fig)
+
+
+
 
 def visualize_matching(indices, outputs, targets):
     # image_path = '/public/home/zncui/datasets/zhaoxian/wheats_rle_coco/coco/vis/segmentation/train/D7-330-20230531.jpg'
@@ -457,6 +544,8 @@ def visualize_matching(indices, outputs, targets):
     bidx = 0
     matching_indices = indices[bidx]
     bboxes = outputs['pred_boxes'][bidx]
+    scores = outputs['pred_logits'][bidx].sigmoid().squeeze()
+    # matching_score = scores[matching_indices[0]]
     targets = targets[bidx]['boxes']
     coord_bboxes = bboxes[:, :2]
     coord_targets = targets[:, :2]
@@ -466,16 +555,54 @@ def visualize_matching(indices, outputs, targets):
     import cv2
     image = mmcv.imread(image_path, channel_order='bgr')
     image = image.astype(np.uint8)
-    for coord_target in coord_targets:
-        x, y = coord_target
-        x = int(x * image.shape[0])
-        y = int(y * image.shape[1])
-        cv2.circle(image, (x, y), radius=5, color=(0, 255, 0), thickness=-1, lineType=cv2.LINE_AA)
-    for coord_bbox in coord_bboxes:
-        x, y = coord_bbox
-        x = int(x * image.shape[1])
-        y = int(y * image.shape[0])
-        cv2.circle(image, (x, y), radius=5, color=(255, 0, 0), thickness=-1, lineType=cv2.LINE_AA)
+
+    pattern = 'rectangle' # 'rectangle' or 'circle'
+    if pattern == 'circle':
+        for coord_target in coord_targets:
+            x, y = coord_target
+            x = int(x * image.shape[0])
+            y = int(y * image.shape[1])
+            cv2.circle(image, (x, y), radius=5, color=(0, 255, 0), thickness=-1, lineType=cv2.LINE_AA)
+        for coord_bbox in coord_bboxes:
+            x, y = coord_bbox
+            x = int(x * image.shape[1])
+            y = int(y * image.shape[0])
+            cv2.circle(image, (x, y), radius=5, color=(255, 0, 0), thickness=-1, lineType=cv2.LINE_AA)
+    if pattern == 'rectangle':
+        for pred_idx, tgt_idx in zip(matching_indices[0], matching_indices[1]):
+            # 随机获取一个颜色
+            def random_dark_rgb():
+                """生成偏深色的随机RGB"""
+                import random
+                return tuple(random.randint(0, 120) for _ in range(3))
+            score = scores[pred_idx]
+
+            bbox_xywh = bboxes[pred_idx]
+            target_xywh = targets[tgt_idx]
+            def xywh_to_xyxy(box):
+                x, y, w, h = box
+                x1, y1, x2, y2 = x - w / 2, y - h / 2, x + w / 2, y + h / 2
+                return x1, y1, x2, y2
+            bbox_xyxy = xywh_to_xyxy(bbox_xywh)
+            target_xyxy = xywh_to_xyxy(target_xywh)
+            w, h = image.shape[1], image.shape[0]
+            def scale_box(box):
+                x1, y1, x2, y2 = box
+                x1 = int(x1 * w)
+                y1 = int(y1 * h)
+                x2 = int(x2 * w)
+                y2 = int(y2 * h)
+                return x1, y1, x2, y2
+            bbox_xyxy = scale_box(bbox_xyxy)
+            target_xyxy = scale_box(target_xyxy)
+            # 绘制矩形框
+            bbox_color = random_dark_rgb()
+            cv2.rectangle(image, (bbox_xyxy[0], bbox_xyxy[1]), (bbox_xyxy[2], bbox_xyxy[3]), thickness=1, color=bbox_color)
+            cv2.rectangle(image, (target_xyxy[0], target_xyxy[1]), (target_xyxy[2], target_xyxy[3]), thickness=1, color=bbox_color)
+            # 在框上写分数
+            cv2.putText(image, f"{score:.2f}", (bbox_xyxy[0], bbox_xyxy[1] - 5), cv2.FONT_HERSHEY_SIMPLEX, 1, bbox_color, 2, cv2.LINE_AA)
+            print(f'Matched pair - Score: {score:.4f}, BBox: {pred_idx}, Target: {tgt_idx}') # Target: 22 是目标
+
     for pred_idx, tgt_idx in zip(matching_indices[0], matching_indices[1]):
         coord_bbox = coord_bboxes[pred_idx]
         coord_target = coord_targets[tgt_idx]
@@ -1746,6 +1873,561 @@ def vis_loss_bar(losses, title="Loss by layer (suffix)", save_path=None):
         plt.close(fig)
     else:
         plt.show()
+
+
+def vis_attention_matrix(attn_matrix,
+                          title="Self-Attention Matrix",
+                          log_scale=True,
+                          clip_percentile=99.8,
+                          export_csv=True):
+    """
+    保存 attention heatmap + 导出 attention 数值 CSV
+
+    参数
+    ----
+    attn_matrix : torch.Tensor / np.ndarray
+        形状 (Q,Q) 或 (H,Q,Q)
+    save_path : str
+        图像保存路径，如：
+        /public/home/zncui/pycharm_project/MaskDINO/myscripts/vis_self_attn_matrix.jpg
+    export_csv : bool
+        是否导出 CSV
+    """
+
+    import os
+    import csv
+    import torch
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    save_path = "/public/home/zncui/pycharm_project/MaskDINO/myscripts/vis_self_attn_matrix.jpg"
+
+    # ---- 1. tensor -> numpy ----
+    if isinstance(attn_matrix, torch.Tensor):
+        attn = attn_matrix.detach().float().cpu().numpy()
+    else:
+        attn = np.asarray(attn_matrix, dtype=np.float32)
+
+    # ---- 2. 多头 attention -> 平均 ----
+    if attn.ndim == 3:
+        attn = attn.mean(axis=0)
+
+    assert attn.ndim == 2, f"Expect 2D attention matrix, got {attn.shape}"
+    Q, K = attn.shape
+
+    # ---- 3. CSV 导出（原始 attention，不做任何变换） ----
+    if export_csv:
+        csv_path = save_path.replace(".jpg", ".csv").replace(".png", ".csv")
+
+        os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            # 写 header
+            writer.writerow(["query\\key"] + list(range(K)))
+            # 写 matrix
+            for i in range(Q):
+                row = [f"{v:.3f}" for v in attn[i]]  # ⭐ 保留三位小数
+                writer.writerow([i] + row)
+
+        print(f"✅ Attention CSV saved to: {csv_path}")
+
+    # ---- 4. heatmap 可视化处理流程 ----
+
+    # 百分位裁剪
+    vmax = np.percentile(attn, clip_percentile)
+    vmin = np.percentile(attn, 100 - clip_percentile)
+    attn_vis = np.clip(attn, vmin, vmax)
+
+    # log 拉伸
+    if log_scale:
+        attn_vis = np.log1p(attn_vis - attn_vis.min())
+
+    # 归一化
+    attn_vis = (attn_vis - attn_vis.min()) / (attn_vis.max() + 1e-8)
+
+    # ---- 5. 绘图 ----
+    fig, ax = plt.subplots(figsize=(7, 6))
+    im = ax.imshow(attn_vis,
+                   cmap="inferno",
+                   aspect="auto",
+                   interpolation="nearest")
+
+    ax.set_title(title, fontsize=12)
+    ax.set_xlabel("Key index")
+    ax.set_ylabel("Query index")
+
+    # 精简刻度
+    step = max(Q // 12, 1)
+    ax.set_xticks(np.arange(0, K, step))
+    ax.set_yticks(np.arange(0, Q, step))
+
+    # 色条
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label("Normalized attention", rotation=270, labelpad=12)
+
+    plt.tight_layout()
+
+    # ---- 6. 保存图像 ----
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    plt.savefig(save_path, dpi=300)
+    plt.close(fig)
+
+    print(f"✅ Attention heatmap saved to: {save_path}")
+
+
+def vis_attention_bar_from_csv(
+    pred_id,
+    csv_path="/public/home/zncui/pycharm_project/MaskDINO/myscripts/vis_self_attn_matrix.csv",
+    save_path=None,
+):
+    """
+    从 vis_self_attn_matrix.csv 中读取第 pred_id 行的 attention，
+    并绘制一个 bar 图。
+
+    CSV 格式示例:
+        query\\key,0,1,2,...,299
+        0,0.071,0.004,0.003,...
+        1,0.006,0.120,0.008,...
+        ...
+    """
+    import os
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+    import torch
+
+    # ---- 0. 把 pred_id 转成 Python int ----
+    if isinstance(pred_id, torch.Tensor):
+        # 支持标量 tensor 或形如 tensor([142])
+        pred_id = int(pred_id.detach().cpu().flatten()[0].item())
+    else:
+        pred_id = int(pred_id)
+
+    # ---- 1. 读 CSV ----
+    df = pd.read_csv(csv_path)  # 你的文件是标准逗号分隔
+
+    num_queries, num_cols = df.shape  # (300, 301)
+
+    # ---- 2. 安全检查 ----
+    if not (0 <= pred_id < num_queries):
+        raise ValueError(f"pred_id={pred_id} 超出范围，合法范围是 [0, {num_queries-1}]")
+
+    # ---- 3. 取出这一行 ----
+    row = df.iloc[pred_id]
+
+    # 如果 pred_id 传的是 array-like，df.iloc[...] 会返回 DataFrame，这里兜个底
+    if isinstance(row, pd.DataFrame):
+        row = row.iloc[0]
+
+    # row 现在应该是一个 Series：
+    # query\key      142
+    # 0             0.005
+    # 1             0.005
+    # ...
+    # 299           0.003
+
+    # 第一列是 query id，从第二列开始是 attention 值
+    attn_values = row.iloc[1:].astype(float).to_numpy()
+    key_indices = np.arange(attn_values.shape[0])
+
+    if attn_values.size == 0:
+        raise RuntimeError(
+            f"pred_id={pred_id} 这一行没有读到任何 attention 数值，row 内容:\n{row}"
+        )
+
+    # ---- 4. 画 bar 图 ----
+    plt.figure(figsize=(12, 4))
+    plt.bar(key_indices, attn_values)
+
+    plt.title(f"Query {pred_id} Attention over Keys", fontsize=12)
+    plt.xlabel("Key index")
+    plt.ylabel("Attention weight")
+
+    # X 轴刻度稀疏一点
+    step = max(len(key_indices) // 20, 1)
+    plt.xticks(key_indices[::step])
+
+    plt.grid(axis="y", linestyle="--", alpha=0.4)
+    plt.tight_layout()
+
+    # ---- 5. 保存或显示 ----
+    if save_path is not None:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path, dpi=200)
+        plt.close()
+        print(f"✅ Bar plot saved to: {save_path}")
+    else:
+        plt.show()
+
+
+# vis_ms_deform_attn.py
+import os
+import cv2
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+
+
+def visualize_ms_deform_attn_sampling(
+        sampling_locations: torch.Tensor,
+        image_path: str,
+        save_path: str,
+        batch_idx: int = 0,
+        query_idx: int = None,
+        max_points_per_level: int = None,
+):
+    """
+    可视化 MSDeformAttn 的采样点，按 feature level 分成多个小图。
+
+    参数
+    ----
+    sampling_locations: Tensor
+        形状为 (N, Len_q, n_heads, n_levels, n_points, 2)，
+        一般就是 MSDeformAttn.forward 中算出来的 sampling_locations。
+    image_path: str
+        背景图片路径，比如你的 transformed_image.jpg。
+    save_path: str
+        保存可视化结果的路径（.jpg 或 .png 均可）。
+    batch_idx: int
+        使用哪个 batch 的采样点（一般 N=1，就用 0）。
+    query_idx: int or None
+        如果是 None：可视化所有 query 的采样点。
+        如果是 int：只可视化指定某个 query 的采样点（便于单 query 观察）。
+    max_points_per_level: int or None
+        为了避免点太多太密，可以随机采样一部分点。
+        如果是 None：不过滤。
+        比如设为 5000，就每个 level 最多画 5000 个采样点。
+    """
+    # ---------- 1. 读图 ----------
+    img = cv2.imread(image_path)
+    if img is None:
+        raise FileNotFoundError(f"image_path not found: {image_path}")
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    H_img, W_img = img.shape[:2]
+
+    # ---------- 2. 整理 sampling_locations ----------
+    # sampling_locations: (N, Len_q, n_heads, n_levels, n_points, 2)
+    if sampling_locations.is_cuda:
+        sampling_locations = sampling_locations.detach().cpu()
+    else:
+        sampling_locations = sampling_locations.detach()
+
+    assert sampling_locations.ndim == 6, f"sampling_locations shape error: {sampling_locations.shape}"
+    N, Len_q, n_heads, n_levels, n_points, _ = sampling_locations.shape
+    assert 0 <= batch_idx < N, f"batch_idx {batch_idx} out of range [0, {N})"
+
+    # 取出某个 batch
+    coords = sampling_locations[batch_idx]  # (Len_q, n_heads, n_levels, n_points, 2)
+
+    # 如果只看某一个 query
+    if query_idx is not None:
+        assert 0 <= query_idx < Len_q, f"query_idx {query_idx} out of range [0, {Len_q})"
+        coords = coords[query_idx:query_idx + 1]  # (1, n_heads, n_levels, n_points, 2)
+        Len_q_vis = 1
+    else:
+        Len_q_vis = Len_q
+
+    # ---------- 3. 画图：每个 level 一个子图 ----------
+    fig, axes = plt.subplots(1, n_levels, figsize=(4 * n_levels, 4))
+    if n_levels == 1:
+        axes = [axes]
+
+    for lvl in range(n_levels):
+        ax = axes[lvl]
+        ax.imshow(img)
+        ax.set_title(f"Level {lvl}")
+        ax.axis("off")
+
+        # coords: (Len_q_vis, n_heads, n_levels, n_points, 2)
+        lvl_coords = coords[:, :, lvl, :, :]  # (Len_q_vis, n_heads, n_points, 2)
+        lvl_coords = lvl_coords.reshape(-1, 2)  # (Len_q_vis * n_heads * n_points, 2)
+
+        # 归一化坐标 -> 像素坐标
+        xs = lvl_coords[:, 0].numpy()
+        ys = lvl_coords[:, 1].numpy()
+
+        # clamp 到 [0, 1]，避免数值略超
+        xs = np.clip(xs, 0.0, 1.0)
+        ys = np.clip(ys, 0.0, 1.0)
+
+        xs_img = xs * W_img
+        ys_img = ys * H_img
+
+        # 如果点太多，可以随机采样一部分
+        if max_points_per_level is not None and xs_img.shape[0] > max_points_per_level:
+            idx = np.random.choice(xs_img.shape[0], max_points_per_level, replace=False)
+            xs_img = xs_img[idx]
+            ys_img = ys_img[idx]
+
+        # 画散点
+        ax.scatter(xs_img, ys_img, s=2, alpha=0.5)
+
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    fig.savefig(save_path, dpi=200)
+    plt.close(fig)
+    print(f"✅ MSDeformAttn sampling visualization saved to: {save_path}")
+
+import os
+import cv2
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+
+
+def visualize_ms_deform_attn_sampling_by_head(
+    sampling_locations: torch.Tensor,
+    image_path: str,
+    save_path: str,
+    batch_idx: int = 0,
+    query_idx: int = None,
+    max_points_per_head_per_level: int = None,
+):
+    """
+    按 head 区分颜色的 MSDeformAttn 采样点可视化。
+    每个 feature level 一个子图，子图中不同 head 使用不同颜色，并带图例。
+
+    参数
+    ----
+    sampling_locations: Tensor
+        形状 (N, Len_q, n_heads, n_levels, n_points, 2)
+    image_path: str
+        背景图 (transformed_image.jpg)
+    save_path: str
+        保存路径
+    batch_idx: int
+        选择第几个 batch
+    query_idx: int or None
+        None: 所有 query
+        int: 指定单个 query
+    max_points_per_head_per_level: int or None
+        每个 level、每个 head 最多绘制多少个采样点，避免太密。
+    """
+    # ---------- 1. 读图 ----------
+    img = cv2.imread(image_path)
+    if img is None:
+        raise FileNotFoundError(f"image_path not found: {image_path}")
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    H_img, W_img = img.shape[:2]
+
+    # ---------- 2. 整理 sampling_locations ----------
+    if sampling_locations.is_cuda:
+        sampling_locations = sampling_locations.detach().cpu()
+    else:
+        sampling_locations = sampling_locations.detach()
+
+    assert sampling_locations.ndim == 6, f"sampling_locations shape error: {sampling_locations.shape}"
+    N, Len_q, n_heads, n_levels, n_points, _ = sampling_locations.shape
+    assert 0 <= batch_idx < N, f"batch_idx {batch_idx} out of range [0, {N})"
+
+    coords = sampling_locations[batch_idx]  # (Len_q, n_heads, n_levels, n_points, 2)
+
+    if query_idx is not None:
+        assert 0 <= query_idx < Len_q, f"query_idx {query_idx} out of range [0, {Len_q})"
+        coords = coords[query_idx:query_idx + 1]  # (1, n_heads, n_levels, n_points, 2)
+        Len_q_vis = 1
+    else:
+        Len_q_vis = Len_q
+
+    # ---------- 3. 颜色：每个 head 一种 ----------
+    cmap = plt.get_cmap("tab10")
+    head_colors = [cmap(h % cmap.N) for h in range(n_heads)]
+
+    # ---------- 4. 画图 ----------
+    fig, axes = plt.subplots(1, n_levels, figsize=(4 * n_levels, 4))
+    if n_levels == 1:
+        axes = [axes]
+
+    for lvl in range(n_levels):
+        ax = axes[lvl]
+        ax.imshow(img)
+        ax.set_title(f"Level {lvl}")
+        ax.axis("off")
+
+        # coords: (Len_q_vis, n_heads, n_levels, n_points, 2)
+        # 取当前 level 的所有 query / head / points
+        lvl_coords = coords[:, :, lvl, :, :]  # (Len_q_vis, n_heads, n_points, 2)
+
+        # 每个 head 单独画一批点
+        for h in range(n_heads):
+            # (Len_q_vis, n_points, 2) -> (-1, 2)
+            head_coords = lvl_coords[:, h, :, :].reshape(-1, 2)  # (Len_q_vis * n_points, 2)
+
+            xs = head_coords[:, 0].numpy()
+            ys = head_coords[:, 1].numpy()
+
+            # clamp 到 [0, 1]
+            xs = np.clip(xs, 0.0, 1.0)
+            ys = np.clip(ys, 0.0, 1.0)
+
+            xs_img = xs * W_img
+            ys_img = ys * H_img
+
+            # 随机采样部分点，避免太密
+            if max_points_per_head_per_level is not None and xs_img.shape[0] > max_points_per_head_per_level:
+                idx = np.random.choice(xs_img.shape[0], max_points_per_head_per_level, replace=False)
+                xs_img = xs_img[idx]
+                ys_img = ys_img[idx]
+
+            ax.scatter(
+                xs_img,
+                ys_img,
+                s=4,
+                alpha=0.7,
+                color=head_colors[h],
+                label=f"head {h}" if lvl == 0 else None,  # 避免每个子图都重复 legend
+            )
+
+    # 只在第一个子图上放一个 legend（避免太挤）
+    axes[0].legend(
+        loc="upper right",
+        fontsize=8,
+        framealpha=0.7,
+        title="Heads"
+    )
+
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    fig.savefig(save_path, dpi=200)
+    plt.close(fig)
+    print(f"✅ MSDeformAttn sampling (by head) visualization saved to: {save_path}")
+
+import os
+import cv2
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+
+
+def visualize_ms_deform_attn_sampling_by_query(
+    sampling_locations: torch.Tensor,
+    image_path: str,
+    save_path: str,
+    batch_idx: int = 0,
+    query_indices=None,
+    max_points_per_query_per_level: int = None,
+):
+    """
+    按 query 区分颜色的 MSDeformAttn 采样点可视化。
+    每个 feature level 一个子图，子图中不同 query 使用不同颜色。
+
+    参数
+    ----
+    sampling_locations: Tensor
+        形状 (N, Len_q, n_heads, n_levels, n_points, 2)
+    image_path: str
+        背景图 (transformed_image.jpg)
+    save_path: str
+        保存路径
+    batch_idx: int
+        选择第几个 batch
+    query_indices: None 或 list[int]
+        None: 使用所有 query（颜色可能会重复/很多，不建议太大）
+        list: 只可视化这些指定 query（例如 [0, 1, 2, 142]）
+    max_points_per_query_per_level: int 或 None
+        每个 level、每个 query 最多绘制多少个采样点，避免太密。
+    """
+    # ---------- 1. 读图 ----------
+    img = cv2.imread(image_path)
+    if img is None:
+        raise FileNotFoundError(f"image_path not found: {image_path}")
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    H_img, W_img = img.shape[:2]
+
+    # ---------- 2. 整理 sampling_locations ----------
+    if sampling_locations.is_cuda:
+        sampling_locations = sampling_locations.detach().cpu()
+    else:
+        sampling_locations = sampling_locations.detach()
+
+    assert sampling_locations.ndim == 6, f"sampling_locations shape error: {sampling_locations.shape}"
+    N, Len_q, n_heads, n_levels, n_points, _ = sampling_locations.shape
+    assert 0 <= batch_idx < N, f"batch_idx {batch_idx} out of range [0, {N})"
+
+    coords = sampling_locations[batch_idx]  # (Len_q, n_heads, n_levels, n_points, 2)
+
+    # 选择要画的 query
+    if query_indices is None:
+        query_indices = list(range(Len_q))
+    else:
+        # 过滤出合法的
+        query_indices = [q for q in query_indices if 0 <= q < Len_q]
+        if len(query_indices) == 0:
+            raise ValueError("query_indices 为空或不合法")
+
+    num_queries_vis = len(query_indices)
+
+    # ---------- 3. 为 query 准备颜色 ----------
+    # 用连续 colormap，保证很多 query 也有不同颜色
+    cmap = plt.get_cmap("hsv")
+    query_colors = {}
+    for i, q in enumerate(query_indices):
+        query_colors[q] = cmap(i / max(1, num_queries_vis - 1))
+
+    # ---------- 4. 画图 ----------
+    fig, axes = plt.subplots(1, n_levels, figsize=(4 * n_levels, 4))
+    if n_levels == 1:
+        axes = [axes]
+
+    for lvl in range(n_levels):
+        ax = axes[lvl]
+        ax.imshow(img)
+        ax.set_title(f"Level {lvl}")
+        ax.axis("off")
+
+        # 给 legend 用的 handler
+        legend_handles = []
+
+        # 针对每个 query 画点
+        for q in query_indices:
+            # coords: (Len_q, n_heads, n_levels, n_points, 2)
+            # -> (n_heads, n_points, 2) for this query & level
+            q_lvl_coords = coords[q, :, lvl, :, :]           # (n_heads, n_points, 2)
+            q_lvl_coords = q_lvl_coords.reshape(-1, 2)       # (n_heads * n_points, 2)
+
+            xs = q_lvl_coords[:, 0].numpy()
+            ys = q_lvl_coords[:, 1].numpy()
+
+            xs = np.clip(xs, 0.0, 1.0)
+            ys = np.clip(ys, 0.0, 1.0)
+
+            xs_img = xs * W_img
+            ys_img = ys * H_img
+
+            if max_points_per_query_per_level is not None and xs_img.shape[0] > max_points_per_query_per_level:
+                idx = np.random.choice(xs_img.shape[0], max_points_per_query_per_level, replace=False)
+                xs_img = xs_img[idx]
+                ys_img = ys_img[idx]
+
+            sc = ax.scatter(
+                xs_img,
+                ys_img,
+                s=4,
+                alpha=0.7,
+                color=query_colors[q],
+                label=f"q{q}",
+            )
+
+            # 只在第一个 level 收集 legend，避免重复
+            if lvl == 0:
+                legend_handles.append(sc)
+
+        # 第一个子图放 legend（如果 query 太多你可以自己关掉）
+        if lvl == 0 and num_queries_vis <= 20:  # 太多就不显示 legend，避免挤满
+            ax.legend(
+                handles=legend_handles,
+                loc="upper right",
+                fontsize=8,
+                framealpha=0.7,
+                title="Queries"
+            )
+
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    fig.savefig(save_path, dpi=200)
+    plt.close(fig)
+    print(f"✅ MSDeformAttn sampling (by query) visualization saved to: {save_path}")
 
 
 

@@ -114,6 +114,26 @@ class MSDeformAttn(nn.Module):
         else:
             raise ValueError(
                 'Last dim of reference_points must be 2 or 4, but get {} instead.'.format(reference_points.shape[-1]))
+        # ====== DEBUG: 可视化采样点 ======
+        # from maskdino.analysis.tool_lab import visualize_ms_deform_attn_sampling, visualize_ms_deform_attn_sampling_by_head, \
+        #     visualize_ms_deform_attn_sampling_by_query
+        # try:
+        #     if sampling_locations.shape[1] == 300:
+        #         visualize_ms_deform_attn_sampling_by_query(
+        #             sampling_locations=sampling_locations,
+        #             image_path="/public/home/zncui/pycharm_project/MaskDINO/myscripts/transformed_image.jpg",
+        #             save_path="/public/home/zncui/pycharm_project/MaskDINO/myscripts/msda_sampling_by_query.jpg",
+        #             batch_idx=0,
+        #             # 例如只看几个 query：
+        #             # query_indices=[0, 1, 2, 10, 20, 50, 142],
+        #             # 或者 None = 所有 query（300 个会非常密，不建议）
+        #             query_indices=None,
+        #             # query_indices=None,
+        #             max_points_per_query_per_level=2000,
+        #         )
+        # except Exception as e:
+        #     print(f"[MSDeformAttn] visualize error: {e}")
+        # ====== DEBUG END ======
         try:
             output = MSDeformAttnFunction.apply(
                 value, input_spatial_shapes, input_level_start_index, sampling_locations, attention_weights, self.im2col_step)
