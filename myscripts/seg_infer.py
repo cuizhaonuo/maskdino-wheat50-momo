@@ -41,6 +41,7 @@ try:
     warnings.filterwarnings('ignore', category=ShapelyDeprecationWarning)
     warnings.filterwarnings("ignore", category=FutureWarning)
     warnings.filterwarnings("ignore", category=UserWarning)
+    warnings.filterwarnings('ignore', category=DeprecationWarning)
 except:
     pass
 
@@ -354,14 +355,14 @@ class SegInferenceTemplate:
 
         rows = [("filename", "ins_counts", "pred_counts")]
         xs, ys = [], []
-        for idx, img_path in tqdm(enumerate(images, 1), desc=f"{split.upper()} images"):
+        for idx, img_path in enumerate(tqdm(images, desc=f"{split.upper()} images", total=len(images)), 1):
             proposals = self._proposals_for_image(img_path)
             final_dets = self._apply_thresh_nms(proposals, score_thr, nms_iou_thr, iou_type)
             pred_count = len(final_dets)
             gt_count = yolo_count_instances(yolo_label_path_for_image(img_path, self.dataset.yolo_root))
             rows.append((os.path.basename(img_path), gt_count, pred_count))
             xs.append(gt_count); ys.append(pred_count)
-            save_coco = True
+            save_coco = False
             if save_coco:
                 img_id = idx * 100000
                 start_ins_id = img_id
@@ -432,11 +433,13 @@ class SegInferenceTemplate:
                     x2t = max(0, min(tile, int(math.ceil(bbox[2]))))
                     y2t = max(0, min(tile, int(math.ceil(bbox[3]))))
                     if x2t <= x1t or y2t <= y1t:
+                        # print(1)
                         continue
 
                     mask_crop = mask[y1t:y2t, x1t:x2t]
                     area = int(mask_crop.sum())
                     if area <= 0:
+                        # print(2)
                         continue
 
                     gx1, gy1 = x0 + x1t, y0 + y1t
@@ -444,6 +447,7 @@ class SegInferenceTemplate:
                     gx1 = max(0, min(W, gx1)); gx2 = max(0, min(W, gx2))
                     gy1 = max(0, min(H, gy1)); gy2 = max(0, min(H, gy2))
                     if gx2 <= gx1 or gy2 <= gy1:
+                        # print(3)
                         continue
 
                     proposals.append(DetProposal(
@@ -503,9 +507,9 @@ class SegInferenceTemplate:
     def _apply_thresh_nms(self, proposals: List[DetProposal],
                           score_thr: float, nms_thr: float, iou_type: IOUType) -> List[DetProposal]:
         fil = [p for p in proposals if p.score >= score_thr]
-        # return mask_nms(fil, nms_thr, iou_type) if fil else []
+        return mask_nms(fil, nms_thr, iou_type) if fil else []
         # 'keep_max'：合并后保留较大 score；想更平滑可改 'area_weighted'
-        return mask_nms_with_merge(fil, nms_thr, iou_type, score_mode="keep_max") if fil else []
+        # return mask_nms_with_merge(fil, nms_thr, iou_type, score_mode="keep_max") if fil else []
 
     def _save_coco_annotation(self, img_id, start_ins_id, img_path: str, dets: List[DetProposal], out_dir: str):
             """
@@ -584,65 +588,86 @@ class SegInferenceTemplate:
             with open(json_path, "w", encoding="utf-8") as f:
                 json.dump(coco_output, f, indent=2, ensure_ascii=False)
 
+    import os
+    import cv2
+    import numpy as np
+    from typing import List
+
     def _visualize_and_save(self, img_path: str, dets: List[DetProposal],
-                            out_dir: str, alpha: float = 0.8, draw_contour: bool = False):
+                            out_dir: str, alpha: float = 0.8, draw_contour: bool = False,
+                            draw_center: bool = False):
         img = cv2.imread(img_path)
-        if img is None: return
+        if img is None:
+            return
+
+        ensure_dir(out_dir)
+
+        # 用 overlay 叠加颜色
         overlay = img.copy()
+
+        # 固定随机种子，保证每次可复现（想要每次都不一样可以删掉 seed）
         rng = np.random.default_rng(12345)
+
         for d in dets:
-            # color = rng.integers(30, 255, size=3, dtype=np.uint8).tolist()
-            color = (255, 0, 0)  # 蓝色(BGR)
+            # --- 1. 随机生成一个“较深”的 BGR 颜色 ---
+            # 让每个通道都在 64~255 之间，避免太浅
+            color = rng.integers(64, 256, size=3, dtype=np.uint8).tolist()  # [B, G, R]
+
+            # --- 2. 取对应 ROI ---
             y1, y2 = d.top, int(d.top + d.mask.shape[0])
             x1, x2 = d.left, int(d.left + d.mask.shape[1])
-            # roi = overlay[y1:y2, x1:x2]
-            m = d.mask
-            # roi[m] = (0.2 * roi[m] + 0.8 * np.array(color, dtype=np.uint8)).astype(np.uint8)
+
+            # 防止越界（可选，但比较安全）
+            h, w = img.shape[:2]
+            y1 = max(0, min(h, y1))
+            y2 = max(0, min(h, y2))
+            x1 = max(0, min(w, x1))
+            x2 = max(0, min(w, x2))
+
+            roi = overlay[y1:y2, x1:x2]
+
+            # --- 3. 掩膜 m 应为 bool 类型 ---
+            m = d.mask.astype(bool)
+
+            # 如果 mask 尺寸与 roi 尺寸严格对应，这里直接用 m 作为索引
+            # 叠加颜色：roi = α * color + (1 - α) * roi
+            roi[m] = (alpha * np.array(color, dtype=np.float32) +
+                      (1 - alpha) * roi[m].astype(np.float32)).astype(np.uint8)
+
+            # --- 4. 画轮廓（用同一个颜色）---
             if draw_contour:
                 m8 = (m.astype(np.uint8) * 255)
                 contours, _ = cv2.findContours(m8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                cv2.drawContours(img[y1:y2, x1:x2], contours, -1, color, 2)
-            score = d.score
-            draw_center = False
-            if draw_center:
-                ys, xs = np.where(m > 0)
-                # if len(xs) > 0 and len(ys) > 0:
-                #     cx = int(x1 + np.mean(xs))
-                #     cy = int(y1 + np.mean(ys))
-                #     cv2.circle(img, (cx, cy), radius=6, color=(0, 0, 255), thickness=-1)  # 红色点
+                cv2.drawContours(overlay[y1:y2, x1:x2], contours, -1, color, 2)
 
-                # score > 0.5 红色， 0.2~0.5 黄色，<0.2 绿色
+            # --- 5. 按 score 画中心点（颜色可以根据 score 改，也可以直接用实例颜色）---
+            if draw_center:
+                score = d.score
+                ys, xs = np.where(m > 0)
                 if len(xs) > 0 and len(ys) > 0:
                     cx = int(x1 + np.mean(xs))
                     cy = int(y1 + np.mean(ys))
-                    if score > 0.5:
-                        point_color = (0, 0, 255)  # 红色
-                    elif score > 0.2:
-                        point_color = (0, 255, 255)  # 黄色
-                    else:
-                        point_color = (0, 255, 0)  # 绿色
-                    cv2.circle(img, (cx, cy), radius=6, color=point_color, thickness=-1)
 
+                    # 如果你想用 score 决定颜色，就用下面这段
+                    # if score > 0.5:
+                    #     point_color = (0, 0, 255)      # 红色
+                    # elif score > 0.2:
+                    #     point_color = (0, 255, 255)    # 黄色
+                    # else:
+                    #     point_color = (0, 255, 0)      # 绿色
 
-        # vis = cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0)
+                    # 或者直接用这个实例自身的颜色：
+                    point_color = tuple(color)
 
-        # # 在 img 上绘制 5x3 的网格
-        # h, w = img.shape[:2]
-        # # 可配置的网格与样式
-        # grid_rows = 5
-        # grid_cols = 3
-        # line_color = (255, 0, 0)  # BGR 中的蓝色
-        # thickness = 2
-        # for i in range(1, grid_rows):
-        #     y = i * h // grid_rows
-        #     cv2.line(img, (0, y), (w, y), color=line_color, thickness=thickness)
-        # for j in range(1, grid_cols):
-        #     x = j * w // grid_cols
-        #     cv2.line(img, (x, 0), (x, h), color=line_color, thickness=thickness)
+                    cv2.circle(overlay, (cx, cy), radius=6,
+                               color=point_color, thickness=-1)
 
-        vis = img
-        ensure_dir(out_dir)
-        cv2.imwrite(os.path.join(out_dir, os.path.basename(img_path)), vis)
+        # --- 6. 最终可视化图像：img 和 overlay 做一次整体的加权 ---
+        # 如果你已经在 roi 那一步做了 alpha 混合，也可以直接 vis = overlay
+        vis = cv2.addWeighted(overlay, 1.0, img, 0.0, 0)
+
+        out_path = os.path.join(out_dir, os.path.basename(img_path))
+        cv2.imwrite(out_path, vis)
 
     def _draw_scatter(self, xs: List[int], ys: List[int], out_path: str):
         plt.figure(figsize=(6, 6))

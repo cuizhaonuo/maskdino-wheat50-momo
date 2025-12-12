@@ -1,3 +1,4 @@
+import pandas as pd
 import torch
 
 from maskdino.utils import box_ops
@@ -426,6 +427,7 @@ def draw_encoder_class_heatmap(class_logits, level_start_indices, spatial_shapes
 
     # ====== 1. dtype & device 统一 ======
     class_logits = class_logits.detach().float().cpu()
+    class_scores = class_logits.sigmoid()
 
     if isinstance(level_start_indices, torch.Tensor):
         level_start_indices = level_start_indices.tolist()
@@ -438,8 +440,8 @@ def draw_encoder_class_heatmap(class_logits, level_start_indices, spatial_shapes
     TOPK = 300
     topk_indices = torch.topk(class_logits, TOPK)[1].tolist()
     # topk_indices = topk_indices[-1:]
-    query_id = vars[0]
-    selected_attn_output_weights = vars[1]
+    query_id = vars[0] if len(vars) > 1 else None
+    selected_attn_output_weights = vars[1] if len(vars) > 2 else None
 
     # ====== 3. token index -> (level, y, x) 映射 ======
     token_map = []   # 每个 token => (level, y, x)
@@ -459,7 +461,7 @@ def draw_encoder_class_heatmap(class_logits, level_start_indices, spatial_shapes
         class_features.append(fmap)
 
     # ====== 5. 读取原图 ======
-    image_path = '/public/home/zncui/pycharm_project/MaskDINO/myscripts/transformed_image.jpg'
+    image_path = '/public/home/zncui/pycharm_project/MaskDINO/myscripts/transformed_image_v1.jpg'
     image = mmcv.imread(image_path, channel_order="rgb")
     image = image.astype(np.uint8)
 
@@ -467,10 +469,11 @@ def draw_encoder_class_heatmap(class_logits, level_start_indices, spatial_shapes
     drawn_images = []
 
     # ====== 6. 每层画热力图 & overlay 蓝色 top-k ======
-
-    score = selected_attn_output_weights
-    # 获取 score 最大的 10 个数值的索引
-    topk_score_indices = torch.topk(score, 10)[1]
+    topk_score_indices = None
+    if selected_attn_output_weights is not None:
+        score = selected_attn_output_weights
+        # 获取 score 最大的 10 个数值的索引
+        topk_score_indices = torch.topk(score, 10)[1]
 
     for lvl, fmap in enumerate(class_features):
 
@@ -501,13 +504,23 @@ def draw_encoder_class_heatmap(class_logits, level_start_indices, spatial_shapes
             px = int((x + 0.5) * sx)
             py = int((y + 0.5) * sy)
 
-            cv2.circle(img, (px, py), radius=3, color=(255, 0, 0), thickness=-1)  # 蓝点(BGR)
+            cv2.circle(img, (px, py), radius=5, color=(255, 0, 0), thickness=-1)
 
-            if i == query_id:
+            # score = class_scores[tidx]
+            # cv2.putText(img, f"{score:.3f}", (px + 5, py - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1, cv2.LINE_AA)
+            # if score < 0.3:
+            #     cv2.circle(img, (px, py), radius=5, color=(255, 0, 0), thickness=-1)
+            # if 0.3 <= score < 0.6:
+            #     cv2.circle(img, (px, py), radius=5, color=(0, 255, 0), thickness=-1)
+            # if score >= 0.6:
+            #     cv2.circle(img, (px, py), radius=5, color=(0, 0, 255), thickness=-1)
+
+            if query_id is not None and i == query_id:
                 cv2.circle(img, (px, py), radius=10, color=(0, 255, 0), thickness=-1)
 
-            if i in topk_score_indices:
-                cv2.circle(img, (px, py), radius=8, color=(0, 0, 255), thickness=-1)
+            if topk_score_indices is not None:
+                if i in topk_score_indices :
+                    cv2.circle(img, (px, py), radius=8, color=(0, 0, 255), thickness=-1)
 
 
             # if score > 0.001:
@@ -533,6 +546,21 @@ def draw_encoder_class_heatmap(class_logits, level_start_indices, spatial_shapes
     save_path = "/public/home/zncui/pycharm_project/MaskDINO/myscripts/encoder_class_heatmap.jpg"
     plt.savefig(save_path, dpi=200)
     plt.close(fig)
+
+    # # ====== 画 TopK class_scores 的柱状图 ======
+    # topk_scores = class_scores[topk_indices].cpu().numpy()  # (TOPK,)
+    #
+    # # 简单版本：x 轴就是 0~TOPK-1
+    # plt.figure(figsize=(12, 4))
+    # plt.bar(np.arange(len(topk_scores)), topk_scores)
+    # plt.xlabel("TopK token rank")
+    # plt.ylabel("class_scores (sigmoid)")
+    # plt.title(f"Top-{TOPK} class scores")
+    # plt.tight_layout()
+    #
+    # bar_save_path = "/public/home/zncui/pycharm_project/MaskDINO/myscripts/encoder_class_scores_bar.jpg"
+    # plt.savefig(bar_save_path, dpi=200)
+    # plt.close()
 
 
 
@@ -2428,6 +2456,893 @@ def visualize_ms_deform_attn_sampling_by_query(
     fig.savefig(save_path, dpi=200)
     plt.close(fig)
     print(f"✅ MSDeformAttn sampling (by query) visualization saved to: {save_path}")
+
+
+
+
+
+def analyze_query_scores(out, save_path="query_scores_bar.png", topk=None):
+    """
+    将 out 中所有 pred_logits 做 sigmoid 后，按 Nx1 纵向柱状图形式保存
+
+    参数
+    ----
+    out : dict
+        模型输出
+    save_path : str
+        保存路径
+    topk : int or None
+        若指定，只画TopK最大的query（按score排序）
+    """
+    import os
+    import torch
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    def _to_numpy(x):
+        if torch.is_tensor(x):
+            return x.detach().cpu().numpy()
+        return np.asarray(x)
+
+    # ===== 1. 收集所有 pred_logits =====
+    logits_list = []
+    names = []
+
+    if "pred_logits" in out:
+        logits_list.append(out["pred_logits"])
+        names.append("main/pred_logits")
+
+    if "aux_outputs" in out:
+        for i, aux in enumerate(out["aux_outputs"]):
+            if "pred_logits" in aux:
+                logits_list.append(aux["pred_logits"])
+                names.append(f"aux[{i}]/pred_logits")
+
+    if "interm_outputs" in out and isinstance(out["interm_outputs"], dict):
+        if "pred_logits" in out["interm_outputs"]:
+            logits_list.append(out["interm_outputs"]["pred_logits"])
+            names.append("interm/pred_logits")
+
+    assert len(logits_list) > 0, "❌ 没有找到 pred_logits"
+
+    # ===== 2. sigmoid 处理 =====
+    scores_list = []
+    scores_sum_list = []
+    for lg in logits_list:
+        lg = torch.as_tensor(lg)
+
+        # 期望 (B, N, C) / (B, N) / (N)
+        if lg.dim() == 3:
+            lg = lg[..., 0]  # 默认第0类
+        if lg.dim() == 2:
+            lg = lg[0]
+        if lg.dim() != 1:
+            raise ValueError(f"不支持 pred_logits 维度: {lg.shape}")
+
+        scores = lg.sigmoid()
+        scores_sum = scores.sum()
+        scores_list.append(_to_numpy(scores))
+        scores_sum_list.append(scores_sum)
+
+    for sc_sum, name in zip(scores_sum_list, names):
+        print(f"[INFO] {name}: scores sum = {sc_sum}")
+    # python
+    import torch
+
+    # 把可能在 GPU 上的 tensor 转为 CPU 上的 float，再去重与统计
+    unique_scores = []
+    for s in scores_sum_list:
+        if torch.is_tensor(s):
+            unique_scores.append(float(s.detach().cpu().item()))
+        else:
+            unique_scores.append(float(s))
+
+    unique_scores_sum_list = list(set(unique_scores))
+    mean_score_sum = np.mean(unique_scores_sum_list)
+    std_score_sum = np.std(unique_scores_sum_list)
+    print(f"[INFO] Unique scores sum: mean = {mean_score_sum:.4f}, std = {std_score_sum:.4f}")
+    # ===== 3. 绘制柱状图 =====
+    N = len(scores_list)
+    fig_h = max(2.2 * N, 3)
+    fig, axes = plt.subplots(N, 1, figsize=(12, fig_h), sharex=False)
+
+    if N == 1:
+        axes = [axes]
+
+    for i, (sc, name) in enumerate(zip(scores_list, names)):
+        ax = axes[i]
+
+        # TopK 可选
+        if topk is not None and topk < len(sc):
+            idx = np.argsort(sc)[-topk:][::-1]
+            sc = sc[idx]
+            x = np.arange(len(sc))
+            title = f"{name}  (Top-{topk})"
+        else:
+            x = np.arange(len(sc))
+            title = f"{name}  (N={len(sc)})"
+
+        ax.bar(x, sc)
+        ax.set_ylim(0, 1.05)
+        ax.set_ylabel("sigmoid score")
+        ax.set_title(title, fontsize=11)
+        ax.grid(alpha=0.3, axis="y")
+
+        # 标注最大最小
+        ax.text(
+            0.01, 0.88,
+            f"min={sc.min():.3f}  max={sc.max():.3f}",
+            transform=ax.transAxes,
+            bbox=dict(facecolor="white", alpha=0.6, edgecolor="none"),
+            fontsize=9
+        )
+
+        # X轴显示密度控制
+        if len(sc) > 50:
+            ax.set_xticks(np.linspace(0, len(sc)-1, num=10).astype(int))
+
+    axes[-1].set_xlabel("query index")
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=200)
+    plt.close()
+
+    print(f"[OK] 柱状图保存完成: {os.path.abspath(save_path)}")
+    return save_path
+
+import os
+import torch
+import numpy as np
+import cv2
+import matplotlib.pyplot as plt
+
+
+def _visualize_decoder_outputs(out):
+    """
+    将所有 decoder 输出中的 query 中心点绘制到同一张背景图上，
+    每个 pred_logits / pred_boxes 对应一个子图 (N x 1 布局)。
+
+    假定 pred_boxes 形状为 (B, num_queries, 4)，格式为
+        (cx, cy, w, h)，并已在 [0, 1] 范围内归一化。
+    """
+
+    # ====== 0. 路径设置 ======
+    img_path = "/public/home/zncui/pycharm_project/MaskDINO/myscripts/transformed_image_v1.jpg"
+    save_path = "/public/home/zncui/pycharm_project/MaskDINO/myscripts/decoder_queries_overlay.jpg"
+
+    # ====== 1. 读入背景图 ======
+    img = cv2.imread(img_path)
+    if img is None:
+        raise FileNotFoundError(f"无法读取背景图: {img_path}")
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    H, W = img_rgb.shape[:2]
+
+    # ====== 2. 收集 (logits, boxes, name) 对 ======
+    pairs = []
+
+    # 主输出
+    if "pred_logits" in out and "pred_boxes" in out:
+        pairs.append((out["pred_logits"], out["pred_boxes"], "main"))
+
+    # aux_outputs
+    if "aux_outputs" in out:
+        for i, aux in enumerate(out["aux_outputs"]):
+            if "pred_logits" in aux and "pred_boxes" in aux:
+                pairs.append((aux["pred_logits"], aux["pred_boxes"], f"aux[{i}]"))
+
+    # interm_outputs
+    if "interm_outputs" in out and isinstance(out["interm_outputs"], dict):
+        inter = out["interm_outputs"]
+        if "pred_logits" in inter and "pred_boxes" in inter:
+            pairs.append((inter["pred_logits"], inter["pred_boxes"], "interm"))
+
+    if len(pairs) == 0:
+        raise ValueError("在 out 中没有找到任意一对 (pred_logits, pred_boxes)")
+
+    # ====== 3. 工具函数：boxes -> 中心点绝对坐标 ======
+    def boxes_to_centers_abs(boxes_tensor, h, w):
+        """
+        boxes_tensor: (B, N, 4) or (N, 4)
+        归一化 cx,cy,wh -> 返回 (N,2) 绝对坐标 (cx_abs, cy_abs)
+        """
+        boxes = torch.as_tensor(boxes_tensor).detach().float()
+
+        # 只取 batch 的第 0 张
+        if boxes.dim() == 3:
+            boxes = boxes[0]          # (N, 4)
+        elif boxes.dim() != 2:
+            raise ValueError(f"不支持的 boxes 维度: {boxes.shape}")
+
+        # 判断是否归一化 (简单判断：最大值 <= 1.0 视为归一化)
+        if boxes[..., :2].max() <= 1.0 and boxes[..., 2:].max() <= 1.0:
+            # cx, cy, w, h (归一化)
+            cx = boxes[:, 0] * w
+            cy = boxes[:, 1] * h
+        else:
+            # 认为是 xyxy 绝对坐标
+            x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+            cx = (x1 + x2) / 2.0
+            cy = (y1 + y2) / 2.0
+
+        centers = torch.stack([cx, cy], dim=-1)
+        return centers.cpu().numpy()   # (N, 2)
+
+    # ====== 4. 创建子图布局 ======
+    num_layers = len(pairs)
+    fig_h = max(3 * num_layers, 3)
+    fig, axes = plt.subplots(num_layers, 1, figsize=(8, fig_h))
+
+    if num_layers == 1:
+        axes = [axes]
+
+    # ====== 5. 逐层画图 ======
+    for idx, (logits, boxes, name) in enumerate(pairs):
+        ax = axes[idx]
+
+        # 背景图
+        ax.imshow(img_rgb)
+
+        # 计算中心点绝对坐标
+        centers = boxes_to_centers_abs(boxes, H, W)  # (N, 2)
+        xs = centers[:, 0]
+        ys = centers[:, 1]
+
+        # 红色点绘制所有 query
+        ax.scatter(xs, ys, s=8, c="red", marker="o", alpha=0.8)
+
+        ax.set_title(f"{name}: {centers.shape[0]} queries", fontsize=11)
+        ax.set_axis_off()
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=200)
+    plt.close()
+
+    print(f"[OK] decoder query 可视化已保存: {save_path}")
+    return save_path
+
+import os
+import torch
+import numpy as np
+import cv2
+import matplotlib.pyplot as plt
+
+
+def visualize_decoder_outputs(
+    out,
+    img_path="/public/home/zncui/pycharm_project/MaskDINO/myscripts/transformed_image_v1.jpg",
+    save_path="/public/home/zncui/pycharm_project/MaskDINO/myscripts/decoder_queries_score_buckets.jpg",
+):
+    """
+    可视化 decoder 各层 query 在背景图上的位置，并根据每个 query 自身的 score(=sigmoid(pred_logits))
+    分段上色。
+
+    规则：
+    - 仅使用 interm_outputs 和 aux_outputs（忽略 main 输出）。
+    - 层顺序：interm(如果有) -> aux[0] -> aux[1] -> ...
+    - 对每一层：
+        1) 从 pred_logits 提取 batch=0、类别0 的 logits，并 sigmoid 得到 score ∈ [0,1]
+        2) 每个 query 的颜色由该 score 所在的区间决定：
+           score > 0.6                         -> 红色 ("red")
+           0.5 <= score <= 0.6                 -> 橙色 ("orange")
+           0.4 <= score < 0.5                  -> 金黄 ("gold")
+           0.3 <= score < 0.4                  -> 黄绿 ("yellowgreen")
+           0.2 <= score < 0.3                  -> 绿 ("green")
+           0.1 <= score < 0.2                  -> 浅蓝 ("deepskyblue")
+           0.0 <= score < 0.1                  -> 深蓝 ("navy")
+        3) 每层一个子图（N x 1 布局），背景为同一张图像，点为该层各 query 的 bbox 中心。
+    - pred_boxes 假定为 (B, N, 4)：
+        若数值在 [0,1] 内，则视为归一化 (cx, cy, w, h)，否则视为 (x1,y1,x2,y2) 绝对坐标。
+    """
+
+    # ===== 0. 读取背景图 =====
+    img = cv2.imread(img_path)
+    if img is None:
+        raise FileNotFoundError(f"无法读取背景图: {img_path}")
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    H, W = img_rgb.shape[:2]
+
+    # ===== 1. 工具函数：取 score =====
+    def _extract_scores(pred_logits):
+        """
+        将 pred_logits 转为一维 scores 向量 (N,)：
+        - 支持 (B, N, C), (B, N), (N, C), (N,)
+        - 默认取 batch=0, 类别维度取第0类，然后过 sigmoid。
+        """
+        t = torch.as_tensor(pred_logits).detach().float()
+
+        if t.dim() == 3:      # (B, N, C)
+            t = t[0]          # (N, C)
+            if t.size(-1) > 1:
+                # 若想改为取 max 类别，可替换为：t = t.max(-1).values
+                t = t[:, 0]
+            else:
+                t = t[:, 0]
+        elif t.dim() == 2:    # (B, N) or (N, C)
+            if t.size(0) > 1 and t.size(1) != 1:
+                # 视为 (B, N)，取第0个 batch
+                t = t[0]
+            elif t.size(1) == 1:
+                t = t[:, 0]
+            else:
+                # 视为 (N,)
+                pass
+        elif t.dim() == 1:    # (N,)
+            pass
+        else:
+            raise ValueError(f"不支持的 pred_logits 维度: {t.shape}")
+
+        scores = t.sigmoid()  # (N,)
+        return scores.cpu().numpy()
+
+    # ===== 2. 工具函数：box -> 中心绝对坐标 =====
+    def _boxes_to_centers_abs(boxes_tensor, h, w):
+        """
+        boxes_tensor: (B, N, 4) or (N, 4)
+        -> 返回 (N, 2) 绝对坐标 (cx_abs, cy_abs)
+        """
+        boxes = torch.as_tensor(boxes_tensor).detach().float()
+
+        if boxes.dim() == 3:
+            boxes = boxes[0]  # (N, 4)
+        elif boxes.dim() != 2:
+            raise ValueError(f"不支持的 boxes 维度: {boxes.shape}")
+
+        # 简单判断是否归一化
+        normalized = (boxes[..., :4].max() <= 1.0) and (boxes[..., :4].min() >= 0.0)
+
+        if normalized:
+            # (cx, cy, w, h) in [0,1]
+            cx = boxes[:, 0] * w
+            cy = boxes[:, 1] * h
+        else:
+            # 认为是 (x1, y1, x2, y2)
+            x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+            cx = (x1 + x2) * 0.5
+            cy = (y1 + y2) * 0.5
+
+        centers = torch.stack([cx, cy], dim=-1)
+        return centers.cpu().numpy()  # (N, 2)
+
+    # ===== 3. 按 interm + aux 顺序收集层 =====
+    layers = []  # 每个元素: dict(name, scores, centers)
+
+    # interm 在最前
+    if "interm_outputs" in out and isinstance(out["interm_outputs"], dict):
+        inter = out["interm_outputs"]
+        if "pred_logits" in inter and "pred_boxes" in inter:
+            scores = _extract_scores(inter["pred_logits"])
+            centers = _boxes_to_centers_abs(inter["pred_boxes"], H, W)
+            layers.append(
+                {
+                    "name": "interm",
+                    "scores": scores,
+                    "centers": centers,
+                }
+            )
+
+    # 然后 aux[0], aux[1], ...
+    if "aux_outputs" in out:
+        for i, aux in enumerate(out["aux_outputs"]):
+            if "pred_logits" in aux and "pred_boxes" in aux:
+                scores = _extract_scores(aux["pred_logits"])
+                centers = _boxes_to_centers_abs(aux["pred_boxes"], H, W)
+                layers.append(
+                    {
+                        "name": f"aux[{i}]",
+                        "scores": scores,
+                        "centers": centers,
+                    }
+                )
+
+    if len(layers) == 0:
+        raise ValueError("没有找到 interm_outputs 或 aux_outputs 中的 (pred_logits, pred_boxes)")
+
+    # ===== 4. 定义 score 分段与颜色映射 =====
+    # 注意：score > 0.6 单独设为红色
+    #       0.0 ~ 0.6 每 0.1 一个区间，共 6 段
+    #       0.6 本身这里归入 [0.5, 0.6] 区间，>0.6 才是红色
+    bucket_defs = [
+        (0.0, 0.1, "navy",        "[0.0, 0.1)"),
+        (0.1, 0.2, "deepskyblue", "[0.1, 0.2)"),
+        (0.2, 0.3, "green",       "[0.2, 0.3)"),
+        (0.3, 0.4, "yellowgreen", "[0.3, 0.4)"),
+        (0.4, 0.5, "gold",        "[0.4, 0.5)"),
+        (0.5, 0.6 + 1e-6, "orange", "[0.5, 0.6]"),  # 0.6 归到这里
+    ]
+    high_color = "red"   # score > 0.6
+
+    # ===== 5. 画图 =====
+    num_layers = len(layers)
+    fig_h = max(3 * num_layers, 3)
+    fig, axes = plt.subplots(num_layers, 1, figsize=(8, fig_h))
+
+    if num_layers == 1:
+        axes = [axes]
+
+    # 我们只在第一层画图例，避免太挤
+    legend_handles = None
+
+    for idx, layer in enumerate(layers):
+        ax = axes[idx]
+        ax.imshow(img_rgb)
+
+        centers = layer["centers"]
+        scores = layer["scores"]
+        # 防止 boxes 数量和 scores 数量不等，截断到最小长度
+        n = min(len(centers), len(scores))
+        centers = centers[:n]
+        scores = scores[:n]
+
+        xs = centers[:, 0]
+        ys = centers[:, 1]
+
+        # 先画 score > 0.6 的红点
+        mask_high = scores > 0.6
+        if mask_high.any():
+            h = ax.scatter(xs[mask_high], ys[mask_high], s=16, c=high_color, alpha=0.9, label="> 0.6")
+        else:
+            h = None
+
+        # 再画各个 bucket
+        bucket_handles = []
+        for (low, high, color, label) in bucket_defs:
+            if high > 0.6:   # 防止和 high_color 冲突，已经让 >0.6 走了高分分支
+                high_eff = min(high, 0.6 + 1e-6)
+            else:
+                high_eff = high
+
+            mask = (scores >= low) & (scores < high_eff)
+            if mask.any():
+                h_bucket = ax.scatter(xs[mask], ys[mask], s=10, c=color, alpha=0.85, label=label)
+                bucket_handles.append(h_bucket)
+
+        n_q = centers.shape[0]
+        ax.set_title(f"{layer['name']}  (queries={n_q})", fontsize=11)
+        ax.set_axis_off()
+
+        # 第一层添加图例
+        if idx == 0:
+            handles = []
+            labels = []
+            # bucket legend
+            for (low, high, color, label), h_bucket in zip(bucket_defs, bucket_handles):
+                handles.append(h_bucket)
+                labels.append(label)
+            # high score legend
+            if h is not None:
+                handles.append(h)
+                labels.append("> 0.6")
+
+            if handles:
+                legend_handles = (handles, labels)
+                ax.legend(handles, labels, loc="upper right", fontsize=8)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=200)
+    plt.close()
+
+    print(f"[OK] decoder query 按 score 分段上色可视化已保存: {save_path}")
+    return save_path
+
+def vis_decoder_layer_results(outputs, batched_inputs):
+    # 获取数据
+    # predictions = [('pred_logits', 'pred_boxes', 'pred_masks', 'layer_name')]
+    # targets = [{'gt_boxes', 'gt_masks'}]
+    # 计算 predictions 中每层与 targets 的 IoU，其中 gt_mask 与 gt_boxs 可选
+    img_path = '/public/home/zncui/pycharm_project/MaskDINO/myscripts/transformed_image_v1.jpg'
+    img = cv2.imread(img_path)
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    H, W = img_rgb.shape[:2]
+
+    predictions = []
+    if 'pred_logits' in outputs and 'pred_boxes' in outputs and 'pred_masks' in outputs:
+        pred_logits = outputs['pred_logits']
+        pred_boxes = outputs['pred_boxes']
+        pred_masks = outputs['pred_masks']
+        predictions.append((pred_logits, pred_boxes, pred_masks, 'main'))
+    if 'interm_outputs' in outputs:
+        interm = outputs['interm_outputs']
+        if 'pred_logits' in interm and 'pred_boxes' in interm and 'pred_masks' in interm:
+            pred_logits = interm['pred_logits']
+            pred_boxes = interm['pred_boxes']
+            pred_masks = interm['pred_masks']
+            predictions.append((pred_logits, pred_boxes, pred_masks, 'interm'))
+    if 'aux_outputs' in outputs:
+        for i, aux in enumerate(outputs['aux_outputs']):
+            if 'pred_logits' in aux and 'pred_boxes' in aux and 'pred_masks' in aux:
+                pred_logits = aux['pred_logits']
+                pred_boxes = aux['pred_boxes']
+                pred_masks = aux['pred_masks']
+                predictions.append((pred_logits, pred_boxes, pred_masks, f'aux[{i}]'))
+
+    targets = {}
+    gt_boxes = batched_inputs[0]['instances'].get('gt_boxes')
+    gt_masks = batched_inputs[0]['instances'].get('gt_masks')
+    targets.update({'gt_boxes': gt_boxes, 'gt_masks': gt_masks})
+
+    def compute_mask_iou(pred_mask, gt_mask):
+        # pred_mask, gt_mask: (H, W), binary mask
+        intersection = torch.logical_and(pred_mask, gt_mask).sum()
+        union = torch.logical_or(pred_mask, gt_mask).sum()
+        if union == 0:
+            return 0.0
+        else:
+            return intersection.float() / union.float()
+
+    def compute_box_iou(pred_box, gt_box, H, W):
+        # pred_box, gt_box: (cx, cy, w, h) in [0,1]
+        # 转为 (x1, y1, x2, y2) 绝对坐标
+        pcx, pcy, pw, ph = pred_box
+        gx1, gy1, gx2, gy2 = gt_box
+        px1 = (pcx - pw / 2.0) * W
+        py1 = (pcy - ph / 2.0) * H
+        px2 = (pcx + pw / 2.0) * W
+        py2 = (pcy + ph / 2.0) * H
+
+        # 计算 IoU
+        inter_x1 = max(px1, gx1)
+        inter_y1 = max(py1, gy1)
+        inter_x2 = min(px2, gx2)
+        inter_y2 = min(py2, gy2)
+        inter_w = max(0.0, inter_x2 - inter_x1)
+        inter_h = max(0.0, inter_y2 - inter_y1)
+        intersection = inter_w * inter_h
+
+        area_pred = (px2 - px1) * (py2 - py1)
+        area_gt = (gx2 - gx1) * (gy2 - gy1)
+        union = area_pred + area_gt - intersection
+
+        if union == 0:
+            return 0.0
+        else:
+            return intersection / union
+
+        # # debug 返回 center 距离
+        # pred_box_center = ((px1 + px2) / 2.0, (py1 + py2) / 2.0)
+        # tgt_box = ((gx1 + gx2) / 2.0, (gy1 + gy2) / 2.0)
+        # center_distance = abs(pred_box_center[0] - tgt_box[0]) + abs(pred_box_center[1] - tgt_box[1])
+        # center_distance = -center_distance
+        # return center_distance
+
+    layer_indices_list = []
+    max_iou_list = []
+    mode = 'gt_boxes'  # 'gt_boxes' or 'gt_masks'
+    for l, layer_prediction in enumerate(predictions):
+        pred_logits, pred_boxes, pred_masks, layer_name = layer_prediction
+        gt_boxes = targets['gt_boxes'].tensor
+        instances = gt_boxes
+        if 'boxes' in mode:
+            W, H = 1024, 1024
+            pred_boxes = pred_boxes.squeeze()  # (N, 4)
+            iou_matrix = torch.zeros(len(pred_boxes), len(instances))
+            for i, box in enumerate(pred_boxes):
+                for j, ins in enumerate(instances):
+                    iou = compute_box_iou(box, ins, H, W)
+                    iou_matrix[i, j] = iou
+            iou_sum = iou_matrix.sum(dim=-1)
+            zero_iou_sum_indices = torch.where(iou_sum == 0)
+            max_iou, indices = iou_matrix.max(dim=-1)
+            indices[zero_iou_sum_indices] = -1
+            layer_indices_list.append(indices)
+            max_iou_list.append(max_iou)
+    stacked_layer_indices_list = torch.stack(layer_indices_list, dim=0)
+    stacked_max_iou_list = torch.stack(max_iou_list, dim=0)
+    # 观察 query id 每层对应的预测结果与最大 iou 匹配实例
+    transposed_layer_indices_list = stacked_layer_indices_list[1:].transpose(1, 0)
+    transposed_max_iou_list = stacked_max_iou_list[1:].transpose(1, 0)
+    layer_pred_logits_list = [item[0].squeeze() for item in predictions] # pred_logits (bs, nq, nc) --> (1, 300, 1) --> (300,)
+    transposed_layer_pred_logits_list = torch.stack(layer_pred_logits_list[1:], dim=0).transpose(1, 0) # (10, 300) --> (300, 10)
+
+    information_for_visualization = []
+    for i, (transposed_layer_indices, transposed_layer_pred_logits, transposed_max_iou) in \
+            enumerate(zip(transposed_layer_indices_list,
+                          transposed_layer_pred_logits_list,
+                          transposed_max_iou_list)):
+        # (300, 10), (300, 10), (300, 10) --> (10,), (10,), (10,)
+        transposed_layer_pred_logits_with_sigmoid = transposed_layer_pred_logits.sigmoid().detach().cpu()
+        # for query_id in [21, 22]:
+        #     if query_id in transposed_layer_indices:
+        #         print('query_id: ', query_id)
+        #         for layer_idx, layer_logits_with_sigmoid, max_iou in zip(transposed_layer_indices, transposed_layer_pred_logits_with_sigmoid,
+        #                                                         transposed_max_iou):
+        #             print(layer_idx.item(), ' --> ', layer_logits_with_sigmoid.item(), ' -- ', max_iou.item())
+        for tgt_id in range(len(targets['gt_boxes'])):
+            # if tgt_id in transposed_layer_indices:
+            if tgt_id == transposed_layer_indices[-1]:
+                print('query_id: ', tgt_id)
+                # print(transposed_layer_indices.tolist())
+                # print(transposed_layer_pred_logits_with_sigmoid.tolist())
+                # print(transposed_max_iou.tolist())
+                information_for_visualization.append((tgt_id,
+                                                      transposed_layer_indices.tolist(),
+                                                      transposed_layer_pred_logits_with_sigmoid.tolist(),
+                                                      transposed_max_iou.tolist()))
+    from matplotlib import pyplot as plt
+    nrows = 10
+    ncols = 5
+    fig0, axes0 = plt.subplots(nrows, ncols, figsize=(5 * ncols, 5 * nrows))
+    axes0 = axes0.flatten()
+
+    # 第一列是 max_score, 第二列是 query_id
+    # max_score_indices = torch.full((len(targets['gt_boxes']), 2), -1, dtype=torch.float)
+    # for i, info in enumerate(information_for_visualization):
+    #     tgt_id, _, layer_pred_logits, _ = info
+    #     if max_score_indices[tgt_id][0] == -1:
+    #         max_score_indices[tgt_id][0] = layer_pred_logits[-1]
+    #         max_score_indices[tgt_id][1] = i
+    #     curr_max_score = max_score_indices[tgt_id][0]
+    #     if layer_pred_logits[-1] > curr_max_score:
+    #         max_score_indices[tgt_id][0] = layer_pred_logits[-1]
+    #         max_score_indices[tgt_id][1] = i
+
+
+    for i, info in enumerate(information_for_visualization):
+        tgt_id, layer_indices, layer_pred_logits_with_sigmoid, layer_max_iou = info
+        ax = axes0[tgt_id]
+        x = np.arange(len(layer_indices))
+        ax.plot(x, layer_pred_logits_with_sigmoid, marker='x', color='orange', label='Pred Logits (sigmoid)')
+        ax.plot(x, layer_max_iou, marker='s', color='green', label='Max IoU')
+        # if i == max_score_indices[tgt_id][1]:
+        #     ax.plot(x, layer_pred_logits_with_sigmoid, marker='x', color='red', label='Pred Logits (sigmoid)')
+        #     ax.plot(x, layer_max_iou, marker='s', color='blue', label='Max IoU')
+        ax.set_ylabel('Score / IoU')
+        ax.set_title(f'Query ID: {tgt_id}')
+        ax.grid(alpha=0.3)
+        # lines, labels = ax.get_legend_handles_labels()
+        # ax.legend(lines, labels, loc='upper right', fontsize=8)
+
+    # 测试功能
+    # lines = axes0[8].get_lines()
+    # for line in lines:
+    #     xdata = line.get_xdata()
+    #     ydata = line.get_ydata()
+    #     print("X:", xdata)
+    #     print("Y:", ydata)
+
+    # 将分数最高的 score-line 和对应的 iou-line 绘制特殊颜色
+    from collections import defaultdict
+    line_style_dict = {
+        'Pred Logits (sigmoid)': {'marker': 'o', 'color': 'red'},
+        'Max IoU': {'marker': 's', 'color': 'blue'},
+    }
+    for ax in axes0:
+        lines = ax.get_lines() # a list of Line2D
+        if lines:
+            label_ydata_dict = defaultdict(list)
+            for line in lines:
+                label_ydata_dict[line.get_label()].append(line.get_ydata())
+            target_label_ydata = {}
+            for label, ydata_list in label_ydata_dict.items():
+                max_score = -1
+                for ydata in ydata_list:
+                    if ydata[-1] > max_score:
+                        max_score = ydata[-1]
+                        target_label_ydata[label] = ydata
+                x = lines[0].get_xdata()
+                marker = line_style_dict[label]['marker']
+                color = line_style_dict[label]['color']
+                ax.plot(x, target_label_ydata[label], marker=marker, color=color)
+
+    plt.tight_layout()
+    plt.savefig('/public/home/zncui/pycharm_project/MaskDINO/myscripts/query_layer_instance_iou_logits.jpg', dpi=200)
+    plt.close()
+
+    # 观察变动 1. 哪些实例经常遭遇变动 2. 发生变动的是哪些 query
+    total_indice_list = []
+    changed_list = []
+    for i in range(2, len(stacked_layer_indices_list)):
+        prev_indices = stacked_layer_indices_list[i - 1]
+        curr_indices = stacked_layer_indices_list[i]
+        changed = (prev_indices != curr_indices)
+        changed_prev_indices = prev_indices[changed].tolist()
+        changed_curr_indices = curr_indices[changed].tolist()
+        # changed_indices = set(changed_curr_indices + changed_prev_indices)
+        # print(f'Layer {i - 1} to Layer {i}: Changed Indices: {changed_indices}')
+        total_indice_list = total_indice_list + changed_prev_indices + changed_curr_indices
+        changed_list.append(changed)
+    unique, counts = np.unique(total_indice_list, return_counts=True)
+    for k, v in zip(unique, counts):
+        print(f'Instance {k} changed {v} times.')
+    img_rgb = img_rgb.copy()
+    img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+    H, W = img_bgr.shape[:2]
+    font, scale, thick = cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2
+    for i, box in enumerate(targets['gt_boxes']):
+        x1, y1, x2, y2 = map(lambda x: int(x.item()), box)
+        color = (128, 128, 128)
+        if i in unique:
+            count = counts[unique == i]
+            if count >= 1:
+                color = (255, 0, 0)
+        cv2.rectangle(img_bgr, (x1, y1), (x2, y2), color, 2)
+        text = str(i)
+        (tw, th), _ = cv2.getTextSize(text, font, scale, thick)
+        # 初始位置：框的左上
+        tx, ty = x1, y1 - 5
+        # 边界修正（统一写法，最大/最小裁剪）
+        tx = max(2, min(tx, W - tw - 2))
+        ty = max(th + 2, min(ty, H - 2))
+        cv2.putText(img_bgr, text, (tx, ty),
+                    font, scale, color, thick, cv2.LINE_AA)
+    cv2.imwrite('/public/home/zncui/pycharm_project/MaskDINO/myscripts/layer_vis_input.jpg', img_bgr)
+
+    # 保存为 csv 文件
+    arr = stacked_layer_indices_list.detach().cpu().numpy()
+    df = pd.DataFrame(arr)
+    df.to_csv('/public/home/zncui/pycharm_project/MaskDINO/myscripts/layer_indices.csv', index=False, header=False)
+
+    unique_layer_indices = torch.unique(stacked_layer_indices_list)
+
+    def get_random_color(seed):
+        import colorsys
+        hue = (seed * 0.618033988749895) % 1.0  # 黄金比例避免重复
+        r, g, b = colorsys.hsv_to_rgb(hue, 0.65, 0.95)
+        return (int(r * 255), int(g * 255), int(b * 255))
+    color_map_dict = {f'{index}' : get_random_color(index) for index in unique_layer_indices}
+    nrows = 2
+    ncols = len(predictions)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 5 * nrows))
+
+    import matplotlib.patches as mpatches
+    import math
+
+    # 1) 统一管理 score 区间和颜色
+    # hi = None 表示无上界（最后一个 > 0.6）
+    SCORE_BINS = [
+        ("[0.0, 0.1)", 0.0, 0.1, (0, 0, 128)),  # Navy
+        ("[0.1, 0.2)", 0.1, 0.2, (0, 191, 255)),  # DeepSkyBlue
+        ("[0.2, 0.3)", 0.2, 0.3, (0, 128, 0)),  # Green
+        ("[0.3, 0.4)", 0.3, 0.4, (154, 205, 50)),  # YellowGreen
+        ("[0.4, 0.5)", 0.4, 0.5, (255, 215, 0)),  # Gold
+        ("[0.5, 0.6]", 0.5, 0.6000001, (255, 165, 0)),  # Orange（闭区间用一点点 trick）
+        ("> 0.6", 0.6, None, (255, 0, 0)),  # Red
+    ]
+
+    # 2) 分数 -> 颜色
+    def score_to_color(score: float):
+        for _, lo, hi, color in SCORE_BINS:
+            if hi is None:
+                if score >= lo:
+                    return color
+            else:
+                if lo <= score < hi:
+                    return color
+        return (0, 0, 0)  # fallback（理论上到不了）
+
+    # 3) 往某个 ax 上加图例（只调一次就行）
+    def add_score_legend(ax):
+        legend_items = [
+            (label, color) for (label, _, _, color) in reversed(SCORE_BINS)
+        ]  # 反转一下：高分在上
+
+        patches = [
+            mpatches.Patch(color=tuple(c / 255 for c in color), label=label)
+            for label, color in legend_items
+        ]
+        ax.legend(
+            handles=patches,
+            loc="lower right",
+            fontsize=8,
+            frameon=True,
+            facecolor="white",
+            framealpha=0.85,
+            title="Score",
+            title_fontsize=9,
+        )
+    a_zero_cx_cy_counts = torch.zeros(len(predictions))
+    b_zero_cx_cy_counts = torch.zeros(len(predictions))
+    for l, layer_prediction in enumerate(predictions):
+        pred_logits, pred_boxes, pred_masks, layer_name = layer_prediction
+
+        # ========= 画框部分（原逻辑不动） =========
+        img_rgb_box = img_rgb.copy()
+        layer_indices = layer_indices_list[l]
+        pred_boxes = pred_boxes.squeeze()
+
+        # H, W = img_rgb_box.shape[:2]
+        # font, scale, thick = cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1
+        # for i, box in enumerate(targets['gt_boxes']):
+        #     # if i != 21 or i != 22:
+        #     #     continue
+        #     x1, y1, x2, y2 = map(lambda x: int(x.item()), box)
+        #     color = (255, 255, 255)
+        #     cv2.rectangle(img_rgb_box, (x1, y1), (x2, y2), color, 2)
+        #     text = str(i)
+        #     (tw, th), _ = cv2.getTextSize(text, font, scale, thick)
+        #     # 初始位置：框的左上
+        #     tx, ty = x1, y1 - 5
+        #     # 边界修正（统一写法，最大/最小裁剪）
+        #     tx = max(2, min(tx, W - tw - 2))
+        #     ty = max(th + 2, min(ty, H - 2))
+        #     cv2.putText(img_rgb_box, text, (tx, ty),
+        #                 font, scale, color, thick, cv2.LINE_AA)
+
+        # changed = None
+        # if l == 1:
+        #     changed = changed_list[l - 1]
+        # if 2 <= l:
+        #     changed1 = changed_list[l - 2] # 当前哪些 query 变动了
+        #     if l == len(predictions) - 1:
+        #         changed2 = torch.zeros_like(changed1, dtype=torch.bool)
+        #     else:
+        #         changed2 = changed_list[l - 1]
+        #     changed = torch.logical_or(changed1, changed2)
+
+        changed = None
+        # if l == 2:
+        #     changed = changed_list[l - 1]
+        #     print('1: ', changed)
+        # if l == 3:
+        #     changed = changed_list[l - 2]
+        #     print('2: ', changed)
+
+        for i, box in enumerate(pred_boxes):
+            cx, cy, w, h = box
+            cx = int(cx * W)
+            cy = int(cy * H)
+            if cx + cy == 0:
+                a_zero_cx_cy_counts[l] += 1
+            color = (
+                color_map_dict[str(layer_indices[i].detach().cpu().numpy())]
+                if layer_indices[i] != -1
+                else (128, 128, 128)
+            )
+            # if changed is not None and changed[i]:
+            #     color = get_random_color(i)
+            #     print(f'layer {l} -- query {i} -- cx() cy(): ({cx}, {cy}) changed color to {color}.')
+            #     x1, y1 = int(cx - w / 2.0 * W), int(cy - h / 2.0 * H)
+            #     x2, y2 = int(cx + w / 2.0 * W), int(cy + h / 2.0 * H)
+            #     area = w * W * h * H
+            #     if area == 0:
+            #         print(f'layer {l} -- query {i} has zero area box.')
+            #     cv2.circle(img_rgb_box, (cx,  cy), 10, color, thickness=-1)
+            #     cv2.rectangle(img_rgb_box, (x1, y1), (x2, y2), color, 2)
+            #     cv2.putText(img_rgb_box, f'{i}', (x1, y1 - 5), font, scale, color, thick, cv2.LINE_AA)
+
+            x1, y1 = int(cx - w / 2.0 * W), int(cy - h / 2.0 * H)
+            x2, y2 = int(cx + w / 2.0 * W), int(cy + h / 2.0 * H)
+            # cv2.circle(img_rgb_box, (cx, cy), 10, color, thickness=-1)
+            cv2.rectangle(img_rgb_box, (x1, y1), (x2, y2), color, 2)
+
+        ax0 = axes[0][l]
+        ax0.imshow(img_rgb_box)
+        ax0.set_title(f"{layer_name}: {len(pred_boxes)} queries", fontsize=11)
+        ax0.set_axis_off()
+
+        # ========= 画 score 点 + 图例部分 =========
+        img_rgb_pts = img_rgb.copy()
+
+        # 一次性算好所有 score
+        scores = pred_logits.sigmoid().view(-1)
+
+
+        for score, box in zip(scores, pred_boxes):
+            cx, cy, w, h = box
+            cx = int(cx * W)
+            cy = int(cy * H)
+            if cx + cy == 0:
+                b_zero_cx_cy_counts[l] += 1
+            color = score_to_color(float(score))
+            cv2.circle(img_rgb_pts, (cx, cy), 2, color, 2)
+
+        ax1 = axes[1][l]
+        ax1.imshow(img_rgb_pts)
+        ax1.set_title(f"{layer_name}: {len(pred_boxes)} queries", fontsize=11)
+        ax1.set_axis_off()
+
+        # 只在第一列加一次图例即可
+        if l == 0:
+            add_score_legend(ax1)
+        print('l: ', l)
+        print('a_zero_cx_cy_counts: ', a_zero_cx_cy_counts)
+        print('b_zero_cx_cy_counts: ', b_zero_cx_cy_counts)
+
+    plt.tight_layout()
+    save_path = '/public/home/zncui/pycharm_project/MaskDINO/myscripts/decoder_layers_queries_overlay.jpg'
+    plt.savefig(save_path, dpi=200)
+    plt.close()
+
+
+
 
 
 

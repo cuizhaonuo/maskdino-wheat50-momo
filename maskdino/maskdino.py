@@ -262,7 +262,7 @@ class MaskDINO(nn.Module):
         img = images[0].detach().cpu().permute(1, 2, 0).numpy()
         img = np.clip(img, 0, 255).astype(np.uint8)
         img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-        save_path = "/public/home/zncui/pycharm_project/MaskDINO/myscripts/transformed_image.jpg"
+        save_path = "/public/home/zncui/pycharm_project/MaskDINO/myscripts/transformed_image_v1.jpg"
         cv2.imwrite(save_path, img_bgr)
 
         images = [(x - self.pixel_mean) / self.pixel_std for x in images]
@@ -290,7 +290,11 @@ class MaskDINO(nn.Module):
             # indices_ctx.set(None)
 
             # 预处理时已经 pad 好了，不需要在这里 pad 了，因此不传入 mask，即 mask=None
-            outputs,mask_dict = self.sem_seg_head(features,targets=targets)
+            outputs,mask_dict = self.sem_seg_head(features, targets=targets)
+
+            # debug: 可视化每一层 decoder 的结果，观察这些结果所各自预测的对象
+            # from maskdino.analysis.tool_lab import vis_decoder_layer_results
+            # vis_decoder_layer_results(outputs, batched_inputs)
 
             # bipartite matching-based loss
             losses, indices = self.criterion(outputs, targets, mask_dict)
@@ -328,9 +332,9 @@ class MaskDINO(nn.Module):
                 else:
                     # remove this loss if not specified in `weight_dict`
                     losses.pop(k)
-            # # debug: loss 的组成部分
+            # debug: loss 的组成部分
             # from maskdino.analysis.tool_lab import vis_loss_bar
-            # vis_loss_bar(losses, title="Example loss", save_path="loss_bar.png")
+            # vis_loss_bar(losses, title="Example loss", save_path="loss_bar_no_weight.png")
             return losses
         else:
 

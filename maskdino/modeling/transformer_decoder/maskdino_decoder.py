@@ -621,6 +621,13 @@ class MaskDINODecoder(nn.Module):
         }
         if self.two_stage:
             out['interm_outputs'] = interm_outputs
+        # debug: 观察一下经过 decoder之后每个 query score 的变化
+        # from maskdino.analysis.tool_lab import analyze_query_scores
+        # analyze_query_scores(out)
+
+        # debug: 可视化每次 decoder 的输出结果
+        # from maskdino.analysis.tool_lab import visualize_decoder_outputs
+        # visualize_decoder_outputs(out)
         return out, mask_dict
 
     def forward_prediction_heads(self, output, mask_features, pred_mask=True):
