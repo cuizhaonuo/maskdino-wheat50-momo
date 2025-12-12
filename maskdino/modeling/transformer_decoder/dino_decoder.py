@@ -226,7 +226,8 @@ class DeformableTransformerDecoderLayer(nn.Module):
 
         # attn score
         self.d_model = d_model
-        self.query_embed = nn.Linear(self.d_model, self.d_model * 2)
+        self.self_attn_query_embed = nn.Linear(self.d_model, self.d_model * 2)
+        self.cross_attn_query_embed = nn.Linear(self.d_model, self.d_model * 2)
 
     def rm_self_attn_modules(self):
         self.self_attn = None
@@ -278,16 +279,14 @@ class DeformableTransformerDecoderLayer(nn.Module):
         # self attention
 
         if self.self_attn is not None:
-        # debug = False
-        # if debug:
-        #     q = k = self.with_pos_embed(tgt, tgt_query_pos)
-        #     tgt2 = self.self_attn(q, k, tgt, attn_mask=self_attn_mask)[0]
+            # q = k = self.with_pos_embed(tgt, tgt_query_pos)
+            # tgt2 = self.self_attn(q, k, tgt, attn_mask=self_attn_mask)[0]
 
             # gated attention
-            tgt, score = self.query_embed(tgt).split([self.d_model, self.d_model], dim=-1)
+            tgt, self_score = self.self_attn_query_embed(tgt).split([self.d_model, self.d_model], dim=-1)
             q = k = self.with_pos_embed(tgt, tgt_query_pos)
             tgt2 = self.self_attn(q, k, tgt, attn_mask=self_attn_mask)[0]
-            tgt2 = tgt2 * score.sigmoid()
+            tgt2 = tgt2 * self_score.sigmoid()
 
             # debug: 可视化 attention weights
             # tgt2, attn_output_weights = self.self_attn(q, k, tgt, attn_mask=self_attn_mask, average_attn_weights=False)
@@ -325,10 +324,12 @@ class DeformableTransformerDecoderLayer(nn.Module):
         input_level_start_index = memory_level_start_index 
         input_padding_mask = memory_key_padding_mask # 全是 False，意思是没有 padding 区域
         '''
+        tgt, cross_score = self.cross_attn_query_embed(tgt).split([self.d_model, self.d_model], dim=-1)
         tgt2 = self.cross_attn(self.with_pos_embed(tgt, tgt_query_pos).transpose(0, 1),
                                tgt_reference_points.transpose(0, 1).contiguous(),
                                memory.transpose(0, 1), memory_spatial_shapes, memory_level_start_index,
                                memory_key_padding_mask).transpose(0, 1)
+        tgt2 = tgt2 * cross_score.sigmoid()
         tgt = tgt + self.dropout1(tgt2)
         tgt = self.norm1(tgt)
 
