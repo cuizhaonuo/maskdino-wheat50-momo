@@ -2923,7 +2923,7 @@ def visualize_decoder_outputs(
     print(f"[OK] decoder query 按 score 分段上色可视化已保存: {save_path}")
     return save_path
 
-def vis_decoder_layer_results(outputs, batched_inputs):
+def vis_decoder_layer_results(outputs, batched_inputs, stacked_attn_output_weights):
     # 获取数据
     # predictions = [('pred_logits', 'pred_boxes', 'pred_masks', 'layer_name')]
     # targets = [{'gt_boxes', 'gt_masks'}]
@@ -3024,8 +3024,26 @@ def vis_decoder_layer_results(outputs, batched_inputs):
             indices[zero_iou_sum_indices] = -1
             layer_indices_list.append(indices)
             max_iou_list.append(max_iou)
-    stacked_layer_indices_list = torch.stack(layer_indices_list, dim=0)
-    stacked_max_iou_list = torch.stack(max_iou_list, dim=0)
+    stacked_layer_indices_list = torch.stack(layer_indices_list, dim=0) # (11, 300)
+    stacked_max_iou_list = torch.stack(max_iou_list, dim=0) # (11, 300)
+
+    if stacked_attn_output_weights is not None: # (9, 300, 300)
+        stacked_layer_indices = stacked_layer_indices_list[-9:]
+        for i, (attn_output_weights, layer_indices) in enumerate(zip(stacked_attn_output_weights, stacked_layer_indices)):
+            # (300, 300), (300,)
+            q22_indices = torch.where(layer_indices == 22)[0]
+            q22_attn = attn_output_weights[q22_indices]
+            topk_q22_attn_value, topk_q22_attn_indices = torch.topk(q22_attn, k=10, dim=-1)
+            repeated_layer_indices = layer_indices.unsqueeze(0).repeat(len(q22_indices), 1)
+            # result_indices = torch.gather(repeated_layer_indices.cpu(), dim=1, index=topk_q22_attn_indices.cpu())
+            # print('Layer ', i)
+            # for qid, value, indices in zip(q22_indices, topk_q22_attn_value, topk_q22_attn_indices):
+            #     print('query id:', qid.item())
+            #     print(np.round(value.detach().cpu().numpy(), 2).tolist())
+            #     print(indices.tolist())
+            #     print(layer_indices[indices.cpu()].tolist())
+
+
     # 观察 query id 每层对应的预测结果与最大 iou 匹配实例
     transposed_layer_indices_list = stacked_layer_indices_list[1:].transpose(1, 0)
     transposed_max_iou_list = stacked_max_iou_list[1:].transpose(1, 0)

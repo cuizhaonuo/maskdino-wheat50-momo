@@ -124,6 +124,7 @@ class TransformerDecoder(nn.Module):
         reference_points = refpoints_unsigmoid.sigmoid().to(device)
         ref_points = [reference_points]
 
+        attn_output_weights_list = []
         for layer_id, layer in enumerate(self.layers):
             # preprocess ref points
             if self.training and self.decoder_query_perturber is not None and layer_id != 0:
@@ -148,7 +149,7 @@ class TransformerDecoder(nn.Module):
             # memory_pos, cross_attn_mask 此处均为 None
             # ---
             # (300, 1, 256) --> (300, 1, 256)
-            output = layer(
+            output, attn_output_weights = layer(
                 tgt=output,
                 tgt_query_pos=query_pos,
                 tgt_query_sine_embed=query_sine_embed, # 没有被使用到
@@ -164,6 +165,7 @@ class TransformerDecoder(nn.Module):
                 self_attn_mask=tgt_mask,
                 cross_attn_mask=memory_mask # None
             )
+            attn_output_weights_list.append(attn_output_weights)
             # refinement of reference points
             # reference_points (sigmoid) --> reference_before_sigmoid (logit) --> outputs_unsig (logit)--> new_reference_points (sigmoid)
             # iter update
@@ -178,6 +180,20 @@ class TransformerDecoder(nn.Module):
                 ref_points.append(new_reference_points)
 
             intermediate.append(self.norm(output))
+
+        # debug: 对每一层的 attn_output_weights 进行分析
+        stacked_attn_output_weights = torch.stack(attn_output_weights_list, dim=0).squeeze() # (9, 300, 300)
+        from maskdino.ctx import stacked_attn_output_weights_ctx
+        stacked_attn_output_weights_ctx.set(stacked_attn_output_weights)
+        # topk_attn_output_weights_indices = torch.topk(stacked_attn_output_weights, k=5, dim=-1)[1].transpose(0, 1) # (300, 9, 5)
+        # selected_topk_attn_output_weights_indices = topk_attn_output_weights_indices[:50] # (50, 9, 5)
+        # for item in selected_topk_attn_output_weights_indices:
+        #     print(item.tolist())
+
+        # for i, attn_output_weights in enumerate(stacked_attn_output_weights):
+        #     topk_attn_output_weights = torch.topk(attn_output_weights, 5, dim=-1)[0]
+        #     selected_topk_attn_output_weights = topk_attn_output_weights[:50]
+
 
         # 把 batch size 放到第 0 维度
         # (300, 1, 256) --> (1, 300, 256)
@@ -272,13 +288,13 @@ class DeformableTransformerDecoderLayer(nn.Module):
         value = tgt
         '''
         # self attention
-
+        attn_output_weights = None
         if self.self_attn is not None:
-        # debug = False
-        # if debug:
             q = k = self.with_pos_embed(tgt, tgt_query_pos)
             tgt2 = self.self_attn(q, k, tgt, attn_mask=self_attn_mask)[0]
-            # tgt2, attn_output_weights = self.self_attn(q, k, tgt, attn_mask=self_attn_mask, average_attn_weights=True)
+            # (nq, bs, d_model), (bs, nq, nq)
+            tgt2, attn_output_weights = self.self_attn(q, k, tgt, attn_mask=self_attn_mask, average_attn_weights=True)
+
             # debug: 可视化一个 num_queries x num_queries 的 attention mask 矩阵
             # from maskdino.analysis.tool_lab import vis_attention_matrix
             # vis_attention_matrix(attn_output_weights[0])
@@ -331,6 +347,6 @@ class DeformableTransformerDecoderLayer(nn.Module):
         # ffn
         tgt = self.forward_ffn(tgt)
 
-        return tgt
+        return tgt, attn_output_weights
 
 
