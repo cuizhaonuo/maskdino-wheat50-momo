@@ -3,7 +3,8 @@ import torch
 
 from maskdino.utils import box_ops
 
-IMG_PATH = "/public/home/zncui/datasets/xinxiang/cropped_100images_for_train/P177-19-pos_5435_5460_5163_151_2960_264_3223_5460_5435_5460-20250508075707_0142_colorchart_146.75/P177-19-pos_5435_5460_5163_151_2960_264_3223_5460_5435_5460-20250508075707_0142_colorchart_146.75_y0_x0.jpg"
+# IMG_PATH = "/public/home/zncui/datasets/xinxiang/cropped_100images_for_train/P177-19-pos_5435_5460_5163_151_2960_264_3223_5460_5435_5460-20250508075707_0142_colorchart_146.75/P177-19-pos_5435_5460_5163_151_2960_264_3223_5460_5435_5460-20250508075707_0142_colorchart_146.75_y0_x0.jpg"
+IMG_PATH = "/public/home/zncui/pycharm_project/MaskDINO/myscripts/transformed_image_v1.jpg"
 
 def check_recall(refpoint_embed, targets):
     pred_bbox = refpoint_embed
@@ -375,7 +376,8 @@ def draw_center_point_on_image(pred_bboxes, proposals):
     import mmcv
     import numpy as np
     import cv2
-    image = mmcv.imread(IMG_PATH, channel_order='bgr')
+    img_path = '/public/home/zncui/pycharm_project/MaskDINO/myscripts/transformed_image_v1.jpg'
+    image = mmcv.imread(img_path, channel_order='bgr')
     image = image.astype(np.uint8)
 
     num_bboxes = pred_bboxes.shape[0]
@@ -3027,17 +3029,19 @@ def vis_decoder_layer_results(outputs, batched_inputs, stacked_attn_output_weigh
     stacked_layer_indices_list = torch.stack(layer_indices_list, dim=0) # (11, 300)
     stacked_max_iou_list = torch.stack(max_iou_list, dim=0) # (11, 300)
 
+    topk_attn_indices_list = []
     if stacked_attn_output_weights is not None: # (9, 300, 300)
         stacked_layer_indices = stacked_layer_indices_list[-9:]
         for i, (attn_output_weights, layer_indices) in enumerate(zip(stacked_attn_output_weights, stacked_layer_indices)):
             # (300, 300), (300,)
             q22_indices = torch.where(layer_indices == 22)[0]
             q22_attn = attn_output_weights[q22_indices]
-            topk_q22_attn_value, topk_q22_attn_indices = torch.topk(q22_attn, k=10, dim=-1)
-            repeated_layer_indices = layer_indices.unsqueeze(0).repeat(len(q22_indices), 1)
+            topk_attn_value, topk_attn_indices = torch.topk(q22_attn, k=10, dim=-1)
+            topk_attn_indices_list.append(topk_attn_indices)
+            # repeated_layer_indices = layer_indices.unsqueeze(0).repeat(len(q22_indices), 1)
             # result_indices = torch.gather(repeated_layer_indices.cpu(), dim=1, index=topk_q22_attn_indices.cpu())
             # print('Layer ', i)
-            # for qid, value, indices in zip(q22_indices, topk_q22_attn_value, topk_q22_attn_indices):
+            # for qid, value, indices in zip(q22_indices, topk_attn_value, topk_q22_attn_indices):
             #     print('query id:', qid.item())
             #     print(np.round(value.detach().cpu().numpy(), 2).tolist())
             #     print(indices.tolist())
@@ -3117,28 +3121,30 @@ def vis_decoder_layer_results(outputs, batched_inputs, stacked_attn_output_weigh
     #     print("Y:", ydata)
 
     # 将分数最高的 score-line 和对应的 iou-line 绘制特殊颜色
-    from collections import defaultdict
-    line_style_dict = {
-        'Pred Logits (sigmoid)': {'marker': 'o', 'color': 'red'},
-        'Max IoU': {'marker': 's', 'color': 'blue'},
-    }
-    for ax in axes0:
-        lines = ax.get_lines() # a list of Line2D
-        if lines:
-            label_ydata_dict = defaultdict(list)
-            for line in lines:
-                label_ydata_dict[line.get_label()].append(line.get_ydata())
-            target_label_ydata = {}
-            for label, ydata_list in label_ydata_dict.items():
-                max_score = -1
-                for ydata in ydata_list:
-                    if ydata[-1] > max_score:
-                        max_score = ydata[-1]
-                        target_label_ydata[label] = ydata
-                x = lines[0].get_xdata()
-                marker = line_style_dict[label]['marker']
-                color = line_style_dict[label]['color']
-                ax.plot(x, target_label_ydata[label], marker=marker, color=color)
+    drawn_highest = False
+    if drawn_highest:
+        from collections import defaultdict
+        line_style_dict = {
+            'Pred Logits (sigmoid)': {'marker': 'o', 'color': 'red'},
+            'Max IoU': {'marker': 's', 'color': 'blue'},
+        }
+        for ax in axes0:
+            lines = ax.get_lines() # a list of Line2D
+            if lines:
+                label_ydata_dict = defaultdict(list)
+                for line in lines:
+                    label_ydata_dict[line.get_label()].append(line.get_ydata())
+                target_label_ydata = {}
+                for label, ydata_list in label_ydata_dict.items():
+                    max_score = -1
+                    for ydata in ydata_list:
+                        if ydata[-1] > max_score:
+                            max_score = ydata[-1]
+                            target_label_ydata[label] = ydata
+                    x = lines[0].get_xdata()
+                    marker = line_style_dict[label]['marker']
+                    color = line_style_dict[label]['color']
+                    ax.plot(x, target_label_ydata[label], marker=marker, color=color)
 
     plt.tight_layout()
     plt.savefig('/public/home/zncui/pycharm_project/MaskDINO/myscripts/query_layer_instance_iou_logits.jpg', dpi=200)
@@ -3315,6 +3321,12 @@ def vis_decoder_layer_results(outputs, batched_inputs, stacked_attn_output_weigh
             #     cv2.circle(img_rgb_box, (cx,  cy), 10, color, thickness=-1)
             #     cv2.rectangle(img_rgb_box, (x1, y1), (x2, y2), color, 2)
             #     cv2.putText(img_rgb_box, f'{i}', (x1, y1 - 5), font, scale, color, thick, cv2.LINE_AA)
+
+            # if len(topk_attn_indices_list) > 0 and l >= 2:
+            #     topk_attn_indices = topk_attn_indices_list[l-2] # 从第2层 aux[0] 开始对应
+            #     for topk_indices in topk_attn_indices:
+            #         if i in topk_indices:
+            #             color = (255, 0, 0)
 
             x1, y1 = int(cx - w / 2.0 * W), int(cy - h / 2.0 * H)
             x2, y2 = int(cx + w / 2.0 * W), int(cy + h / 2.0 * H)

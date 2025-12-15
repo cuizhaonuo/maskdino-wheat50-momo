@@ -507,9 +507,9 @@ class SegInferenceTemplate:
     def _apply_thresh_nms(self, proposals: List[DetProposal],
                           score_thr: float, nms_thr: float, iou_type: IOUType) -> List[DetProposal]:
         fil = [p for p in proposals if p.score >= score_thr]
-        return mask_nms(fil, nms_thr, iou_type) if fil else []
+        # return mask_nms(fil, nms_thr, iou_type) if fil else []
         # 'keep_max'：合并后保留较大 score；想更平滑可改 'area_weighted'
-        # return mask_nms_with_merge(fil, nms_thr, iou_type, score_mode="keep_max") if fil else []
+        return mask_nms_with_merge(fil, nms_thr, iou_type, score_mode="keep_max") if fil else []
 
     def _save_coco_annotation(self, img_id, start_ins_id, img_path: str, dets: List[DetProposal], out_dir: str):
             """
@@ -613,24 +613,37 @@ class SegInferenceTemplate:
             # 让每个通道都在 64~255 之间，避免太浅
             color = rng.integers(64, 256, size=3, dtype=np.uint8).tolist()  # [B, G, R]
 
-            # --- 2. 取对应 ROI ---
-            y1, y2 = d.top, int(d.top + d.mask.shape[0])
-            x1, x2 = d.left, int(d.left + d.mask.shape[1])
+            # --- 2. 取对应 ROI（严格对齐 mask 与 roi）---
+            H, W = img.shape[:2]
 
-            # 防止越界（可选，但比较安全）
-            h, w = img.shape[:2]
-            y1 = max(0, min(h, y1))
-            y2 = max(0, min(h, y2))
-            x1 = max(0, min(w, x1))
-            x2 = max(0, min(w, x2))
+            # det 的原始全局框（对应 d.mask 的坐标系）
+            y1o, x1o = int(d.top), int(d.left)
+            y2o = int(d.top + d.mask.shape[0])
+            x2o = int(d.left + d.mask.shape[1])
+
+            # clamp 到图像内，得到实际 roi
+            y1 = max(0, min(H, y1o))
+            y2 = max(0, min(H, y2o))
+            x1 = max(0, min(W, x1o))
+            x2 = max(0, min(W, x2o))
+            if y2 <= y1 or x2 <= x1:
+                continue
 
             roi = overlay[y1:y2, x1:x2]
 
-            # --- 3. 掩膜 m 应为 bool 类型 ---
-            m = d.mask.astype(bool)
+            # 计算 roi 相对 det-mask 的偏移，并裁剪 mask 使其与 roi 尺寸一致
+            my1 = y1 - y1o
+            my2 = my1 + (y2 - y1)
+            mx1 = x1 - x1o
+            mx2 = mx1 + (x2 - x1)
 
-            # 如果 mask 尺寸与 roi 尺寸严格对应，这里直接用 m 作为索引
-            # 叠加颜色：roi = α * color + (1 - α) * roi
+            m = d.mask[my1:my2, mx1:mx2].astype(bool)
+
+            # 双保险：确保尺寸完全一致
+            if m.shape[0] != roi.shape[0] or m.shape[1] != roi.shape[1]:
+                m = m[:roi.shape[0], :roi.shape[1]]
+
+            # --- 3. 叠加颜色 ---
             roi[m] = (alpha * np.array(color, dtype=np.float32) +
                       (1 - alpha) * roi[m].astype(np.float32)).astype(np.uint8)
 

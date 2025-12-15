@@ -272,7 +272,7 @@ class MaskDINO(nn.Module):
         # debug：可视化 backbone 热力图
         # from maskdino.analysis.tool_lab import show_heatmap
         # show_heatmap(features, batched_inputs,
-        #              save_path="/public/home/zncui/pycharm_project/MaskDINO/myscripts/output_heatmap/dinov3_mean_all_heatmaps.png")
+        #              save_path="/public/home/zncui/pycharm_project/MaskDINO/myscripts/output_heatmap/maskdino_mean_all_heatmaps.png")
 
         if self.training:
             # dn_args={"scalar":30,"noise_scale":0.4}
@@ -298,8 +298,6 @@ class MaskDINO(nn.Module):
             from maskdino.ctx import stacked_attn_output_weights_ctx
             stacked_attn_output_weights = stacked_attn_output_weights_ctx.get()
             vis_decoder_layer_results(outputs, batched_inputs, stacked_attn_output_weights)
-
-
 
             # bipartite matching-based loss
             losses, indices = self.criterion(outputs, targets, mask_dict)
