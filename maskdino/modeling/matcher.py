@@ -117,6 +117,7 @@ class HungarianMatcher(nn.Module):
 
         indices = []
         C_list = []
+        # query_matched_iou_list = []
         # Iterate through batch size
         for b in range(bs):
             out_bbox = outputs["pred_boxes"][b]
@@ -133,6 +134,14 @@ class HungarianMatcher(nn.Module):
             # focal loss
             alpha = 0.25
             gamma = 2.0
+            # giou 数值 [-1, 1]，归一化到 [0, 1]，数值越大表示重叠程度越高
+            giou_aware_weight = generalized_box_iou(box_cxcywh_to_xyxy(out_bbox), box_cxcywh_to_xyxy(tgt_bbox))
+            giou_aware_weight = (giou_aware_weight + 1) / 2  # [0, 1]
+            giou_aware_weight = giou_aware_weight.clamp(min=0.0, max=1.0)
+            # giou_aware_weight = giou_aware_weight ** 2  # 放大权重差异
+            # giou_aware_weight = giou_aware_weight.max(dim=-1)[0].unsqueeze(dim=-1)  # [num_queries, 1]
+            # pos 正样本，iou 大则损失小，所以乘以 (1 - giou_aware_weight)
+            # neg 负样本，iou 大也损失小，所以也乘以 (1 - giou_aware_weight)
             neg_cost_class = (1 - alpha) * (out_prob ** gamma) * (-(1 - out_prob + 1e-8).log())
             pos_cost_class = alpha * ((1 - out_prob) ** gamma) * (-(out_prob + 1e-8).log())
             # debug: 获取 neg_cost_class 和 pos_cost_class 的柱状图
@@ -144,6 +153,7 @@ class HungarianMatcher(nn.Module):
             # temporal_diff_bar_scatter(self, neg_cost_class, pos_cost_class)
 
             cost_class = pos_cost_class[:, tgt_ids] - neg_cost_class[:, tgt_ids]
+            cost_class = cost_class * (1 - giou_aware_weight)
 
             # Compute the classification cost. Contrary to the loss, we don't use the NLL,
             # but approximate it in 1 - proba[target class].
@@ -258,6 +268,14 @@ class HungarianMatcher(nn.Module):
             # C_list.append(self.cost_class * cost_class.cpu())
             indices.append(linear_sum_assignment(C))
 
+            # from maskdino.utils.box_ops import box_iou
+            # out_bbox = outputs["pred_boxes"][b]
+            # tgt_bbox = targets[b]["boxes"]
+            # iou, union = box_iou(box_cxcywh_to_xyxy(out_bbox), box_cxcywh_to_xyxy(tgt_bbox))
+            # full_idx = torch.argmin(C, dim=-1)
+            # query_matched_iou = torch.gather(iou.cpu(), index=full_idx.unsqueeze(-1), dim=1)
+            # # full_idx = torch.argmax(iou, dim=1)
+            # query_matched_iou_list.append(query_matched_iou)
 
         # debug: 统计每个query被匹配的次数
         # from maskdino.analysis.tool_lab import count_query_frequency
@@ -271,6 +289,7 @@ class HungarianMatcher(nn.Module):
         # from maskdino.analysis.tool_lab import plot_class_distribution
         # plot_class_distribution(outputs)
 
+        # batched_query_matched_iou = torch.stack(query_matched_iou_list, dim=0)
         return [
             (torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64))
             for i, j in indices
