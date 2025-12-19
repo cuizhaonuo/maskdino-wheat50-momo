@@ -257,13 +257,14 @@ class MaskDINO(nn.Module):
         # 将张量从 GPU 移至 CPU，并转换为 NumPy 数组
         # Detectron2 加载的图像通常是 BGR 格式，范围是 [0, 255]
         # cv2.imwrite 也需要 BGR 格式的图像
-        import cv2
-        import numpy as np
-        img = images[0].detach().cpu().permute(1, 2, 0).numpy()
-        img = np.clip(img, 0, 255).astype(np.uint8)
-        img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-        save_path = "/public/home/zncui/pycharm_project/MaskDINO/myscripts/transformed_image_v1.jpg"
-        cv2.imwrite(save_path, img_bgr)
+
+        # import cv2
+        # import numpy as np
+        # img = images[0].detach().cpu().permute(1, 2, 0).numpy()
+        # img = np.clip(img, 0, 255).astype(np.uint8)
+        # img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        # save_path = "/public/home/zncui/pycharm_project/MaskDINO/myscripts/transformed_image_v1.jpg"
+        # cv2.imwrite(save_path, img_bgr)
 
         images = [(x - self.pixel_mean) / self.pixel_std for x in images]
         images = ImageList.from_tensors(images, self.size_divisibility)
@@ -292,16 +293,16 @@ class MaskDINO(nn.Module):
             # 预处理时已经 pad 好了，不需要在这里 pad 了，因此不传入 mask，即 mask=None
             outputs,mask_dict = self.sem_seg_head(features, targets=targets)
 
-            # debug: 可视化每一层 decoder 的结果，观察这些结果所各自预测的对象
-            from maskdino.analysis.tool_lab import vis_decoder_layer_results
-            # vis_decoder_layer_results(outputs, batched_inputs)
-            from maskdino.ctx import stacked_attn_output_weights_ctx
-            stacked_attn_output_weights = stacked_attn_output_weights_ctx.get()
-            vis_decoder_layer_results(outputs, batched_inputs, stacked_attn_output_weights)
+            # # debug: 可视化每一层 decoder 的结果，观察这些结果所各自预测的对象
+            # from maskdino.analysis.tool_lab import vis_decoder_layer_results
+            # # vis_decoder_layer_results(outputs, batched_inputs)
+            # from maskdino.ctx import stacked_attn_output_weights_ctx
+            # stacked_attn_output_weights = stacked_attn_output_weights_ctx.get()
+            # vis_decoder_layer_results(outputs, batched_inputs, stacked_attn_output_weights)
 
             # bipartite matching-based loss
             losses, indices = self.criterion(outputs, targets, mask_dict)
-            bid = 0
+            # bid = 0
             # target_index = torch.where(indices[bid][1] == 22)[0]  # 这里 target_id = 22
             # # target_id = indices[0][1][target_index]
             # pred_id = indices[bid][0][target_index]

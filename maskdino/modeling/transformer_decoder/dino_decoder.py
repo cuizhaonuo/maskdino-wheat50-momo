@@ -182,9 +182,10 @@ class TransformerDecoder(nn.Module):
             intermediate.append(self.norm(output))
 
         # debug: 对每一层的 attn_output_weights 进行分析
-        stacked_attn_output_weights = torch.stack(attn_output_weights_list, dim=0).squeeze() # (9, 300, 300)
-        from maskdino.ctx import stacked_attn_output_weights_ctx
-        stacked_attn_output_weights_ctx.set(stacked_attn_output_weights)
+        # stacked_attn_output_weights = torch.stack(attn_output_weights_list, dim=0).squeeze() # (9, 300, 300)
+        # from maskdino.ctx import stacked_attn_output_weights_ctx
+        # stacked_attn_output_weights_ctx.set(stacked_attn_output_weights)
+
         # topk_attn_output_weights_indices = torch.topk(stacked_attn_output_weights, k=5, dim=-1)[1].transpose(0, 1) # (300, 9, 5)
         # selected_topk_attn_output_weights_indices = topk_attn_output_weights_indices[:50] # (50, 9, 5)
         # for item in selected_topk_attn_output_weights_indices:
@@ -293,7 +294,7 @@ class DeformableTransformerDecoderLayer(nn.Module):
             q = k = self.with_pos_embed(tgt, tgt_query_pos)
             tgt2 = self.self_attn(q, k, tgt, attn_mask=self_attn_mask)[0]
             # (nq, bs, d_model), (bs, nq, nq)
-            tgt2, attn_output_weights = self.self_attn(q, k, tgt, attn_mask=self_attn_mask, average_attn_weights=True)
+            # tgt2, attn_output_weights = self.self_attn(q, k, tgt, attn_mask=self_attn_mask, average_attn_weights=True)
 
             # debug: 可视化一个 num_queries x num_queries 的 attention mask 矩阵
             # from maskdino.analysis.tool_lab import vis_attention_matrix
