@@ -182,9 +182,10 @@ class TransformerDecoder(nn.Module):
             intermediate.append(self.norm(output))
 
         # debug: 对每一层的 attn_output_weights 进行分析
-        stacked_attn_output_weights = torch.stack(attn_output_weights_list, dim=0).squeeze() # (9, 300, 300)
-        from maskdino.ctx import stacked_attn_output_weights_ctx
-        stacked_attn_output_weights_ctx.set(stacked_attn_output_weights)
+        # stacked_attn_output_weights = torch.stack(attn_output_weights_list, dim=0).squeeze() # (9, 300, 300)
+        # from maskdino.ctx import stacked_attn_output_weights_ctx
+        # stacked_attn_output_weights_ctx.set(stacked_attn_output_weights)
+
         # topk_attn_output_weights_indices = torch.topk(stacked_attn_output_weights, k=5, dim=-1)[1].transpose(0, 1) # (300, 9, 5)
         # selected_topk_attn_output_weights_indices = topk_attn_output_weights_indices[:50] # (50, 9, 5)
         # for item in selected_topk_attn_output_weights_indices:

@@ -338,6 +338,12 @@ class SetCriterion(nn.Module):
              targets: list of dicts, such that len(targets) == batch_size.
                       The expected keys in each dict depends on the losses applied, see each loss' doc
         """
+        if isinstance(targets, tuple):
+            targets_for_dn = targets[0]
+            targets = targets[1]
+        else:
+            targets_for_dn = targets
+
         outputs_without_aux = {k: v for k, v in outputs.items() if k != "aux_outputs"}
 
         # Retrieve the matching between the outputs of the last layer and the targets
@@ -376,7 +382,7 @@ class SetCriterion(nn.Module):
         if self.dn != "no" and mask_dict is not None:
             l_dict={}
             for loss in self.dn_losses:
-                l_dict.update(self.get_loss(loss, output_known_lbs_bboxes, targets, exc_idx, num_masks*scalar))
+                l_dict.update(self.get_loss(loss, output_known_lbs_bboxes, targets_for_dn, exc_idx, num_masks*scalar))
             l_dict = {k + f'_dn': v for k, v in l_dict.items()}
             losses.update(l_dict)
         elif self.dn != "no":

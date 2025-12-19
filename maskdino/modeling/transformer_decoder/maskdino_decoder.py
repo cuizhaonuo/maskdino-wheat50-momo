@@ -316,6 +316,8 @@ class MaskDINODecoder(nn.Module):
         """
             post process of dn after output from the transformer
             put the dn part in the mask_dict
+            在使用 DN-DETR / MaskDINO 的 Denoising（DN）训练机制时，把 Transformer 输出中“用于 DN 的已知 GT queries”从正常 queries 中拆出来，
+            单独整理成一个结构存入 mask_dict，供 DN loss 计算使用；同时返回“去掉 DN 部分”的正常输出，供常规 one-to-one matching 使用。
             """
         assert mask_dict['pad_size'] > 0
         output_known_class = outputs_class[:, :, :mask_dict['pad_size'], :]
@@ -659,6 +661,42 @@ class MaskDINODecoder(nn.Module):
         # debug: 可视化每次 decoder 的输出结果
         # from maskdino.analysis.tool_lab import visualize_decoder_outputs
         # visualize_decoder_outputs(out)
+
+        # 将 out 转换为包含 one-to-many 的格式
+        aux_outputs_one_to_many = []
+        for aux_output in out['aux_outputs']:
+            aux_output_one_to_many = {
+                'pred_logits': aux_output['pred_logits'][:, self.num_queries:],
+                'pred_masks': aux_output['pred_masks'][:, self.num_queries:],
+                'pred_boxes': aux_output['pred_boxes'][:, self.num_queries:],
+            }
+            aux_outputs_one_to_many.append(aux_output_one_to_many)
+        aux_outputs = []
+        for aux in out['aux_outputs']:
+            aux_one_to_one = {
+                'pred_logits': aux['pred_logits'][:, :self.num_queries],
+                'pred_masks': aux['pred_masks'][:, :self.num_queries],
+                'pred_boxes': aux['pred_boxes'][:, :self.num_queries],
+            }
+            aux_outputs.append(aux_one_to_one)
+        interm_outputs = out['interm_outputs']
+        interm_outputs_one_to_many = {
+            'pred_logits': interm_outputs['pred_logits'].repeat(1, 5, 1),
+            'pred_masks': interm_outputs['pred_masks'].repeat(1, 5, 1, 1),
+            'pred_boxes': interm_outputs['pred_boxes'].repeat(1, 5, 1),
+        }
+        out = {
+            'pred_logits': out['pred_logits'][:, :self.num_queries],
+            'pred_masks': out['pred_masks'][:, :self.num_queries],
+            'pred_boxes': out['pred_boxes'][:, :self.num_queries],
+            'pred_logits_one_to_many': out['pred_logits'][:, self.num_queries:],
+            'pred_masks_one_to_many': out['pred_masks'][:, self.num_queries:],
+            'pred_boxes_one_to_many': out['pred_boxes'][:, self.num_queries:],
+            'aux_outputs': aux_outputs,
+            'aux_outputs_one_to_many': aux_outputs_one_to_many,
+            'interm_outputs': interm_outputs,
+            'interm_outputs_one_to_many': interm_outputs_one_to_many,
+        }
         return out, mask_dict
 
     def forward_prediction_heads(self, output, mask_features, pred_mask=True):
