@@ -327,7 +327,7 @@ class MaskDINODecoder(nn.Module):
             outputs_mask = outputs_mask[:, :, mask_dict['pad_size']:, :]
         out = {'pred_logits': output_known_class[-1], 'pred_boxes': output_known_coord[-1],'pred_masks': output_known_mask[-1]}
 
-        out['aux_outputs'] = self._set_aux_loss(output_known_class, output_known_mask,output_known_coord)
+        out['aux_outputs'] = self._set_aux_loss(output_known_class, output_known_mask, output_known_coord)
         mask_dict['output_known_lbs_bboxes']=out
         return outputs_class, outputs_coord, outputs_mask
 
@@ -510,7 +510,14 @@ class MaskDINODecoder(nn.Module):
         # 此处 tgt 变成了 (bs, dn_pad + num_queries, hidden_dim)，content query + denoising query
         # 增加了 dn_pad 个 denoising query
 
-        # direct prediction from the matching and denoising part in the begining
+        # tgt 进行复制
+        tgt_len_before = tgt.shape[1]
+        query_one_to_one = tgt[:, -self.num_queries:, :]
+        query_one_to_many = query_one_to_one.repeat(1, 5, 1)
+        tgt = torch.cat([tgt, query_one_to_many],
+                        dim=1)  # (bs, dn_queries + one-to-one + one-to-many, hidden_dim)
+
+        # direct prediction from the matching and denoising part in the beginning
         if self.initial_pred:
             # 暂时注释
             outputs_class, outputs_mask = self.forward_prediction_heads(tgt.transpose(0, 1), mask_features, self.training)
@@ -523,7 +530,31 @@ class MaskDINODecoder(nn.Module):
         if self.dn != "no" and self.training and mask_dict is not None:
             refpoint_embed=torch.cat([input_query_bbox,refpoint_embed],dim=1)
         # 此处 refpoint_embed 变成了 (bs, dn_pad + num_queries, 4)，position query + denoising query
-        # 增加了 dn_pad 个 denoising query
+
+        # 位置编码进行复制
+        refpoint_embed_one_to_one = refpoint_embed[:, -self.num_queries:, :]
+        refpoint_embed_one_to_many = refpoint_embed_one_to_one.repeat(1, 5, 1)
+        refpoint_embed = torch.cat([refpoint_embed, refpoint_embed_one_to_many],
+                                   dim=1)  # (bs, dn_queries + one-to-one + one-to-many, 4)
+
+        # 增加 one-to-many query
+        # 现在默认 denoising query 是添加的，tgt = [denoising query, one-to-one matching query, one-to-many matching query]
+        query_total_len = tgt_len = tgt.shape[1]
+        tgt_mask_new = torch.ones((tgt_len, tgt_len), device=tgt.device).bool()
+        group_len = int(mask_dict['pad_size'] / 2)
+        group0_start = 0
+        group1_start = group_len
+        query_one_to_one_start = group_len * 2
+        query_one_to_many_start = tgt_len_before
+        query_one_to_one_len = self.num_queries
+        query_one_to_many_len = self.num_queries * 5
+        tgt_mask_new[group0_start:group0_start + group_len, group0_start:group0_start + group_len] = False
+        tgt_mask_new[group0_start:group0_start + group_len, query_one_to_one_start:] = False
+        tgt_mask_new[group1_start:group1_start + group_len, group1_start:] = False
+        tgt_mask_new[query_one_to_one_start: query_one_to_one_start + query_one_to_one_len,
+        query_one_to_one_start: query_one_to_one_start + query_one_to_one_len] = False
+        tgt_mask_new[query_one_to_many_start:, query_one_to_many_start:] = False
+        tgt_mask = tgt_mask_new
 
         '''
         Result 
@@ -534,7 +565,7 @@ class MaskDINODecoder(nn.Module):
         Q K V
           tgt: (dn_pad + num_queries, bs, hidden_dim) content query
           refpoint_embed: (dn_pad + num_queries, bs, 4) position query
-          memeory: (\sum{hw}, bs, hidden_dim) key and value
+          memory: (\sum{hw}, bs, hidden_dim) key and value
           以上三个变量都是 transpose 过的，最为关键，是 Transformer decoder 的 Q K V
         Mask
           memory_key_padding_mask: (bs, \sum{hw}) padding mask for key and value 
