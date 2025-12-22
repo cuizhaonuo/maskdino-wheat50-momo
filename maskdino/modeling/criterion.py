@@ -317,46 +317,9 @@ class SetCriterion(nn.Module):
             align_corners=False,
         ).squeeze(1)
 
-        # def dice_from_logits_and_gt(src_logits, tgt_mask, out_size=64, eps=1e-6):
-        #     """
-        #     src_logits: (m, Hs, Ws)  raw logits
-        #     tgt_mask:   (m, Ht, Wt)  {0,1} or bool/float
-        #     return:     (m,) dice in [0,1]
-        #     """
-        #     # (m,1,H,W)
-        #     src = src_logits[:, None]
-        #     tgt = tgt_mask[:, None].float()
-        #
-        #     # resize both to same grid
-        #     src = F.interpolate(src, size=(out_size, out_size), mode="bilinear", align_corners=False)
-        #     tgt = F.interpolate(tgt, size=(out_size, out_size), mode="nearest")  # GT 用 nearest 更合理
-        #
-        #     src = src.sigmoid()  # (m,1,K,K)
-        #
-        #     # flatten
-        #     src = src.flatten(1)  # (m, K*K)
-        #     tgt = tgt.flatten(1)  # (m, K*K)
-        #
-        #     inter = (src * tgt).sum(-1)
-        #     denom = src.sum(-1) + tgt.sum(-1)
-        #
-        #     dice = (2 * inter + eps) / (denom + eps)
-        #     return dice
-        #
-        # loss_dice_l1 = torch.as_tensor(0., device=src_masks.device)
-        # if 'pred_logits_dice' in outputs:
-        #     src_mask_full = outputs["pred_masks"][src_idx]  # (m, 256, 256) logits
-        #     tgt_mask_full = target_masks[tgt_idx]  # (m, 1024, 1024) 0/1
-        #
-        #     dice = dice_from_logits_and_gt(src_mask_full, tgt_mask_full, out_size=256).detach()
-        #
-        #     pred_dice = outputs['pred_logits_dice'][src_idx].squeeze(-1).sigmoid()  # (m,)
-        #     loss_dice_l1 = F.smooth_l1_loss(pred_dice, dice, reduction='sum') / num_masks * 5
-
         losses = {
             "loss_mask": sigmoid_ce_loss_jit(point_logits, point_labels, num_masks),
             "loss_dice": dice_loss_jit(point_logits, point_labels, num_masks),
-            # "loss_dice_l1": loss_dice_l1
         }
 
         del src_masks
@@ -402,6 +365,7 @@ class SetCriterion(nn.Module):
              targets: list of dicts, such that len(targets) == batch_size.
                       The expected keys in each dict depends on the losses applied, see each loss' doc
         """
+
         outputs_without_aux = {k: v for k, v in outputs.items() if k != "aux_outputs"}
 
         # Retrieve the matching between the outputs of the last layer and the targets

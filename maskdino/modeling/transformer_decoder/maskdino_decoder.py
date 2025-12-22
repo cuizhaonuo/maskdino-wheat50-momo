@@ -115,9 +115,9 @@ class MaskDINODecoder(nn.Module):
         self.semantic_ce_loss = semantic_ce_loss
         # learnable query features
         if not two_stage or self.learn_tgt:
-            self.query_feat = nn.Embedding(num_queries, hidden_dim)
+            self.query_feat = nn.Embedding(self.num_queries, hidden_dim)
         if not two_stage and initialize_box_type == 'no':
-            self.query_embed = nn.Embedding(num_queries, 4)
+            self.query_embed = nn.Embedding(self.num_queries, 4)
         if two_stage:
             self.enc_output = nn.Linear(hidden_dim, hidden_dim)
             self.enc_output_norm = nn.LayerNorm(hidden_dim)
@@ -644,6 +644,43 @@ class MaskDINODecoder(nn.Module):
         if self.dn != "no" and self.training and mask_dict is not None:
             refpoint_embed=torch.cat([input_query_bbox,refpoint_embed],dim=1)
         # 此处 refpoint_embed 变成了 (bs, dn_pad + num_queries, 4)，position query + denoising query
+
+        # 此处可以取消，位置编码由 two-stage 阶段产生 select 1800
+        # # 增加 one-to-many query
+        # # 位置编码进行复制
+        # refpoint_embed_one_to_one = refpoint_embed[:, -self.num_queries:, :]
+        # refpoint_embed_one_to_many = refpoint_embed_one_to_one.repeat(1, 5, 1)
+        # refpoint_embed = torch.cat([refpoint_embed, refpoint_embed_one_to_many],
+        #                            dim=1)  # (bs, dn_queries + one-to-one + one-to-many, 4)
+
+        # 此处必须添加
+        # 增加 one-to-many query
+        # 现在默认 denoising query 是添加的，tgt = [denoising query, one-to-one matching query, one-to-many matching query]
+        # query_total_len = tgt_len = tgt.shape[1]
+        # tgt_mask_new = torch.ones((tgt_len, tgt_len), device=tgt.device).bool()
+        # group_len = int(mask_dict['pad_size'] / 2)
+        # group0_start = 0
+        # group1_start = group_len
+        # query_one_to_one_start = group_len * 2
+        # query_one_to_many_start = mask_dict['pad_size'] + 300
+        # query_one_to_one_len = self.num_queries
+        # query_one_to_many_len = self.num_queries * 5
+        # tgt_mask_new[group0_start:group0_start + group_len, group0_start:group0_start + group_len] = False
+        # tgt_mask_new[group0_start:group0_start + group_len, query_one_to_one_start:] = False
+        # tgt_mask_new[group1_start:group1_start + group_len, group1_start:] = False
+        # tgt_mask_new[query_one_to_one_start: query_one_to_one_start + query_one_to_one_len,
+        # query_one_to_one_start: query_one_to_one_start + query_one_to_one_len] = False
+        # tgt_mask_new[query_one_to_many_start:, query_one_to_many_start:] = False
+        # tgt_mask = tgt_mask_new
+
+        # 给出一个没有 dn 版本的
+        tgt_len = tgt.shape[1]
+        tgt_mask_new = torch.ones((tgt_len, tgt_len), device=tgt.device).bool()
+        query_one_to_one_len = 900
+        # query_one_to_many_len = 1500
+        tgt_mask_new[:query_one_to_one_len, :query_one_to_one_len] = False
+        tgt_mask_new[query_one_to_one_len:, query_one_to_one_len:] = False
+        tgt_mask = tgt_mask_new
         # 增加了 dn_pad 个 denoising query
 
         '''

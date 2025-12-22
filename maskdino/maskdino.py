@@ -4,6 +4,7 @@
 # ------------------------------------------------------------------------
 # Modified from Mask2Former https://github.com/facebookresearch/Mask2Former by Feng Li and Hao Zhang.
 from typing import Tuple
+import copy
 
 import torch
 from torch import nn
@@ -117,6 +118,12 @@ class MaskDINO(nn.Module):
     def from_config(cls, cfg):
         backbone = build_backbone(cfg)
         sem_seg_head = build_sem_seg_head(cfg, backbone.output_shape())
+
+        # one-to-many
+        # lambda_one_to_many = cfg.MODEL.MaskDINO.LAMBDA_ONE_TO_MANY
+        # one_to_many_flag = cfg.MODEL.MaskDINO.ONE_TO_MANY_FLAG
+        # k_one_to_many = cfg.MODEL.MaskDINO.K_ONE_TO_MANY
+
 
         # Loss parameters:
         deep_supervision = cfg.MODEL.MaskDINO.DEEP_SUPERVISION
@@ -295,7 +302,7 @@ class MaskDINO(nn.Module):
             # indices_ctx.set(None)
 
             # 预处理时已经 pad 好了，不需要在这里 pad 了，因此不传入 mask，即 mask=None
-            outputs,mask_dict = self.sem_seg_head(features, targets=targets)
+            outputs, mask_dict = self.sem_seg_head(features, targets=targets)
 
             # # debug: 可视化每一层 decoder 的结果，观察这些结果所各自预测的对象
             # from maskdino.analysis.tool_lab import vis_decoder_layer_results
@@ -304,8 +311,37 @@ class MaskDINO(nn.Module):
             # stacked_attn_output_weights = stacked_attn_output_weights_ctx.get()
             # vis_decoder_layer_results(outputs, batched_inputs, stacked_attn_output_weights)
 
+            # one-to-one loss, one-to-one query and denoising query
             # bipartite matching-based loss
             losses, indices = self.criterion(outputs, targets, mask_dict)
+
+            # one-to-many loss, one-to-many query
+            one_to_many_flag = True
+            if one_to_many_flag:
+                multi_targets = copy.deepcopy(targets)
+
+                def duplicate_targets(src_targets, k_one_to_many):
+                    for t in src_targets:
+                        t['labels'] = t['labels'].repeat(k_one_to_many)
+                        t['masks'] = t['masks'].repeat(k_one_to_many, 1, 1)
+                        t['boxes'] = t['boxes'].repeat(k_one_to_many, 1)
+                    return src_targets
+
+                multi_targets = duplicate_targets(multi_targets, k_one_to_many=18)
+                outputs_one_to_many = dict()
+                outputs_one_to_many['pred_logits'] = outputs['pred_logits_one_to_many']
+                outputs_one_to_many['pred_boxes'] = outputs['pred_boxes_one_to_many']
+                outputs_one_to_many['pred_masks'] = outputs['pred_masks_one_to_many']
+                outputs_one_to_many['aux_outputs'] = outputs['aux_outputs_one_to_many']
+                outputs_one_to_many['interm_outputs'] = outputs['interm_outputs_one_to_many']
+                # mask_dict = None # 表示关闭 dn-query
+                losses_one_to_many, _ = self.criterion(outputs_one_to_many, multi_targets, mask_dict)
+                lambda_one_to_many = 1.0
+                for key, value in losses_one_to_many.items():
+                    losses[key + '_one_to_many'] = value * lambda_one_to_many
+                    weight = self.criterion.weight_dict[key]
+                    self.criterion.weight_dict[key + '_one_to_many'] = weight
+
             # bid = 0
             # target_index = torch.where(indices[bid][1] == 22)[0]  # 这里 target_id = 22
             # # target_id = indices[0][1][target_index]
