@@ -120,6 +120,27 @@ class HungarianMatcher(nn.Module):
         # Iterate through batch size
         for b in range(bs):
             out_bbox = outputs["pred_boxes"][b]
+            # 检查问题
+            if not torch.isfinite(out_bbox).all():
+                print("FOUND NaN/Inf in out_bbox", out_bbox[~torch.isfinite(out_bbox)])
+                raise
+
+            # 检查 w/h 是否为负（cxcywh格式下不应出现）
+            wh = out_bbox[:, 2:]
+            if (wh < 0).any():
+                print("NEGATIVE w/h in out_bbox:", wh.min().item(), wh.max().item())
+                # 看看是不是没sigmoid
+                print("out_bbox range:", out_bbox.min().item(), out_bbox.max().item())
+                raise
+
+            xyxy = box_cxcywh_to_xyxy(out_bbox)
+            bad = (xyxy[:, 2:] < xyxy[:, :2]).any(dim=1)
+            if bad.any():
+                idx = bad.nonzero(as_tuple=False).squeeze(1)[:10]
+                print("BAD xyxy examples:", xyxy[idx])
+                print("source cxcywh:", out_bbox[idx])
+                raise
+
             if 'box' in cost:
                 tgt_bbox=targets[b]["boxes"]
                 cost_bbox = torch.cdist(out_bbox, tgt_bbox, p=1)
