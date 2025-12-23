@@ -298,6 +298,8 @@ class SetCriterion(nn.Module):
         del src_masks
         del target_masks
         return losses
+    def loss_ious(self, outputs, targets, indices, num_masks):
+        pass
 
     def prep_for_dn(self,mask_dict):
         output_known_lbs_bboxes = mask_dict['output_known_lbs_bboxes']
@@ -327,6 +329,7 @@ class SetCriterion(nn.Module):
             'labels': self.loss_labels_ce if self.semantic_ce_loss else self.loss_labels,
             'masks': self.loss_masks,
             'boxes': self.loss_boxes_panoptic if self.panoptic_on else self.loss_boxes,
+            'ious': self.loss_ious,
         }
         assert loss in loss_map, f"do you really want to compute {loss} loss?"
         return loss_map[loss](outputs, targets, indices, num_masks)
@@ -428,7 +431,9 @@ class SetCriterion(nn.Module):
                 l_dict = self.get_loss(loss, interm_outputs, targets, indices, num_masks)
                 l_dict = {k + f'_interm': v for k, v in l_dict.items()}
                 losses.update(l_dict)
-
+            l_dict = self.get_loss('ious', interm_outputs, targets, indices, num_masks)
+            # l_dict = {k + f'_interm': v for k, v in l_dict.items()}
+            # losses.update(l_dict)
         return losses, indices
 
     def __repr__(self):

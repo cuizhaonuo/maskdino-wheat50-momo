@@ -161,6 +161,9 @@ class MaskDINODecoder(nn.Module):
         self.bbox_embed = nn.ModuleList(box_embed_layerlist)
         self.decoder.bbox_embed = self.bbox_embed
 
+        self.iou_head = nn.Linear(hidden_dim, 1)
+        self.iou_head_before_norm = nn.LayerNorm(hidden_dim)
+
 
     @classmethod
     def from_config(cls, cfg, in_channels, mask_classification):
@@ -459,6 +462,10 @@ class MaskDINODecoder(nn.Module):
                                   topk_proposals.unsqueeze(-1).repeat(1, 1, self.hidden_dim))  # unsigmoid
 
             outputs_class, outputs_mask = self.forward_prediction_heads(tgt_undetach.transpose(0, 1), mask_features)
+            # ========================
+
+            outputs_iou = self.iou_head(self.iou_head_before_norm(tgt_undetach))
+            # ========================
             tgt = tgt_undetach.detach()
             if self.learn_tgt:
                 tgt = self.query_feat.weight[None].repeat(bs, 1, 1)
@@ -466,6 +473,7 @@ class MaskDINODecoder(nn.Module):
             interm_outputs['pred_logits'] = outputs_class
             interm_outputs['pred_boxes'] = refpoint_embed_undetach.sigmoid()
             interm_outputs['pred_masks'] = outputs_mask
+            interm_outputs['pred_logits_iou'] = outputs_iou
 
             # debug: pred_boxes 中间结果绘制到图像上
             # from maskdino.analysis.tool_lab import draw_bboxes_on_image
