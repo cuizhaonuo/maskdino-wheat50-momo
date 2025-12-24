@@ -61,6 +61,84 @@ def generalized_box_iou(boxes1, boxes2):
 
     return iou - (area - union) / (area + 1e-6)
 
+def box_iou_batch(boxes1, boxes2, eps=1e-6):
+    """
+    Args:
+        boxes1: (B, N, 4)
+        boxes2: (B, M, 4)
+
+    Returns:
+        iou:   (B, N, M)
+        union: (B, N, M)
+    """
+    # intersection
+    lt = torch.max(
+        boxes1[:, :, None, :2],
+        boxes2[:, None, :, :2],
+    )
+    rb = torch.min(
+        boxes1[:, :, None, 2:],
+        boxes2[:, None, :, 2:],
+    )
+
+    wh = (rb - lt).clamp(min=0)
+    inter = wh[..., 0] * wh[..., 1]  # (B, N, M)
+
+    # areas
+    area1 = (boxes1[..., 2] - boxes1[..., 0]) * (boxes1[..., 3] - boxes1[..., 1])
+    area2 = (boxes2[..., 2] - boxes2[..., 0]) * (boxes2[..., 3] - boxes2[..., 1])
+
+    # broadcast
+    area1 = area1[:, :, None]  # (B, N, 1)
+    area2 = area2[:, None, :]  # (B, 1, M)
+
+    union = area1 + area2 - inter
+    iou = inter / (union + eps)
+
+    return iou, union
+
+
+def generalized_box_iou_batch(boxes1, boxes2, eps=1e-6):
+    """
+    Batched Generalized IoU
+
+    Args:
+        boxes1: (B, N, 4) in [x0, y0, x1, y1]
+        boxes2: (B, M, 4) in [x0, y0, x1, y1]
+
+    Returns:
+        giou: (B, N, M)
+    """
+    assert boxes1.ndim == 3 and boxes2.ndim == 3
+    assert boxes1.size(-1) == 4 and boxes2.size(-1) == 4
+    assert boxes1.size(0) == boxes2.size(0)
+
+    # early check
+    assert (boxes1[..., 2:] >= boxes1[..., :2]).all()
+    assert (boxes2[..., 2:] >= boxes2[..., :2]).all()
+
+    # ------------------------
+    # IoU & union
+    # ------------------------
+    iou, union = box_iou_batch(boxes1, boxes2)  # (B, N, M)
+
+    # ------------------------
+    # smallest enclosing box
+    # ------------------------
+    lt = torch.min(
+        boxes1[:, :, None, :2],   # (B, N, 1, 2)
+        boxes2[:, None, :, :2],   # (B, 1, M, 2)
+    )
+    rb = torch.max(
+        boxes1[:, :, None, 2:],   # (B, N, 1, 2)
+        boxes2[:, None, :, 2:],   # (B, 1, M, 2)
+    )
+
+    wh = (rb - lt).clamp(min=0)      # (B, N, M, 2)
+    area = wh[..., 0] * wh[..., 1]   # (B, N, M)
+
+    giou = iou - (area - union) / (area + eps)
+    return giou
 
 
 # modified from torchvision to also return the union

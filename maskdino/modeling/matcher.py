@@ -138,6 +138,7 @@ class HungarianMatcher(nn.Module):
             giou_aware_weight = generalized_box_iou(box_cxcywh_to_xyxy(out_bbox), box_cxcywh_to_xyxy(tgt_bbox))
             giou_aware_weight = (giou_aware_weight + 1) / 2  # [0, 1]
             giou_aware_weight = giou_aware_weight.clamp(min=0.0, max=1.0)
+
             # giou_aware_weight = giou_aware_weight ** 2  # 放大权重差异
             # giou_aware_weight = giou_aware_weight.max(dim=-1)[0].unsqueeze(dim=-1)  # [num_queries, 1]
             # pos 正样本，iou 大则损失小，所以乘以 (1 - giou_aware_weight)

@@ -52,6 +52,19 @@ def sigmoid_focal_loss(inputs, targets, num_boxes, alpha: float = 0.25, gamma: f
 
     return loss.mean(1).sum() / num_boxes
 
+def sigmoid_giou_aware_focal_loss(inputs, targets, giou_aware_weight, num_boxes, alpha: float = 0.25, gamma: float = 2):
+    prob = inputs.sigmoid()
+    # prob = prob * giou_aware_weight # v1
+    ce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
+    p_t = prob * targets + (1 - prob) * (1 - targets)
+    loss = ce_loss * ((1 - p_t) ** gamma)
+
+    if alpha >= 0:
+        alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
+        loss = alpha_t * loss
+    # loss = loss * giou_aware_weight # v2
+    return loss.mean(1).sum() / num_boxes
+
 
 def dice_loss(
         inputs: torch.Tensor,
@@ -196,17 +209,24 @@ class SetCriterion(nn.Module):
         target_classes_onehot.scatter_(2, target_classes.unsqueeze(-1), 1)
 
         # -------
-        src_boxes = outputs['pred_boxes'][idx]
-        target_boxes = torch.cat([t['boxes'][i] for t, (_, i) in zip(targets, indices)], dim=0)
-        loss_giou = 1 - torch.diag(box_ops.generalized_box_iou(
-            box_ops.box_cxcywh_to_xyxy(src_boxes),
-            box_ops.box_cxcywh_to_xyxy(target_boxes)))
-        loss_giou = -loss_giou
+        src_boxes = outputs['pred_boxes']
+        target_boxes = torch.stack([t['boxes'] for t in targets], dim=0)
+        from maskdino.utils.box_ops import box_cxcywh_to_xyxy, generalized_box_iou_batch
+        b, nq = src_boxes.shape[:2]
+        nt = target_boxes.shape[1]
+        if nt == 0:
+            giou_aware_weight = torch.ones((b, nq, 1), device=src_boxes.device)
+        else:
+            giou_aware_weight = generalized_box_iou_batch(box_cxcywh_to_xyxy(src_boxes), box_cxcywh_to_xyxy(target_boxes))
+            giou_aware_weight = (giou_aware_weight + 1) / 2  # [0, 1]
+            giou_aware_weight = giou_aware_weight.clamp(min=0.0, max=1.0)
+            giou_aware_weight = 1 - torch.max(giou_aware_weight, dim=-1, keepdim=True)[0] # (b, 300,)
         # --------
         target_classes_onehot = target_classes_onehot[:,:,:-1]
-        loss_ce = sigmoid_focal_loss(src_logits, target_classes_onehot, num_boxes, alpha=self.focal_alpha, gamma=2) * src_logits.shape[1]
-        # loss_ce = sigmoid_focal_loss(loss_giou, src_logits, target_classes_onehot, num_boxes, alpha=self.focal_alpha, gamma=2) * src_logits.shape[1]
-        losses = {'loss_ce': loss_ce}
+        target_classes_onehot = target_classes_onehot * giou_aware_weight  # v3
+        loss_ce_giou_aware = sigmoid_focal_loss(src_logits, target_classes_onehot, num_boxes, alpha=self.focal_alpha, gamma=2) * src_logits.shape[1]
+        # loss_ce_giou_aware = sigmoid_giou_aware_focal_loss(src_logits, target_classes_onehot, giou_aware_weight, num_boxes, alpha=self.focal_alpha, gamma=2) * src_logits.shape[1]
+        losses = {'loss_ce': loss_ce_giou_aware}
 
         return losses
 

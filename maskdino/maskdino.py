@@ -337,7 +337,7 @@ class MaskDINO(nn.Module):
                     losses.pop(k)
             # debug: loss 的组成部分
             # from maskdino.analysis.tool_lab import vis_loss_bar
-            # vis_loss_bar(losses, title="Example loss", save_path="loss_bar_no_weight.png")
+            # vis_loss_bar(losses, title="Example loss", save_path="loss_bar_add_weight.png")
             return losses
         else:
 
