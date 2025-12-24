@@ -52,7 +52,7 @@ def sigmoid_focal_loss(inputs, targets, num_boxes, alpha: float = 0.25, gamma: f
 
     return loss.mean(1).sum() / num_boxes
 
-def sigmoid_giou_aware_focal_loss(inputs, targets, giou_aware_weight, num_boxes, alpha: float = 0.25, gamma: float = 2):
+def sigmoid_conditional_aware_focal_loss(inputs, targets, conditional_weight, num_boxes, alpha: float = 0.25, gamma: float = 2):
     prob = inputs.sigmoid()
     # prob = prob * giou_aware_weight # v1
     ce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
@@ -63,6 +63,8 @@ def sigmoid_giou_aware_focal_loss(inputs, targets, giou_aware_weight, num_boxes,
         alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
         loss = alpha_t * loss
     # loss = loss * giou_aware_weight # v2
+    if conditional_weight.ndim == 3:
+        loss = loss * conditional_weight
     return loss.mean(1).sum() / num_boxes
 
 
@@ -86,6 +88,26 @@ def dice_loss(
     denominator = inputs.sum(-1) + targets.sum(-1)
     loss = 1 - (numerator + 1) / (denominator + 1)
     return loss.sum() / num_masks
+
+def get_dice_aware_weight(
+        inputs: torch.Tensor,
+        targets: torch.Tensor,
+    ):
+    """
+    Compute the DICE loss, similar to generalized IOU for masks
+    Args:
+        inputs: A float tensor of arbitrary shape.
+                The predictions for each example.
+        targets: A float tensor with the same shape as inputs. Stores the binary
+                 classification label for each element in inputs
+                (0 for the negative class and 1 for the positive class).
+    """
+    inputs = inputs.sigmoid()
+    inputs = inputs.flatten(1)
+    numerator = 2 * (inputs * targets).sum(-1)
+    denominator = inputs.sum(-1) + targets.sum(-1)
+    weight = 1 - (numerator + 1) / (denominator + 1)
+    return weight
 
 
 dice_loss_jit = torch.jit.script(
@@ -210,7 +232,7 @@ class SetCriterion(nn.Module):
 
         # -------
         src_boxes = outputs['pred_boxes']
-        target_boxes = torch.stack([t['boxes'] for t in targets], dim=0)
+        target_boxes = torch.stack([t['boxes'] for t in targets], dim=0) # 这一行代码其实限制了 batch size 为1
         from maskdino.utils.box_ops import box_cxcywh_to_xyxy, generalized_box_iou_batch
         b, nq = src_boxes.shape[:2]
         nt = target_boxes.shape[1]
@@ -222,11 +244,85 @@ class SetCriterion(nn.Module):
             giou_aware_weight = giou_aware_weight.clamp(min=0.0, max=1.0)
             giou_aware_weight = 1 - torch.max(giou_aware_weight, dim=-1, keepdim=True)[0] # (b, 300,)
         # --------
+        # loss_masks = self.loss_masks(outputs, targets, indices, num_boxes)
+        # (point_logits, point_labels) = loss_masks['info']
+        # dice_aware_weight = get_dice_aware_weight(point_logits, point_logits)
+        def _get_dice_aware_weight(outputs, targets):
+            bs = outputs['pred_masks'].shape[0]
+            dice_list = []
+            for bid in range(bs):
+                pred_masks = outputs['pred_masks'][bid] # (nq, h, w)
+                target_masks = targets[bid]['masks'].to(pred_masks) # (nt, h, w)
+                out_mask = pred_masks[:, None]
+                tgt_mask = target_masks[:, None]
+                # all masks share the same set of points for efficient matching!
+                point_coords = torch.rand(1, self.num_points, 2, device=out_mask.device)
+
+                def _point_sample(input, point_coords, **kwargs):
+                    add_dim = False
+                    if point_coords.dim() == 3:
+                        add_dim = True
+                        point_coords = point_coords.unsqueeze(2)
+                    output = F.grid_sample(input, 2.0 * point_coords - 1.0, **kwargs)
+                    if add_dim:
+                        output = output.squeeze(3)
+                    return output
+                # get gt labels
+                tgt_mask = _point_sample(
+                    tgt_mask,
+                    point_coords.repeat(tgt_mask.shape[0], 1, 1),
+                    align_corners=False,
+                ).squeeze(1)
+
+                out_mask = _point_sample(
+                    out_mask,
+                    point_coords.repeat(out_mask.shape[0], 1, 1),
+                    align_corners=False,
+                ).squeeze(1)
+                with torch.amp.autocast('cuda', enabled=False):
+                    out_mask = out_mask.float()
+                    tgt_mask = tgt_mask.float()
+
+                    def batch_dice_loss(inputs: torch.Tensor, targets: torch.Tensor):
+                        """
+                        Compute the DICE loss, similar to generalized IOU for masks
+                        Args:
+                            inputs: A float tensor of arbitrary shape.
+                                    The predictions for each example.
+                            targets: A float tensor with the same shape as inputs. Stores the binary
+                                     classification label for each element in inputs
+                                    (0 for the negative class and 1 for the positive class).
+                        """
+                        inputs = inputs.sigmoid()
+                        inputs = inputs.flatten(1)
+                        numerator = 2 * torch.einsum("nc,mc->nm", inputs, targets)
+                        denominator = inputs.sum(-1)[:, None] + targets.sum(-1)[None, :]
+                        loss = 1 - (numerator + 1) / (denominator + 1)
+                        return loss
+                    # If there's no annotations
+                    if out_mask.shape[0] == 0 or tgt_mask.shape[0] == 0:
+                        # Compute the focal loss between masks
+                        # cost_mask = batch_sigmoid_ce_loss(out_mask, tgt_mask)
+                        # Compute the dice loss betwen masks
+                        cost_dice = batch_dice_loss(out_mask, tgt_mask)
+                    else:
+                        # cost_mask = batch_sigmoid_ce_loss_jit(out_mask, tgt_mask)
+                        cost_dice = batch_dice_loss(out_mask, tgt_mask)
+                    dice_list.append(cost_dice)
+            stacked_dice = torch.stack(dice_list, dim=0)  # (b, nq, nt)
+            return stacked_dice
+        if nt == 0:
+            dice_aware_weight = torch.ones((b, nq, 1), device=src_boxes.device)
+        else:
+            dice_aware_weight = _get_dice_aware_weight(outputs, targets)
+            dice_aware_weight = dice_aware_weight.max(dim=-1, keepdim=True)[0]  # (b, nq, 1)
+        # --------
         target_classes_onehot = target_classes_onehot[:,:,:-1]
-        target_classes_onehot = target_classes_onehot * giou_aware_weight  # v3
-        loss_ce_giou_aware = sigmoid_focal_loss(src_logits, target_classes_onehot, num_boxes, alpha=self.focal_alpha, gamma=2) * src_logits.shape[1]
+        # target_classes_onehot = target_classes_onehot * giou_aware_weight  # v3
+        # loss_ce_giou_aware = sigmoid_focal_loss(src_logits, target_classes_onehot, num_boxes, alpha=self.focal_alpha, gamma=2) * src_logits.shape[1]
         # loss_ce_giou_aware = sigmoid_giou_aware_focal_loss(src_logits, target_classes_onehot, giou_aware_weight, num_boxes, alpha=self.focal_alpha, gamma=2) * src_logits.shape[1]
-        losses = {'loss_ce': loss_ce_giou_aware}
+        loss_ce_conditional_aware = sigmoid_conditional_aware_focal_loss(src_logits, target_classes_onehot, dice_aware_weight, num_boxes, alpha=self.focal_alpha, gamma=2) * src_logits.shape[1]
+        losses = {'loss_ce': loss_ce_conditional_aware}
 
         return losses
 
@@ -322,6 +418,7 @@ class SetCriterion(nn.Module):
         losses = {
             "loss_mask": sigmoid_ce_loss_jit(point_logits, point_labels, num_masks),
             "loss_dice": dice_loss_jit(point_logits, point_labels, num_masks),
+            "info": (point_logits, point_labels)
         }
 
         del src_masks
