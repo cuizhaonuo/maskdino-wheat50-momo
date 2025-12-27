@@ -2455,7 +2455,18 @@ def visualize_ms_deform_attn_sampling_by_query(
 
     plt.tight_layout()
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    fig.savefig(save_path, dpi=200)
+    if not os.path.exists(save_path):
+        fig.savefig(save_path, dpi=200)
+    else:
+        # 增加后缀 index 避免覆盖
+        base, ext = os.path.splitext(save_path)
+        idx = 1
+        new_path = f"{base}_{idx}{ext}"
+        while os.path.exists(new_path):
+            idx += 1
+            new_path = f"{base}_{idx}{ext}"
+        fig.savefig(new_path, dpi=200)
+
     plt.close(fig)
     print(f"✅ MSDeformAttn sampling (by query) visualization saved to: {save_path}")
 

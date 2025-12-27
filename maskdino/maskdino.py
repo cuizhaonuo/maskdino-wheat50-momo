@@ -290,7 +290,34 @@ class MaskDINO(nn.Module):
             # indices_ctx.set(None)
 
             # 预处理时已经 pad 好了，不需要在这里 pad 了，因此不传入 mask，即 mask=None
+            from maskdino.ctx import layer_query_ids_ctx
+            layer_query_ids_ctx.set(None)
             outputs,mask_dict = self.sem_seg_head(features, targets=targets)
+
+            # debug: 可视化预测遮挡麦穗的 query 在 cross-attn 中所关注的区域
+            def get_layer_query_ids(outputs, targets, *, target_id):
+                b = 0
+                layer_query_ids = []
+                def get_query_id(pred_boxes, tgt_boxes, target_id):
+                    from maskdino.utils.box_ops import box_cxcywh_to_xyxy, box_iou
+                    iou, _ = box_iou(box_cxcywh_to_xyxy(pred_boxes), box_cxcywh_to_xyxy(tgt_boxes)) # (nq, nt)
+                    query_with_max_iou_id = torch.max(iou, dim=-1)[1] # (nq,)
+                    query_to_target = torch.where(query_with_max_iou_id == target_id)[0]
+                    return query_to_target
+                tgt_boxes = targets[b]['boxes']
+                aux_outputs = outputs["aux_outputs"]
+                for out in aux_outputs[1:]:
+                    pred_boxes = out['pred_boxes'][b]
+                    query_ids = get_query_id(pred_boxes, tgt_boxes, target_id=target_id)
+                    layer_query_ids.append(query_ids)
+                pred_boxes = outputs['pred_boxes'][0]
+                query_ids = get_query_id(pred_boxes, tgt_boxes, target_id=target_id)
+                layer_query_ids.append(query_ids)
+                return layer_query_ids
+            layer_query_ids = get_layer_query_ids(outputs, targets, target_id=22)
+            from maskdino.ctx import layer_query_ids_ctx
+            layer_query_ids_ctx.set(layer_query_ids)
+            outputs, mask_dict = self.sem_seg_head(features, targets=targets)
 
             # debug: 可视化每一层 decoder 的结果，观察这些结果所各自预测的对象
             from maskdino.analysis.tool_lab import vis_decoder_layer_results

@@ -79,7 +79,7 @@ class MSDeformAttn(nn.Module):
         xavier_uniform_(self.output_proj.weight.data)
         constant_(self.output_proj.bias.data, 0.)
 
-    def forward(self, query, reference_points, input_flatten, input_spatial_shapes, input_level_start_index, input_padding_mask=None):
+    def forward(self, query, reference_points, input_flatten, input_spatial_shapes, input_level_start_index, input_padding_mask=None, **kwargs):
         """
         :param query                       (N, Length_{query}, C)
         :param reference_points            (N, Length_{query}, n_levels, 2), range in [0, 1], top-left (0,0), bottom-right (1, 1), including padding area
@@ -115,30 +115,33 @@ class MSDeformAttn(nn.Module):
             raise ValueError(
                 'Last dim of reference_points must be 2 or 4, but get {} instead.'.format(reference_points.shape[-1]))
         # ====== DEBUG: 可视化采样点 ======
-        # from maskdino.analysis.tool_lab import visualize_ms_deform_attn_sampling, visualize_ms_deform_attn_sampling_by_head, \
-        #     visualize_ms_deform_attn_sampling_by_query
-        # try:
-        #     if sampling_locations.shape[1] == 300:
-        #         visualize_ms_deform_attn_sampling_by_query(
-        #             sampling_locations=sampling_locations,
-        #             image_path="/public/home/zncui/pycharm_project/MaskDINO/myscripts/transformed_image.jpg",
-        #             save_path="/public/home/zncui/pycharm_project/MaskDINO/myscripts/msda_sampling_by_query.jpg",
-        #             batch_idx=0,
-        #             # 例如只看几个 query：
-        #             # query_indices=[0, 1, 2, 10, 20, 50, 142],
-        #             # 或者 None = 所有 query（300 个会非常密，不建议）
-        #             query_indices=None,
-        #             # query_indices=None,
-        #             max_points_per_query_per_level=2000,
-        #         )
-        # except Exception as e:
-        #     print(f"[MSDeformAttn] visualize error: {e}")
+        from maskdino.analysis.tool_lab import visualize_ms_deform_attn_sampling, visualize_ms_deform_attn_sampling_by_head, \
+            visualize_ms_deform_attn_sampling_by_query
+        try:
+            if sampling_locations.shape[1] == 300:
+                query_ids = kwargs['query_ids']
+                if query_ids is not None:
+                    query_ids = query_ids.tolist()
+                    visualize_ms_deform_attn_sampling_by_query(
+                        sampling_locations=sampling_locations,
+                        image_path="/public/home/zncui/pycharm_project/MaskDINO/myscripts/transformed_image_v1.jpg",
+                        save_path="/public/home/zncui/pycharm_project/MaskDINO/myscripts/msda_sampling_by_query.jpg",
+                        batch_idx=0,
+                        # 例如只看几个 query：
+                        query_indices=query_ids,
+                        # 或者 None = 所有 query（300 个会非常密，不建议）
+                        # query_indices=None,
+                        # query_indices=None,
+                        max_points_per_query_per_level=2000,
+                    )
+        except Exception as e:
+            print(f"[MSDeformAttn] visualize error: {e}")
         # ====== DEBUG END ======
         try:
             output = MSDeformAttnFunction.apply(
                 value, input_spatial_shapes, input_level_start_index, sampling_locations, attention_weights, self.im2col_step)
             # debug
-            # output = ms_deform_attn_core_pytorch(value, input_spatial_shapes, sampling_locations, attention_weights)
+            output = ms_deform_attn_core_pytorch(value, input_spatial_shapes, sampling_locations, attention_weights)
         except:
             # CPU
             output = ms_deform_attn_core_pytorch(value, input_spatial_shapes, sampling_locations, attention_weights)

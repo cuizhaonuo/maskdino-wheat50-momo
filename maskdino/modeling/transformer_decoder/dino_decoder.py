@@ -124,6 +124,10 @@ class TransformerDecoder(nn.Module):
         reference_points = refpoints_unsigmoid.sigmoid().to(device)
         ref_points = [reference_points]
 
+        from maskdino.ctx import layer_query_ids_ctx
+        layer_query_ids = layer_query_ids_ctx.get() if layer_query_ids_ctx.get() else None
+
+
         attn_output_weights_list = []
         for layer_id, layer in enumerate(self.layers):
             # preprocess ref points
@@ -149,6 +153,7 @@ class TransformerDecoder(nn.Module):
             # memory_pos, cross_attn_mask 此处均为 None
             # ---
             # (300, 1, 256) --> (300, 1, 256)
+            query_ids = layer_query_ids[layer_id] if layer_query_ids is not None else None
             output, attn_output_weights = layer(
                 tgt=output,
                 tgt_query_pos=query_pos,
@@ -163,7 +168,8 @@ class TransformerDecoder(nn.Module):
                 memory_pos=pos, # None
 
                 self_attn_mask=tgt_mask,
-                cross_attn_mask=memory_mask # None
+                cross_attn_mask=memory_mask, # None
+                query_ids=query_ids
             )
             attn_output_weights_list.append(attn_output_weights)
             # refinement of reference points
@@ -274,6 +280,7 @@ class DeformableTransformerDecoderLayer(nn.Module):
                 # sa
                 self_attn_mask: Optional[Tensor] = None,  # mask used for self-attention
                 cross_attn_mask: Optional[Tensor] = None,  # mask used for cross-attention
+                **kwargs
                 ):
         '''
         tgt: nq, bs, d_model
@@ -337,10 +344,12 @@ class DeformableTransformerDecoderLayer(nn.Module):
         input_level_start_index = memory_level_start_index 
         input_padding_mask = memory_key_padding_mask # 全是 False，意思是没有 padding 区域
         '''
+        query_ids = kwargs['query_ids']
         tgt2 = self.cross_attn(self.with_pos_embed(tgt, tgt_query_pos).transpose(0, 1),
                                tgt_reference_points.transpose(0, 1).contiguous(),
                                memory.transpose(0, 1), memory_spatial_shapes, memory_level_start_index,
-                               memory_key_padding_mask).transpose(0, 1)
+                               memory_key_padding_mask,
+                               query_ids=query_ids).transpose(0, 1)
         tgt = tgt + self.dropout1(tgt2)
         tgt = self.norm1(tgt)
 
