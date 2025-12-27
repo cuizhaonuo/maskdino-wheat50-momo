@@ -124,15 +124,18 @@ class MaskDINO(nn.Module):
 
         # loss weights
         class_weight = cfg.MODEL.MaskDINO.CLASS_WEIGHT
+        mask_weight = cfg.MODEL.MaskDINO.MASK_WEIGHT
+        dice_weight = cfg.MODEL.MaskDINO.DICE_WEIGHT  #
+        box_weight = cfg.MODEL.MaskDINO.BOX_WEIGHT  #
+        giou_weight = cfg.MODEL.MaskDINO.GIOU_WEIGHT  #
+        # iou_weight = cfg.MODEL.MaskDINO.IOU_WEIGHT
+
         cost_class_weight = cfg.MODEL.MaskDINO.COST_CLASS_WEIGHT
         cost_dice_weight = cfg.MODEL.MaskDINO.COST_DICE_WEIGHT
-        dice_weight = cfg.MODEL.MaskDINO.DICE_WEIGHT  #
         cost_mask_weight = cfg.MODEL.MaskDINO.COST_MASK_WEIGHT  #
-        mask_weight = cfg.MODEL.MaskDINO.MASK_WEIGHT
         cost_box_weight = cfg.MODEL.MaskDINO.COST_BOX_WEIGHT
-        box_weight = cfg.MODEL.MaskDINO.BOX_WEIGHT  #
         cost_giou_weight = cfg.MODEL.MaskDINO.COST_GIOU_WEIGHT
-        giou_weight = cfg.MODEL.MaskDINO.GIOU_WEIGHT  #
+
         # building matcher
         matcher = HungarianMatcher(
             cost_class=cost_class_weight,
@@ -146,6 +149,7 @@ class MaskDINO(nn.Module):
         weight_dict = {"loss_ce": class_weight}
         weight_dict.update({"loss_mask": mask_weight, "loss_dice": dice_weight})
         weight_dict.update({"loss_bbox":box_weight,"loss_giou":giou_weight})
+        # weight_dict.update({'loss_iou': iou_weight})
         # two stage is the query selection scheme
         if cfg.MODEL.MaskDINO.TWO_STAGE:
             interm_weight_dict = {}
@@ -335,6 +339,9 @@ class MaskDINO(nn.Module):
                     losses[k] *= self.criterion.weight_dict[k]
                 else:
                     # remove this loss if not specified in `weight_dict`
+                    if 'loss_iou' in k or 'loss_dice_l1' in k:
+                        continue
+                    print(k)
                     losses.pop(k)
             # debug: loss 的组成部分
             # from maskdino.analysis.tool_lab import vis_loss_bar
