@@ -220,6 +220,33 @@ class SetCriterion(nn.Module):
             box_ops.box_cxcywh_to_xyxy(target_boxes)))
         losses['loss_giou'] = loss_giou.sum() / num_boxes
 
+        if 'pred_logits_iou' in outputs:
+            src_iou = outputs['pred_logits_iou'][idx].squeeze(-1).sigmoid()
+
+            # unmatched_pred_iou = outputs['pred_logits_iou'].squeeze().sigmoid()
+            # unmatched_pred_iou = unmatched_pred_iou.detach().cpu()
+            # nq = unmatched_pred_iou.shape[0]
+            # nq_x_axis = torch.arange(nq, dtype=torch.int64, device=unmatched_pred_iou.device)
+            # from matplotlib import pyplot as plt
+            # plt.figure()
+            # plt.plot(nq_x_axis, unmatched_pred_iou)
+            # plt.show()
+
+            iou, _ = box_ops.box_iou(
+                box_ops.box_cxcywh_to_xyxy(src_boxes),
+                box_ops.box_cxcywh_to_xyxy(target_boxes),
+            )
+            target_iou = torch.diag(iou).detach()
+
+            loss_iou = F.smooth_l1_loss(src_iou, target_iou, reduction='none')
+
+            # for i, (pred_iou, tgt_iou) in enumerate(zip(src_iou, target_iou)):
+            #     pred_iou = pred_iou
+            #     tgt_iou = tgt_iou
+            #     print(f'query id: {i} --> pred_iou[{pred_iou}] tgt_iou[{tgt_iou}]')
+
+            losses['loss_iou'] = loss_iou.sum() / num_boxes * 5
+
         return losses
 
     def loss_boxes_panoptic(self, outputs, targets, indices, num_boxes):
@@ -290,9 +317,46 @@ class SetCriterion(nn.Module):
             align_corners=False,
         ).squeeze(1)
 
+        # def dice_from_logits_and_gt(src_logits, tgt_mask, out_size=64, eps=1e-6):
+        #     """
+        #     src_logits: (m, Hs, Ws)  raw logits
+        #     tgt_mask:   (m, Ht, Wt)  {0,1} or bool/float
+        #     return:     (m,) dice in [0,1]
+        #     """
+        #     # (m,1,H,W)
+        #     src = src_logits[:, None]
+        #     tgt = tgt_mask[:, None].float()
+        #
+        #     # resize both to same grid
+        #     src = F.interpolate(src, size=(out_size, out_size), mode="bilinear", align_corners=False)
+        #     tgt = F.interpolate(tgt, size=(out_size, out_size), mode="nearest")  # GT 用 nearest 更合理
+        #
+        #     src = src.sigmoid()  # (m,1,K,K)
+        #
+        #     # flatten
+        #     src = src.flatten(1)  # (m, K*K)
+        #     tgt = tgt.flatten(1)  # (m, K*K)
+        #
+        #     inter = (src * tgt).sum(-1)
+        #     denom = src.sum(-1) + tgt.sum(-1)
+        #
+        #     dice = (2 * inter + eps) / (denom + eps)
+        #     return dice
+        #
+        # loss_dice_l1 = torch.as_tensor(0., device=src_masks.device)
+        # if 'pred_logits_dice' in outputs:
+        #     src_mask_full = outputs["pred_masks"][src_idx]  # (m, 256, 256) logits
+        #     tgt_mask_full = target_masks[tgt_idx]  # (m, 1024, 1024) 0/1
+        #
+        #     dice = dice_from_logits_and_gt(src_mask_full, tgt_mask_full, out_size=256).detach()
+        #
+        #     pred_dice = outputs['pred_logits_dice'][src_idx].squeeze(-1).sigmoid()  # (m,)
+        #     loss_dice_l1 = F.smooth_l1_loss(pred_dice, dice, reduction='sum') / num_masks * 5
+
         losses = {
             "loss_mask": sigmoid_ce_loss_jit(point_logits, point_labels, num_masks),
             "loss_dice": dice_loss_jit(point_logits, point_labels, num_masks),
+            # "loss_dice_l1": loss_dice_l1
         }
 
         del src_masks

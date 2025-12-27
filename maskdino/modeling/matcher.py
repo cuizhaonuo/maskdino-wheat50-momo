@@ -208,6 +208,35 @@ class HungarianMatcher(nn.Module):
             )
             C = C.reshape(num_queries, -1).cpu()
 
+            # if 'interm_outputs' in outputs:
+            #     interm_outputs = outputs['interm_outputs']
+            #     pred_boxes = interm_outputs['pred_boxes'][b].cpu() # (bs, nq, 4) --> (nq, 4)
+            #     tgt_boxes = targets[b]['boxes'].to(pred_boxes.device) # (nt, 4)
+            #     from maskdino.utils.box_ops import box_iou
+            #     iou_matrix = box_iou(box_cxcywh_to_xyxy(pred_boxes),
+            #                          box_cxcywh_to_xyxy(tgt_boxes))[0]
+            #     # ===== min matching results
+            #     # iou_indices = C.min(dim=-1)[1] # (nq, nt) --> (nq,)
+            #     # nq = pred_boxes.shape[0]
+            #     # query_indices = torch.arange(nq, dtype=torch.int64, device=pred_boxes.device)
+            #     # pred_iou = interm_outputs['pred_logits_iou'][b].sigmoid().to(pred_boxes.device) # (nq,)
+            #     # ===== hungary matching results
+            #     query_indices, iou_indices = linear_sum_assignment(C)
+            #     tgt_iou = iou_matrix[query_indices, iou_indices]  # (nq,)
+            #     pred_iou = interm_outputs['pred_logits_iou'][b].sigmoid()[query_indices].to(pred_boxes.device) # (nq,)
+            #     from matplotlib import pyplot as plt
+            #     plt.figure()
+            #     nq = query_indices.shape[0]
+            #     x_indices = torch.arange(nq, dtype=torch.int64, device=pred_boxes.device)
+            #     plt.plot(x_indices, tgt_iou, marker='o', color='orange', label='tgt_iou')
+            #     plt.plot(x_indices, pred_iou, marker='s', color='green', label='pred_iou')
+            #     plt.xlabel('query id')
+            #     plt.ylabel('iou value')
+            #     plt.title('tgt_iou vs pred_iou')
+            #     plt.legend()
+            #     plt.savefig(f'hungary_matching_iou_plot_batch{b}.png')
+            #     plt.close()
+
             # debug: 可视化 cost_xxx 在 C 中的占比
             # from maskdino.analysis.tool_lab import visualize_cost_components, visualize_cost_components_bar_sorted
             # no weighted

@@ -140,6 +140,17 @@ class MaskDINODecoder(nn.Module):
         self.label_enc=nn.Embedding(num_classes,hidden_dim)
         self.mask_embed = MLP(hidden_dim, hidden_dim, mask_dim, 3)
 
+        # self.refpoints_mapping = MLP(4, 16, 16, 1)
+        # self.refpoints_mapping = nn.Linear(4, 64)
+        # self.iou_head = MLP(hidden_dim, hidden_dim, 1, 1)
+        # self.iou_head_before_norm = nn.LayerNorm(hidden_dim)
+
+        self.iou_head = MLP(hidden_dim + 4, hidden_dim, 1, 1)
+        self.iou_head_before_norm = nn.LayerNorm(hidden_dim + 4)
+
+        # self.dice_head = MLP(hidden_dim, hidden_dim, 1, 1)
+        # self.dice_head_before_norm = nn.LayerNorm(hidden_dim)
+
         # init decoder
         self.decoder_norm = decoder_norm = nn.LayerNorm(hidden_dim)
         decoder_layer = DeformableTransformerDecoderLayer(hidden_dim, dim_feedforward,
@@ -312,7 +323,7 @@ class MaskDINODecoder(nn.Module):
 
         return input_query_label,input_query_bbox,attn_mask,mask_dict
 
-    def dn_post_process(self,outputs_class,outputs_coord,mask_dict,outputs_mask):
+    def dn_post_process(self, outputs_class, outputs_coord, outputs_mask, outputs_iou, mask_dict):
         """
             post process of dn after output from the transformer
             put the dn part in the mask_dict
@@ -322,14 +333,19 @@ class MaskDINODecoder(nn.Module):
         outputs_class = outputs_class[:, :, mask_dict['pad_size']:, :]
         output_known_coord = outputs_coord[:, :, :mask_dict['pad_size'], :]
         outputs_coord = outputs_coord[:, :, mask_dict['pad_size']:, :]
+        outputs_known_iou = outputs_iou[:, :, :mask_dict['pad_size'], :]
+        outputs_iou = outputs_iou[:, :, mask_dict['pad_size']:, :]
         if outputs_mask is not None:
             output_known_mask = outputs_mask[:, :, :mask_dict['pad_size'], :]
             outputs_mask = outputs_mask[:, :, mask_dict['pad_size']:, :]
-        out = {'pred_logits': output_known_class[-1], 'pred_boxes': output_known_coord[-1],'pred_masks': output_known_mask[-1]}
+        out = {'pred_logits': output_known_class[-1],
+               'pred_boxes': output_known_coord[-1],
+               'pred_masks': output_known_mask[-1],
+               'pred_logits_iou': outputs_known_iou[-1]}
 
-        out['aux_outputs'] = self._set_aux_loss(output_known_class, output_known_mask,output_known_coord)
+        out['aux_outputs'] = self._set_aux_loss(output_known_class, output_known_mask, outputs_known_iou, output_known_coord)
         mask_dict['output_known_lbs_bboxes']=out
-        return outputs_class, outputs_coord, outputs_mask
+        return outputs_class, outputs_coord, outputs_mask, outputs_iou
 
     def get_valid_ratio(self, mask):
         _, H, W = mask.shape
@@ -407,6 +423,7 @@ class MaskDINODecoder(nn.Module):
 
         predictions_class = []
         predictions_mask = []
+        predictions_iou = []
         if self.two_stage:
             output_memory, output_proposals = gen_encoder_output_proposals(src_flatten, mask_flatten, spatial_shapes)
             output_memory = self.enc_output_norm(self.enc_output(output_memory))
@@ -415,7 +432,7 @@ class MaskDINODecoder(nn.Module):
                 output_memory) + output_proposals  # (bs, \sum{hw}, 4) unsigmoid
             # enc_outputs_coord_unselected = output_proposals
             topk = self.num_queries
-            topk_proposals = torch.topk(enc_outputs_class_unselected.max(-1)[0], topk, dim=1)[1]
+            topk_proposals = torch.topk(enc_outputs_class_unselected.max(-1)[0], topk, dim=1)[1] # (bs, k)
 
             # from maskdino.ctx import indices_ctx
             # indices = indices_ctx.get()
@@ -454,6 +471,14 @@ class MaskDINODecoder(nn.Module):
                                   topk_proposals.unsqueeze(-1).repeat(1, 1, self.hidden_dim))  # unsigmoid
 
             outputs_class, outputs_mask = self.forward_prediction_heads(tgt_undetach.transpose(0, 1), mask_features)
+            # ================
+
+            outputs_iou = self.iou_head(self.iou_head_before_norm(tgt_undetach))
+            # tgt_with_bbox_undetach = torch.concat([refpoint_embed_undetach.sigmoid(), tgt_undetach], dim=-1)
+            # outputs_iou = self.iou_head(self.iou_head_before_norm(tgt_with_bbox_undetach))
+
+            # outputs_dice = self.dice_head(self.dice_head_before_norm(tgt_undetach))
+            # ================
             tgt = tgt_undetach.detach()
             if self.learn_tgt:
                 tgt = self.query_feat.weight[None].repeat(bs, 1, 1)
@@ -461,6 +486,8 @@ class MaskDINODecoder(nn.Module):
             interm_outputs['pred_logits'] = outputs_class
             interm_outputs['pred_boxes'] = refpoint_embed_undetach.sigmoid()
             interm_outputs['pred_masks'] = outputs_mask
+            interm_outputs['pred_logits_iou'] = outputs_iou
+            # interm_outputs['pred_logits_dice'] = outputs_dice
 
             # debug: pred_boxes 中间结果绘制到图像上
             # from maskdino.analysis.tool_lab import draw_bboxes_on_image
@@ -510,16 +537,38 @@ class MaskDINODecoder(nn.Module):
         # 此处 tgt 变成了 (bs, dn_pad + num_queries, hidden_dim)，content query + denoising query
         # 增加了 dn_pad 个 denoising query
 
+        def get_refpoint_embed(outputs_mask):
+            flaten_mask = outputs_mask.detach().flatten(0, 1)
+            h, w = outputs_mask.shape[-2:]
+            if self.initialize_box_type == 'bitmask':  # slower, but more accurate
+                refpoint_embed = BitMasks(flaten_mask > 0).get_bounding_boxes().tensor.to(device)
+            elif self.initialize_box_type == 'mask2box':  # faster conversion
+                refpoint_embed = box_ops.masks_to_boxes(flaten_mask > 0).to(device)
+            else:
+                assert NotImplementedError
+            refpoint_embed = box_ops.box_xyxy_to_cxcywh(refpoint_embed) / torch.as_tensor([w, h, w, h],
+                                                                                          dtype=torch.float).to(device)
+            refpoint_embed = refpoint_embed.reshape(outputs_mask.shape[0], outputs_mask.shape[1], 4)
+            # refpoint_embed = inverse_sigmoid(refpoint_embed)
+            return refpoint_embed.sigmoid()
+
         # direct prediction from the matching and denoising part in the begining
         if self.initial_pred:
             # 暂时注释
-            outputs_class, outputs_mask = self.forward_prediction_heads(tgt.transpose(0, 1), mask_features, self.training)
+            # outputs_class, outputs_mask = self.forward_prediction_heads(tgt.transpose(0, 1), mask_features, self.training)
+            outputs_class, outputs_mask = self.forward_prediction_heads(tgt.transpose(0, 1), mask_features, True)
+            outputs_iou = self.iou_head(self.iou_head_before_norm(tgt))
+            # refpoint_embed_undetach = get_refpoint_embed(outputs_mask)
+            # tgt_with_bbox_undetach = torch.concat([refpoint_embed_undetach, tgt], dim=-1)
+            # outputs_iou = self.iou_head(self.iou_head_before_norm(tgt_with_bbox_undetach))
 
             # debug: 查看推理时每一层的预测结果
             # outputs_class, outputs_mask = self.forward_prediction_heads(tgt.transpose(0, 1), mask_features, pred_mask=True)
 
             predictions_class.append(outputs_class)
             predictions_mask.append(outputs_mask)
+            predictions_iou.append(outputs_iou)
+
         if self.dn != "no" and self.training and mask_dict is not None:
             refpoint_embed=torch.cat([input_query_bbox,refpoint_embed],dim=1)
         # 此处 refpoint_embed 变成了 (bs, dn_pad + num_queries, 4)，position query + denoising query
@@ -564,13 +613,18 @@ class MaskDINODecoder(nn.Module):
             # 这样做的目的是减少计算量，因为掩码预测比较耗时
 
             # 暂时注释
-            outputs_class, outputs_mask = self.forward_prediction_heads(output.transpose(0, 1), mask_features, self.training or (i == len(hs)-1))
-
+            # outputs_class, outputs_mask = self.forward_prediction_heads(output.transpose(0, 1), mask_features, self.training or (i == len(hs)-1))
+            outputs_class, outputs_mask = self.forward_prediction_heads(output.transpose(0, 1), mask_features, True)
+            # refpoint_embed_undetach = get_refpoint_embed(outputs_mask)
+            # tgt_with_bbox_undetach = torch.concat([refpoint_embed_undetach, output], dim=-1)
+            # outputs_iou = self.iou_head(self.iou_head_before_norm(tgt_with_bbox_undetach))
+            outputs_iou = self.iou_head(self.iou_head_before_norm(output))
             # debug: 查看推理时每一层的预测结果
             # outputs_class, outputs_mask = self.forward_prediction_heads(output.transpose(0, 1), mask_features, pred_mask=True)
 
             predictions_class.append(outputs_class)
             predictions_mask.append(outputs_mask)
+            predictions_iou.append(outputs_iou)
 
         # iteratively box prediction
         '''
@@ -580,7 +634,7 @@ class MaskDINODecoder(nn.Module):
         '''
         if self.initial_pred:
             '''
-            reference: List num_layers + 1 -- (bsm dn_pad + num_queries, 4)
+            reference: List num_layers + 1 -- (bs, dn_pad + num_queries, 4)
             hs: List num_layers -- (bs, dn_pad + num_queries, hidden_dim)
             refpoint_embed: (bs, dn_pad + num_queries, 4)
             out_boxes: List num_layers + 1 -- (bs, dn_pad + num_queries, 4)
@@ -597,13 +651,19 @@ class MaskDINODecoder(nn.Module):
         if mask_dict is not None:
             predictions_mask=torch.stack(predictions_mask)
             predictions_class=torch.stack(predictions_class)
+            predictions_iou = torch.stack(predictions_iou)
             # 包含中间的所有结果
             # predictions_mask: (num_layers + 1, bs, dn_pad + num_queries, h, w)
             # predictions_class: (num_layers + 1, bs, dn_pad + num_queries, num_classes)
             # out_boxes: (num_layers + 1, bs, dn_pad + num_queries, 4)
-            predictions_class, out_boxes,predictions_mask=\
-                self.dn_post_process(predictions_class,out_boxes,mask_dict,predictions_mask)
-            predictions_class,predictions_mask=list(predictions_class),list(predictions_mask)
+            predictions_class, out_boxes, predictions_mask, predictions_iou = self.dn_post_process(
+                predictions_class,
+                out_boxes,
+                predictions_mask,
+                predictions_iou,
+                mask_dict
+                )
+            predictions_class,predictions_mask,predictions_iou=list(predictions_class),list(predictions_mask), list(predictions_iou)
         elif self.training:  # this is to insure self.label_enc participate in the model
             predictions_class[-1] += 0.0*self.label_enc.weight.sum()
 
@@ -611,12 +671,17 @@ class MaskDINODecoder(nn.Module):
         # 训练中，返回 9 个 decoder 的结果，加上 1 个 tgt 的结果：pred_logits, pred_masks, pred_boxes 是最后一层解码器的结果
         # aux_outputs 按照顺序，第一个是 tgt 的结果，后面依次是每一层解码器的结果，也就是 1, 2 ... 8 层的结果
         # 推理中，依然是返回全部的结果，但是不会计算 pred_masks，也就是所有的 pred_masks 都是 None，不论 tgt 还是 9 层解码器的结果
+        # 补: predictions_class, predictions_mask, out_boxes 都是 10 层
         out = {
             'pred_logits': predictions_class[-1],
             'pred_masks': predictions_mask[-1],
             'pred_boxes':out_boxes[-1],
+            'pred_logits_iou': predictions_iou[-1],
             'aux_outputs': self._set_aux_loss(
-                predictions_class if self.mask_classification else None, predictions_mask,out_boxes
+                predictions_class if self.mask_classification else None,
+                predictions_mask,
+                predictions_iou,
+                out_boxes
             )
         }
         if self.two_stage:
@@ -642,7 +707,7 @@ class MaskDINODecoder(nn.Module):
         return outputs_class, outputs_mask
 
     @torch.jit.unused
-    def _set_aux_loss(self, outputs_class, outputs_seg_masks, out_boxes=None):
+    def _set_aux_loss(self, outputs_class, outputs_seg_masks, outputs_iou=None, out_boxes=None):
         # this is a workaround to make torchscript happy, as torchscript
         # doesn't support dictionary with non-homogeneous values, such
         # as a dict having both a Tensor and a list.
@@ -653,6 +718,11 @@ class MaskDINODecoder(nn.Module):
                 for a, b in zip(outputs_class[:-1], outputs_seg_masks[:-1])
             ]
         else:
+            if outputs_iou is not None:
+                return [
+                    {'pred_logits': a, 'pred_masks': b, 'pred_logits_iou': c, 'pred_boxes': d}
+                    for a, b, c, d in zip(outputs_class[:-1], outputs_seg_masks[:-1], outputs_iou[:-1], out_boxes[:-1])
+                ]
             return [
                 {"pred_logits": a, "pred_masks": b, "pred_boxes":c}
                 for a, b, c in zip(outputs_class[:-1], outputs_seg_masks[:-1], out_boxes[:-1])
