@@ -145,8 +145,8 @@ class MaskDINODecoder(nn.Module):
         # self.iou_head = MLP(hidden_dim, hidden_dim, 1, 1)
         # self.iou_head_before_norm = nn.LayerNorm(hidden_dim)
 
-        self.iou_head = MLP(hidden_dim + 4, hidden_dim, 1, 1)
-        self.iou_head_before_norm = nn.LayerNorm(hidden_dim + 4)
+        self.iou_head = MLP(hidden_dim, hidden_dim, 1, 1)
+        self.iou_head_before_norm = nn.LayerNorm(hidden_dim)
 
         # self.dice_head = MLP(hidden_dim, hidden_dim, 1, 1)
         # self.dice_head_before_norm = nn.LayerNorm(hidden_dim)

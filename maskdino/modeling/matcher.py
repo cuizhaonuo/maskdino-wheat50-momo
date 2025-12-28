@@ -129,6 +129,8 @@ class HungarianMatcher(nn.Module):
                 cost_giou = torch.tensor(0).to(out_bbox)
 
             out_prob = outputs["pred_logits"][b].sigmoid()  # [num_queries, num_classes]
+            out_iou = outputs['pred_logits_iou'][b].sigmoid()
+            out_prob = out_prob * out_iou
             tgt_ids = targets[b]["labels"]
             # focal loss
             alpha = 0.25

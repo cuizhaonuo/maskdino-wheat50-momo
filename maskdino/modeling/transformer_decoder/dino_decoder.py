@@ -290,7 +290,9 @@ class DeformableTransformerDecoderLayer(nn.Module):
         '''
         # self attention
         attn_output_weights = None
-        if self.self_attn is not None:
+        # self.self_attn = None
+        debug = False
+        if self.self_attn is not None and not debug:
             q = k = self.with_pos_embed(tgt, tgt_query_pos)
             tgt2 = self.self_attn(q, k, tgt, attn_mask=self_attn_mask)[0]
             # (nq, bs, d_model), (bs, nq, nq)
@@ -344,6 +346,12 @@ class DeformableTransformerDecoderLayer(nn.Module):
                                memory_key_padding_mask).transpose(0, 1)
         tgt = tgt + self.dropout1(tgt2)
         tgt = self.norm1(tgt)
+
+        # # self attention
+        # q = k = self.with_pos_embed(tgt, tgt_query_pos)
+        # tgt2 = self.self_attn(q, k, tgt, attn_mask=self_attn_mask)[0]
+        # tgt = tgt + self.dropout2(tgt2)
+        # tgt = self.norm2(tgt)
 
         # ffn
         tgt = self.forward_ffn(tgt)

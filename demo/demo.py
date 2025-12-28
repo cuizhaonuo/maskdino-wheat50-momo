@@ -129,6 +129,7 @@ if __name__ == "__main__":
             if args.output:
                 if os.path.isdir(args.output):
                     assert os.path.isdir(args.output), args.output
+                    # os.makedirs(args.output, exist_ok=True)
                     out_filename = os.path.join(args.output, os.path.basename(path))
                 else:
                     assert len(args.input) == 1, "Please specify a directory with args.output"
