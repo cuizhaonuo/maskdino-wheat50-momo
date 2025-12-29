@@ -698,7 +698,20 @@ class MaskDINODecoder(nn.Module):
     def forward_prediction_heads(self, output, mask_features, pred_mask=True):
         decoder_output = self.decoder_norm(output)
         decoder_output = decoder_output.transpose(0, 1)
-        outputs_class = self.class_embed(decoder_output)
+        outputs_iou = self.iou_head(self.iou_head_before_norm(decoder_output)) # (bs, nq, 1)
+        q = outputs_iou.sigmoid().clamp(0.0, 1.0)  # (B,Q,1)
+        # 关键：detach，避免 cls loss 反向影响 iou_head
+        q = q.detach()
+        # v1
+        # 残差式门控：不会把特征直接打没
+        alpha = iou_gate_alpha = 1.0 # 例如 0.5 或 1.0
+        decoder_output_for_class = decoder_output * (1.0 + alpha * (q - 0.5))
+        # q=0.5 时几乎不变；q>0.5 放大；q<0.5 缩小
+        outputs_class = self.class_embed(decoder_output_for_class) # (bs, nq, num_classes)
+        # v2
+        # decoder_output_for_class = decoder_output * q
+        # outputs_class = self.class_embed(decoder_output_for_class)
+        # outputs_class = self.class_embed(decoder_output) # base
         outputs_mask = None
         if pred_mask:
             mask_embed = self.mask_embed(decoder_output)
