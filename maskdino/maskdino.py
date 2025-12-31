@@ -258,13 +258,13 @@ class MaskDINO(nn.Module):
         # Detectron2 加载的图像通常是 BGR 格式，范围是 [0, 255]
         # cv2.imwrite 也需要 BGR 格式的图像
 
-        # import cv2
-        # import numpy as np
-        # img = images[0].detach().cpu().permute(1, 2, 0).numpy()
-        # img = np.clip(img, 0, 255).astype(np.uint8)
-        # img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-        # save_path = "/public/home/zncui/pycharm_project/MaskDINO/myscripts/transformed_image_v1.jpg"
-        # cv2.imwrite(save_path, img_bgr)
+        import cv2
+        import numpy as np
+        img = images[0].detach().cpu().permute(1, 2, 0).numpy()
+        img = np.clip(img, 0, 255).astype(np.uint8)
+        img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        save_path = "/public/home/zncui/pycharm_project/MaskDINO/myscripts/transformed_image.jpg"
+        cv2.imwrite(save_path, img_bgr)
 
         images = [(x - self.pixel_mean) / self.pixel_std for x in images]
         images = ImageList.from_tensors(images, self.size_divisibility)
@@ -292,6 +292,34 @@ class MaskDINO(nn.Module):
 
             # 预处理时已经 pad 好了，不需要在这里 pad 了，因此不传入 mask，即 mask=None
             outputs,mask_dict = self.sem_seg_head(features, targets=targets)
+
+            # debug: 验证 qq-gating-matrix 是否正确
+            def get_query_query_gating_matrix(pred_boxes, pred_masks, *, soft_mode=False):
+                from torch.nn.functional import grid_sample
+                bs, nq, h, w = pred_masks.shape
+                prob_masks = pred_masks.sigmoid()  # (bs, nq, h, w)
+                center = pred_boxes[..., :2]  # (bs, nq, 2)
+                grid = 2 * center - 1  # [0, 1] --> [-1, 1]
+                grid_rep = grid.reshape(bs, nq, 1, 2).repeat(nq, 1, 1, 1)  # (bs*nq, nq, 1, 2)
+                prob_masks_as_batch = prob_masks.reshape(bs * nq, 1, h, w)  # (bs*nq, 1, h, w)
+                # input: pred_masks: (bs*nq, 1, h, w)
+                # grid: center: (bs*nq, q, 1, 2)
+                sample_mask = grid_sample(prob_masks_as_batch, grid_rep, align_corners=False)  # (bs*nq, 1, nq, 1)
+                g = sample_mask.squeeze(1).squeeze(-1).reshape(bs, nq, nq)
+
+                if soft_mode:
+                    gate = g
+                    eps = 1e-6
+                    bias_qq = torch.log(eps + gate)
+                    return bias_qq
+                bias_qq = (g > 0.5).float()
+                return bias_qq
+            interm_pred_boxes = outputs['interm_outputs']['pred_boxes']
+            interm_pred_masks = outputs['interm_outputs']['pred_masks']
+            qq_gating_matrix = get_query_query_gating_matrix(interm_pred_boxes, interm_pred_masks, soft_mode=False)
+            from maskdino.analysis.tool_lab import checking_qq_gating_matrix
+            checking_qq_gating_matrix(outputs, targets, qq_gating_matrix)
+
 
             # # debug: 可视化每一层 decoder 的结果，观察这些结果所各自预测的对象
             # from maskdino.analysis.tool_lab import vis_decoder_layer_results
