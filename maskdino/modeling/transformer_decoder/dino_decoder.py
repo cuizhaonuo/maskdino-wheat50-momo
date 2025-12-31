@@ -10,6 +10,7 @@ from typing import Optional, List, Union
 import torch
 from torch import nn, Tensor
 from torch.cuda.amp import autocast
+from torch.nn.functional import grid_sample
 
 from ...utils.utils import MLP, _get_clones, _get_activation_fn, gen_sineembed_for_position, inverse_sigmoid
 from ..pixel_decoder.ops.modules import MSDeformAttn
@@ -102,7 +103,7 @@ class TransformerDecoder(nn.Module):
                 level_start_index: Optional[Tensor] = None,  # num_levels
                 spatial_shapes: Optional[Tensor] = None,  # bs, num_levels, 2
                 valid_ratios: Optional[Tensor] = None,
-
+                **kwargs
                 ):
         """
         Input:
@@ -115,6 +116,10 @@ class TransformerDecoder(nn.Module):
         output = tgt
         device = tgt.device
 
+        interm_outputs = kwargs['interm_outputs'] if 'interm_outputs' in kwargs else None
+        interm_pred_masks = interm_outputs['pred_masks'] if (interm_outputs is not None
+                                                             and 'pred_masks' in interm_outputs) else None
+
         intermediate = []
         # refpoints_unsigmoid (reference_points_unsigmoid) --> reference_points
         # 一共 10 组参考点，也就是 10 组预测框，N=9，初始参考点 + 9 次迭代更新参考点
@@ -123,6 +128,37 @@ class TransformerDecoder(nn.Module):
 
         reference_points = refpoints_unsigmoid.sigmoid().to(device)
         ref_points = [reference_points]
+
+        # ============================
+        # initial_pred_boxes = reference_points # (bs, nq, 4)
+        # initial_pred_masks = interm_pred_masks # (bs, nq, h, w)
+        #
+        # def get_query_query_gating_matrix(pred_boxes, pred_masks, *, soft_mode=False):
+        #     bs, nq, h, w = pred_masks.shape
+        #     prob_masks = pred_masks.sigmoid() # (bs, nq, h, w)
+        #     center = pred_boxes[..., :2] # (bs, nq, 2)
+        #     grid = 2 * center - 1 # [0, 1] --> [-1, 1]
+        #     grid_rep = grid.reshape(bs, nq, 1, 2).repeat(nq, 1, 1, 1) # (bs*nq, nq, 1, 2)
+        #     prob_masks_as_batch = prob_masks.reshape(bs * nq, 1, h, w) # (bs*nq, 1, h, w)
+        #     # input: pred_masks: (bs*nq, 1, h, w)
+        #     # grid: center: (bs*nq, q, 1, 2)
+        #     sample_mask = grid_sample(prob_masks_as_batch, grid_rep, align_corners=False) # (bs*nq, 1, nq, 1)
+        #     g = sample_mask.squeeze(1).squeeze(-1).reshape(bs, nq, nq)
+        #
+        #     if soft_mode:
+        #         gate = g
+        #         eps = 1e-6
+        #         bias_qq = torch.log(eps + gate)
+        #         return bias_qq
+        #     bias_qq = (g > 0.5).float()
+        #     return bias_qq
+        #
+        # query_query_gating_matrix = get_query_query_gating_matrix(
+        #     pred_boxes=initial_pred_boxes.transpose(0, 1), # (bs, nq, 4)
+        #     pred_masks=initial_pred_masks, # (bs, nq, h, w)
+        #     soft_mode=False,
+        # ) # (bs, nq, nq)
+        # ============================
 
         attn_output_weights_list = []
         for layer_id, layer in enumerate(self.layers):

@@ -602,7 +602,9 @@ class MaskDINODecoder(nn.Module):
             level_start_index=level_start_index,
             spatial_shapes=spatial_shapes,
             valid_ratios=valid_ratios,
-            tgt_mask=tgt_mask
+            tgt_mask=tgt_mask,
+            # **kwargs
+            interm_outputs=interm_outputs,
         )
         # 为所有 decoder 层的输出，添加预测头，得到每一层的分类和掩码预测，所有的特征层共用一个预测头，也就是说参数是共享的
         # PS：类别和掩码预测头的参数也是共享的，但是预测框的参数不共享
