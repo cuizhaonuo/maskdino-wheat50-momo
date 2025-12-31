@@ -3371,7 +3371,35 @@ def vis_decoder_layer_results(outputs, batched_inputs, stacked_attn_output_weigh
     plt.savefig(save_path, dpi=200)
     plt.close()
 
+def checking_qq_gating_matrix(outputs, targets, qq_gating_matrix):
+    import cv2
+    import random
+    def get_detach_cpu_numpy(tensor):
+        return tensor.detach().cpu().numpy()
+    bid = 0
+    pred_boxes = get_detach_cpu_numpy(outputs['pred_boxes'][bid])
+    pred_masks = get_detach_cpu_numpy(outputs['pred_masks'][bid])
+    tgt_boxes = get_detach_cpu_numpy(targets[bid]['boxes'])
+    tgt_masks = get_detach_cpu_numpy(targets[bid]['masks'])
 
+    img_path = '/public/home/zncui/pycharm_project/MaskDINO/myscripts/transformed_image.jpg'
+    img = cv2.imread(img_path)
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    H, W = img_rgb.shape[:2]
+
+    def get_random_rgb(min_val=100):
+        return [random.randint(min_val, 255) for _ in range(3)]
+
+    # 将 Mask 绘制到图像上
+    for i, mask in enumerate(pred_masks):
+        rgb_value = get_random_rgb()
+        binary_mask = (mask > 0.5).astype('uint8')  # 二值化
+        colored_mask = np.zeros(img_rgb.shape, dtype=np.uint8)
+        colored_mask[binary_mask == 1] = rgb_value
+        img_rgb = cv2.addWeighted(img_rgb, 0.5, colored_mask, 0.5, 0)
+    save_path = '/public/home/zncui/pycharm_project/MaskDINO/myscripts/pred_masks_overlay.jpg'
+    cv2.imwrite(save_path, cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR))
+    print(1)
 
 
 
