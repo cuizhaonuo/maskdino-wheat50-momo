@@ -1,5 +1,8 @@
+from typing import Any
+
 import pandas as pd
 import torch
+from numpy import dtype, ndarray
 from sympy.abc import alpha
 from torch.nn.functional import threshold
 
@@ -3400,72 +3403,64 @@ def checking_qq_gating_matrix(outputs, targets, qq_gating_matrix):
     pred_masks = get_detach_cpu_numpy(pred_masks[bid])
     tgt_boxes = get_detach_cpu_numpy(targets[bid]['boxes'])
     tgt_masks = get_detach_cpu_numpy(targets[bid]['masks'])
-    qq_gating_matrix = get_detach_cpu_numpy(qq_gating_matrix[bid])
+    qq_gating_matrix = get_detach_cpu_numpy(qq_gating_matrix[bid]).astype(np.int32)
 
-    def get_random_rgb(min_val=100):
+    def get_random_rgb(min_val=100, seed=None):
+        if seed is not None:
+            random.seed(seed)
         return np.array([random.randint(min_val, 255) for _ in range(3)])
 
-    def compute_mask_iou(src_masks, gt_masks):
-        src_masks = (src_masks > 0).astype(np.uint8)
-        src_len = src_masks.shape[0]
-        gt_len = gt_masks.shape[0]
-        src_masks = src_masks.reshape(src_len, -1).astype(np.uint8)
-        gt_masks = gt_masks.reshape(gt_len, -1).astype(np.uint8)
-        mask_inter = src_masks @ gt_masks.T
-        area_src = src_masks.sum(axis=1, keepdims=True)
-        area_gt = gt_masks.sum(axis=1, keepdims=True)
-        mask_union = area_src + area_gt.T - mask_inter
-        iou = mask_inter.astype(np.float32) / (mask_union.astype(np.float32) + 1e-6)
-        return iou  # (src_len, gt_len)
-
-    mask_iou = compute_mask_iou(pred_masks, tgt_masks)  # (num_pred, num_tgt)
-    mask_iou_t = mask_iou.T # (num_tgt, num_pred)
-    tgt_id = 21
-    # query_id = np.where(mask_iou_t[tgt_id, :] > 0.3)[0]
-    query_iou = np.max(mask_iou_t, axis=-1)[tgt_id]
-    query_id = np.argmax(mask_iou_t, axis=-1)[tgt_id]
-    print('query_iou: ', query_iou)
-    print('query_id: ', query_id)
-    qq_ids = np.where(qq_gating_matrix[query_id] == 1)[0]
-
-    rows = 1
-    cols = 3
-    fig, axes = plt.subplots()
-
-    # 将 tgt_id mask 绘制到图像上
-    tgt_ids = [21]
-    for tgt_id in tgt_ids:
-        rgb_value = (255, 0, 0)
-        tgt_mask = tgt_masks[tgt_id].astype(np.bool)
-        img_rgb[tgt_mask] = 0.25 * img_rgb[tgt_mask] + 0.75 * np.array(rgb_value).astype(np.float32)
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
 
     # 将 Mask 绘制到图像上
     alpha = 0.8
-    img_rgb = img_rgb.copy().astype(np.float32)
+    img_rgb0 = img_rgb.copy().astype(np.float32)
     for i, mask in enumerate(pred_masks):
-        # if i not in set(np.append(qq_ids, query_id)):
-        #     continue
-        rgb_value = get_random_rgb().astype(np.float32)
-        binary_mask = (mask > 0.5)
+        rgb_value = get_random_rgb(seed=i).astype(np.float32)
+        binary_mask = (mask > 0)
         if not binary_mask.any():
             continue
-        if i == query_id:
-            rgb_value = np.array([0, 255, 0]).astype(np.float32)
-            alpha = 0.5
-            img_rgb[binary_mask] = (1 - alpha) * img_rgb[binary_mask] + alpha * rgb_value
-        # img_rgb[binary_mask] = (1 - alpha) * img_rgb[binary_mask] + alpha * rgb_value
-        bbox = pred_boxes[i]
-        cx, cy, w, h = bbox
+        img_rgb0[binary_mask] = (1 - alpha) * img_rgb0[binary_mask] + alpha * rgb_value
+        box = pred_boxes[i]
+        cx, cy, w, h = box
         x1 = int((cx - w / 2.0) * W)
         y1 = int((cy - h / 2.0) * H)
         x2 = int((cx + w / 2.0) * W)
         y2 = int((cy + h / 2.0) * H)
-        cv2.rectangle(img_rgb, (x1, y1), (x2, y2), rgb_value.astype(np.uint8).tolist(), 2)
+        cv2.rectangle(img_rgb0, (x1, y1), (x2, y2), rgb_value.astype(np.uint8).tolist(), 2)
+    axes[0].imshow(img_rgb0.astype(np.uint8))
 
+    img_rgb1 = img_rgb.copy()
+    for i, box in enumerate(pred_boxes):
+        rgb_value = get_random_rgb(seed=i)
+        cx, cy, w, h = box
+        center_x, center_y = int(cx * W), int(cy * H)
+        cv2.circle(img_rgb1, (center_x, center_y), 5, rgb_value.astype(np.uint8).tolist(), -1)
+    axes[1].imshow(img_rgb1.astype(np.uint8))
 
+    img_rgb2 = img_rgb.copy()
+    random.seed(2026)
+    selected_query_ids = random.sample(range(pred_boxes.shape[0]), k=20)
+    for query_id in selected_query_ids:
+        rgb_value = get_random_rgb(seed=query_id)
+        mask = (pred_masks[query_id] > 0)
+        if not mask.any():
+            continue
+        img_rgb2[mask] = (1 - alpha) * img_rgb2[mask] + alpha * rgb_value
+        queries = np.where(qq_gating_matrix[query_id] == 1)[0]
+        for qid in queries:
+            box = pred_boxes[qid]
+            cx, cy, w, h = box
+            center_x, center_y = int(cx * W), int(cy * H)
+            cv2.circle(img_rgb2, (center_x, center_y), 5, [255, 0, 0], -1)
+    axes[2].imshow(img_rgb2.astype(np.uint8))
 
-    save_path = '/public/home/zncui/pycharm_project/MaskDINO/myscripts/pred_masks_overlay.jpg'
-    cv2.imwrite(save_path, cv2.cvtColor(img_rgb.astype(np.uint8), cv2.COLOR_RGB2BGR))
+    plt.tight_layout()  # 关键：让三个子图不挤
+
+    # ✅ 保存 figure（最推荐：一张图里三个子图）
+    save_fig_path = '/public/home/zncui/pycharm_project/MaskDINO/myscripts/pred_masks_overlay_3cols.png'
+    fig.savefig(save_fig_path, dpi=200)
+    plt.close(fig)
 
     print(1)
 
