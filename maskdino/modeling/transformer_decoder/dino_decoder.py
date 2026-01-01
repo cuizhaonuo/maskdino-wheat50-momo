@@ -6,11 +6,15 @@
 # Modified from DINO https://github.com/IDEA-Research/DINO by Feng Li and Hao Zhang.
 # ------------------------------------------------------------------------
 
-from typing import Optional, List, Union
-import torch
+from typing import Optional, List, Union, Tuple
 from torch import nn, Tensor
 from torch.cuda.amp import autocast
 from torch.nn.functional import grid_sample
+
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 from ...utils.utils import MLP, _get_clones, _get_activation_fn, gen_sineembed_for_position, inverse_sigmoid
 from ..pixel_decoder.ops.modules import MSDeformAttn
@@ -113,12 +117,14 @@ class TransformerDecoder(nn.Module):
             - refpoints_unsigmoid: nq, bs, 2/4
             - valid_ratios/spatial_shapes: bs, nlevel, 2
         """
-        output = tgt
+        output = tgt # (nq, bs, d_model)
         device = tgt.device
 
         interm_outputs = kwargs['interm_outputs'] if 'interm_outputs' in kwargs else None
         interm_pred_masks = interm_outputs['pred_masks'] if (interm_outputs is not None
                                                              and 'pred_masks' in interm_outputs) else None
+        maskdino_decoder = kwargs['maskdino_decoder'] if 'maskdino_decoder' in kwargs else None
+        mask_features = kwargs['mask_features'] if 'mask_features' in kwargs else None
 
         intermediate = []
         # refpoints_unsigmoid (reference_points_unsigmoid) --> reference_points
@@ -130,34 +136,34 @@ class TransformerDecoder(nn.Module):
         ref_points = [reference_points]
 
         # ============================
-        # initial_pred_boxes = reference_points # (bs, nq, 4)
-        # initial_pred_masks = interm_pred_masks # (bs, nq, h, w)
-        #
-        # def get_query_query_gating_matrix(pred_boxes, pred_masks, *, soft_mode=False):
-        #     bs, nq, h, w = pred_masks.shape
-        #     prob_masks = pred_masks.sigmoid() # (bs, nq, h, w)
-        #     center = pred_boxes[..., :2] # (bs, nq, 2)
-        #     grid = 2 * center - 1 # [0, 1] --> [-1, 1]
-        #     grid_rep = grid.reshape(bs, nq, 1, 2).repeat(nq, 1, 1, 1) # (bs*nq, nq, 1, 2)
-        #     prob_masks_as_batch = prob_masks.reshape(bs * nq, 1, h, w) # (bs*nq, 1, h, w)
-        #     # input: pred_masks: (bs*nq, 1, h, w)
-        #     # grid: center: (bs*nq, q, 1, 2)
-        #     sample_mask = grid_sample(prob_masks_as_batch, grid_rep, align_corners=False) # (bs*nq, 1, nq, 1)
-        #     g = sample_mask.squeeze(1).squeeze(-1).reshape(bs, nq, nq)
-        #
-        #     if soft_mode:
-        #         gate = g
-        #         eps = 1e-6
-        #         bias_qq = torch.log(eps + gate)
-        #         return bias_qq
-        #     bias_qq = (g > 0.5).float()
-        #     return bias_qq
-        #
-        # query_query_gating_matrix = get_query_query_gating_matrix(
-        #     pred_boxes=initial_pred_boxes.transpose(0, 1), # (bs, nq, 4)
-        #     pred_masks=initial_pred_masks, # (bs, nq, h, w)
-        #     soft_mode=False,
-        # ) # (bs, nq, nq)
+        initial_pred_boxes = reference_points.transpose(0, 1) # (bs, nq, 4)
+        initial_pred_masks = interm_pred_masks # (bs, nq, h, w)
+
+        def get_query_query_gating_matrix(pred_boxes, pred_masks, *, soft_mode=False):
+            bs, nq, h, w = pred_masks.shape
+            prob_masks = pred_masks.sigmoid() # (bs, nq, h, w)
+            center = pred_boxes[..., :2] # (bs, nq, 2)
+            grid = 2 * center - 1 # [0, 1] --> [-1, 1]
+            grid_rep = grid.reshape(bs, nq, 1, 2).repeat(nq, 1, 1, 1) # (bs*nq, nq, 1, 2)
+            prob_masks_as_batch = prob_masks.reshape(bs * nq, 1, h, w) # (bs*nq, 1, h, w)
+            # input: pred_masks: (bs*nq, 1, h, w)
+            # grid: center: (bs*nq, q, 1, 2)
+            sample_mask = grid_sample(prob_masks_as_batch, grid_rep, align_corners=False) # (bs*nq, 1, nq, 1)
+            g = sample_mask.squeeze(1).squeeze(-1).reshape(bs, nq, nq)
+
+            if soft_mode:
+                gate = g
+                eps = 1e-6
+                bias_qq = torch.log(eps + gate)
+                return bias_qq
+            bias_qq = (g > 0.5).float()
+            return bias_qq
+
+        query_query_gating_matrix = get_query_query_gating_matrix(
+            pred_boxes=initial_pred_boxes, # (bs, nq, 4)
+            pred_masks=initial_pred_masks, # (bs, nq, h, w)
+            soft_mode=False,
+        ) # (bs, nq, nq)
         # ============================
 
         attn_output_weights_list = []
@@ -199,12 +205,17 @@ class TransformerDecoder(nn.Module):
                 memory_pos=pos, # None
 
                 self_attn_mask=tgt_mask,
-                cross_attn_mask=memory_mask # None
+                cross_attn_mask=memory_mask, # None
+                # kwargs
+                query_query_gating_matrix=query_query_gating_matrix
             )
             attn_output_weights_list.append(attn_output_weights)
             # refinement of reference points
             # reference_points (sigmoid) --> reference_before_sigmoid (logit) --> outputs_unsig (logit)--> new_reference_points (sigmoid)
             # iter update
+
+            tmp_pred_boxes = None
+            tmp_pred_masks = None
             if self.bbox_embed is not None:
                 reference_before_sigmoid = inverse_sigmoid(reference_points)
                 delta_unsig = self.bbox_embed[layer_id](output).to(device)
@@ -214,6 +225,11 @@ class TransformerDecoder(nn.Module):
                 reference_points = new_reference_points.detach()
                 # if layer_id != self.num_layers - 1:
                 ref_points.append(new_reference_points)
+                tmp_pred_boxes = new_reference_points.transpose(0, 1) # (bs, nq, 4)
+            tmp_output = self.norm(output)
+            _, tmp_pred_masks = maskdino_decoder.forward_prediction_heads(tmp_output.transpose(0, 1), mask_features, True)
+            tmp_pred_masks = tmp_pred_masks.transpose(0, 1)
+            query_query_gating_matrix = get_query_query_gating_matrix(tmp_pred_boxes, tmp_pred_masks, soft_mode=False)
 
             intermediate.append(self.norm(output))
 
@@ -262,7 +278,8 @@ class DeformableTransformerDecoderLayer(nn.Module):
         self.norm1 = nn.LayerNorm(d_model)
 
         # self attention
-        self.self_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout)
+        # self.self_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout)
+        self.self_attn = CustomMultiheadAttention(d_model, n_heads, dropout=dropout)
         self.dropout2 = nn.Dropout(dropout)
         self.norm2 = nn.LayerNorm(d_model)
 
@@ -311,6 +328,7 @@ class DeformableTransformerDecoderLayer(nn.Module):
                 # sa
                 self_attn_mask: Optional[Tensor] = None,  # mask used for self-attention
                 cross_attn_mask: Optional[Tensor] = None,  # mask used for cross-attention
+                **kwargs
                 ):
         '''
         tgt: nq, bs, d_model
@@ -324,11 +342,19 @@ class DeformableTransformerDecoderLayer(nn.Module):
         query = key = tgt + tgt_query_pos
         value = tgt
         '''
+        query_query_gating_matrix = kwargs.get('query_query_gating_matrix', None) # (bs, nq, nq)
         # self attention
         attn_output_weights = None
         if self.self_attn is not None:
             q = k = self.with_pos_embed(tgt, tgt_query_pos)
-            tgt2 = self.self_attn(q, k, tgt, attn_mask=self_attn_mask)[0]
+            # tgt2 = self.self_attn(q, k, tgt, attn_mask=self_attn_mask)[0]
+            # 以下属于能跑就行，形状正确即可
+            tgt2 = self.self_attn(q.transpose(0, 1),
+                                  k.transpose(0, 1),
+                                  tgt.transpose(0, 1),
+                                  attn_mask=self_attn_mask.transpose(0, 1) if self_attn_mask is not None else None,
+                                  query_query_gating_matrix=query_query_gating_matrix)[0]
+            tgt2 = tgt2.transpose(0, 1)
             # (nq, bs, d_model), (bs, nq, nq)
             # tgt2, attn_output_weights = self.self_attn(q, k, tgt, attn_mask=self_attn_mask, average_attn_weights=True)
 
@@ -386,4 +412,208 @@ class DeformableTransformerDecoderLayer(nn.Module):
 
         return tgt, attn_output_weights
 
+
+
+
+class CustomMultiheadAttention(nn.Module):
+    """
+    A customizable Multi-Head Attention module (batch_first).
+
+    Key customization points:
+      - You can inject extra_bias into attention logits (e.g., gating/decay matrix).
+      - You can override how logits are computed (hook functions).
+      - You can return per-head attention weights.
+
+    Args:
+      d_model: embedding dim C
+      n_heads: number of heads H
+      dropout: dropout on attention probabilities
+      bias: whether to use bias in linear layers
+      batch_first: expects inputs [B, L, C] if True
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        dropout: float = 0.0,
+        bias: bool = True,
+        batch_first: bool = True,
+    ):
+        super().__init__()
+        assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+        self.dropout = dropout
+        self.batch_first = batch_first
+
+        # You can swap these projections with your own (e.g., gated linear).
+        self.q_proj = nn.Linear(d_model, d_model, bias=bias)
+        self.k_proj = nn.Linear(d_model, d_model, bias=bias)
+        self.v_proj = nn.Linear(d_model, d_model, bias=bias)
+        self.out_proj = nn.Linear(d_model, d_model, bias=bias)
+
+        self.attn_drop = nn.Dropout(dropout)
+
+        # Optional: if you want to keep same init style as common practice
+        self._reset_parameters()
+
+    def _reset_parameters(self):
+        # A simple init; you can replace with xavier_uniform_ etc.
+        nn.init.xavier_uniform_(self.q_proj.weight)
+        nn.init.xavier_uniform_(self.k_proj.weight)
+        nn.init.xavier_uniform_(self.v_proj.weight)
+        nn.init.xavier_uniform_(self.out_proj.weight)
+        if self.q_proj.bias is not None:
+            nn.init.zeros_(self.q_proj.bias)
+            nn.init.zeros_(self.k_proj.bias)
+            nn.init.zeros_(self.v_proj.bias)
+            nn.init.zeros_(self.out_proj.bias)
+
+    def _shape(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        [B, L, C] -> [B, H, L, D]
+        """
+        B, L, C = x.shape
+        x = x.view(B, L, self.n_heads, self.head_dim)
+        return x.transpose(1, 2).contiguous()
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor] = None,
+        attn_mask: Optional[torch.Tensor] = None,
+        extra_bias: Optional[torch.Tensor] = None,
+        need_weights: bool = False,
+        average_attn_weights: bool = False,
+        **kwargs
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Inputs:
+          query/key/value: if batch_first=True -> [B, Lq/Lk, C]
+          key_padding_mask: [B, Lk] with True for positions to mask (padding)
+          attn_mask:
+              - [Lq, Lk] or
+              - [B, Lq, Lk] or
+              - [B, H, Lq, Lk]
+            where True means masked OR float mask with -inf for masked positions.
+          extra_bias: custom additive bias to logits, same broadcast rules as attn_mask.
+              Typical: [B, H, Lq, Lk] (e.g., query-query gating/decay)
+          need_weights: return attention weights
+          average_attn_weights: if True, return [B, Lq, Lk]; else [B, H, Lq, Lk]
+
+        Returns:
+          out: [B, Lq, C]
+          attn_weights (optional): [B, H, Lq, Lk] or averaged [B, Lq, Lk]
+        """
+        query_query_gating_matrix = kwargs.get('query_query_gating_matrix', None)
+
+        if not self.batch_first:
+            # If you want, you can extend to [L, B, C], but for DETR-like code batch_first is easier.
+            raise NotImplementedError("This implementation assumes batch_first=True.")
+
+        B, Lq, C = query.shape
+        _, Lk, _ = key.shape
+
+        # 1) Project
+        q = self.q_proj(query)  # [B, Lq, C]
+        k = self.k_proj(key)    # [B, Lk, C]
+        v = self.v_proj(value)  # [B, Lk, C]
+
+        # 2) Split heads
+        q = self._shape(q)  # [B, H, Lq, D]
+        k = self._shape(k)  # [B, H, Lk, D]
+        v = self._shape(v)  # [B, H, Lk, D]
+
+        # 3) Scaled dot-product logits
+        # logits: [B, H, Lq, Lk]
+        scale = 1.0 / math.sqrt(self.head_dim)
+        logits = torch.matmul(q, k.transpose(-2, -1)) * scale
+
+        # 4) Apply masks / bias (all are additive on logits)
+        # key_padding_mask: True means mask out => add -inf
+        if key_padding_mask is not None:
+            # [B, 1, 1, Lk]
+            mask = key_padding_mask[:, None, None, :].to(torch.bool)
+            logits = logits.masked_fill(mask, float("-inf"))
+
+        if attn_mask is not None:
+            logits = self._apply_attn_mask(logits, attn_mask)
+
+        if extra_bias is not None:
+            logits = logits + self._broadcast_bias(extra_bias, B, Lq, Lk)
+
+        if query_query_gating_matrix is not None:
+            # query_query_gating_matrix: [B, Lq, Lk]
+            gating_matrix = query_query_gating_matrix.unsqueeze(1)  # [B, 1, Lq, Lk]
+            logits = logits * gating_matrix
+
+        # 5) Softmax -> probs
+        attn = F.softmax(logits, dim=-1)
+        attn = self.attn_drop(attn)
+
+        # 6) Weighted sum
+        out = torch.matmul(attn, v)  # [B, H, Lq, D]
+
+        # 7) Merge heads
+        out = out.transpose(1, 2).contiguous().view(B, Lq, C)  # [B, Lq, C]
+        out = self.out_proj(out)
+
+        if need_weights:
+            if average_attn_weights:
+                return out, attn.mean(dim=1)  # [B, Lq, Lk]
+            return out, attn  # [B, H, Lq, Lk]
+        return out, None
+
+    @staticmethod
+    def _apply_attn_mask(logits: torch.Tensor, attn_mask: torch.Tensor) -> torch.Tensor:
+        """
+        logits: [B, H, Lq, Lk]
+        attn_mask can be:
+          - bool mask (True masked)
+          - float mask (additive, e.g., 0 or -inf)
+          shapes: [Lq, Lk] or [B, Lq, Lk] or [B, H, Lq, Lk]
+        """
+        if attn_mask.dtype == torch.bool:
+            m = attn_mask
+            if m.dim() == 2:
+                m = m[None, None, :, :]
+            elif m.dim() == 3:
+                m = m[:, None, :, :]
+            elif m.dim() == 4:
+                pass
+            else:
+                raise ValueError(f"attn_mask dim {m.dim()} not supported")
+            return logits.masked_fill(m, float("-inf"))
+        else:
+            # additive float mask
+            if attn_mask.dim() == 2:
+                m = attn_mask[None, None, :, :]
+            elif attn_mask.dim() == 3:
+                m = attn_mask[:, None, :, :]
+            elif attn_mask.dim() == 4:
+                m = attn_mask
+            else:
+                raise ValueError(f"attn_mask dim {attn_mask.dim()} not supported")
+            return logits + m
+
+    @staticmethod
+    def _broadcast_bias(bias: torch.Tensor, B: int, Lq: int, Lk: int) -> torch.Tensor:
+        """
+        Make extra_bias broadcastable to [B, H, Lq, Lk].
+        Commonly you will pass [B, H, Lq, Lk] directly.
+        """
+        if bias.dim() == 2:
+            # [Lq, Lk]
+            return bias[None, None, :, :]
+        if bias.dim() == 3:
+            # [B, Lq, Lk]
+            return bias[:, None, :, :]
+        if bias.dim() == 4:
+            # [B, H, Lq, Lk]
+            return bias
+        raise ValueError(f"extra_bias dim {bias.dim()} not supported")
 

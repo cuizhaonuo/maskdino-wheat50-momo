@@ -258,13 +258,13 @@ class MaskDINO(nn.Module):
         # Detectron2 加载的图像通常是 BGR 格式，范围是 [0, 255]
         # cv2.imwrite 也需要 BGR 格式的图像
 
-        import cv2
-        import numpy as np
-        img = images[0].detach().cpu().permute(1, 2, 0).numpy()
-        img = np.clip(img, 0, 255).astype(np.uint8)
-        img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-        save_path = "/public/home/zncui/pycharm_project/MaskDINO/myscripts/transformed_image.jpg"
-        cv2.imwrite(save_path, img_bgr)
+        # import cv2
+        # import numpy as np
+        # img = images[0].detach().cpu().permute(1, 2, 0).numpy()
+        # img = np.clip(img, 0, 255).astype(np.uint8)
+        # img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        # save_path = "/public/home/zncui/pycharm_project/MaskDINO/myscripts/transformed_image.jpg"
+        # cv2.imwrite(save_path, img_bgr)
 
         images = [(x - self.pixel_mean) / self.pixel_std for x in images]
         images = ImageList.from_tensors(images, self.size_divisibility)
@@ -314,11 +314,12 @@ class MaskDINO(nn.Module):
                     return bias_qq
                 bias_qq = (g > 0.5).float()
                 return bias_qq
-            interm_pred_boxes = outputs['interm_outputs']['pred_boxes']
-            interm_pred_masks = outputs['interm_outputs']['pred_masks']
-            qq_gating_matrix = get_query_query_gating_matrix(interm_pred_boxes, interm_pred_masks, soft_mode=False)
-            from maskdino.analysis.tool_lab import checking_qq_gating_matrix
-            checking_qq_gating_matrix(outputs, targets, qq_gating_matrix)
+            # debug
+            # interm_pred_boxes = outputs['interm_outputs']['pred_boxes']
+            # interm_pred_masks = outputs['interm_outputs']['pred_masks']
+            # qq_gating_matrix = get_query_query_gating_matrix(interm_pred_boxes, interm_pred_masks, soft_mode=False)
+            # from maskdino.analysis.tool_lab import checking_qq_gating_matrix
+            # checking_qq_gating_matrix(outputs, targets, qq_gating_matrix)
 
 
             # # debug: 可视化每一层 decoder 的结果，观察这些结果所各自预测的对象
