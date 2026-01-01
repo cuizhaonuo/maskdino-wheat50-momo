@@ -1,5 +1,7 @@
 import pandas as pd
 import torch
+from sympy.abc import alpha
+from torch.nn.functional import threshold
 
 from maskdino.utils import box_ops
 
@@ -3374,31 +3376,97 @@ def vis_decoder_layer_results(outputs, batched_inputs, stacked_attn_output_weigh
 def checking_qq_gating_matrix(outputs, targets, qq_gating_matrix):
     import cv2
     import random
-    def get_detach_cpu_numpy(tensor):
-        return tensor.detach().cpu().numpy()
-    bid = 0
-    pred_boxes = get_detach_cpu_numpy(outputs['pred_boxes'][bid])
-    pred_masks = get_detach_cpu_numpy(outputs['pred_masks'][bid])
-    tgt_boxes = get_detach_cpu_numpy(targets[bid]['boxes'])
-    tgt_masks = get_detach_cpu_numpy(targets[bid]['masks'])
+    from torch.nn import functional as F
+    from matplotlib import pyplot as plt
+    import numpy as np
 
     img_path = '/public/home/zncui/pycharm_project/MaskDINO/myscripts/transformed_image.jpg'
     img = cv2.imread(img_path)
     img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     H, W = img_rgb.shape[:2]
 
+    def get_detach_cpu_numpy(tensor):
+        return tensor.detach().cpu().numpy()
+
+    bid = 0
+    pred_boxes = get_detach_cpu_numpy(outputs['pred_boxes'][bid])
+    pred_masks = outputs['pred_masks']
+    pred_masks = F.interpolate(
+        pred_masks,
+        size=(H, W),
+        mode="bilinear",
+        align_corners=False,
+    )
+    pred_masks = get_detach_cpu_numpy(pred_masks[bid])
+    tgt_boxes = get_detach_cpu_numpy(targets[bid]['boxes'])
+    tgt_masks = get_detach_cpu_numpy(targets[bid]['masks'])
+    qq_gating_matrix = get_detach_cpu_numpy(qq_gating_matrix[bid])
+
     def get_random_rgb(min_val=100):
-        return [random.randint(min_val, 255) for _ in range(3)]
+        return np.array([random.randint(min_val, 255) for _ in range(3)])
+
+    def compute_mask_iou(src_masks, gt_masks):
+        src_masks = (src_masks > 0).astype(np.uint8)
+        src_len = src_masks.shape[0]
+        gt_len = gt_masks.shape[0]
+        src_masks = src_masks.reshape(src_len, -1).astype(np.uint8)
+        gt_masks = gt_masks.reshape(gt_len, -1).astype(np.uint8)
+        mask_inter = src_masks @ gt_masks.T
+        area_src = src_masks.sum(axis=1, keepdims=True)
+        area_gt = gt_masks.sum(axis=1, keepdims=True)
+        mask_union = area_src + area_gt.T - mask_inter
+        iou = mask_inter.astype(np.float32) / (mask_union.astype(np.float32) + 1e-6)
+        return iou  # (src_len, gt_len)
+
+    mask_iou = compute_mask_iou(pred_masks, tgt_masks)  # (num_pred, num_tgt)
+    mask_iou_t = mask_iou.T # (num_tgt, num_pred)
+    tgt_id = 21
+    # query_id = np.where(mask_iou_t[tgt_id, :] > 0.3)[0]
+    query_iou = np.max(mask_iou_t, axis=-1)[tgt_id]
+    query_id = np.argmax(mask_iou_t, axis=-1)[tgt_id]
+    print('query_iou: ', query_iou)
+    print('query_id: ', query_id)
+    qq_ids = np.where(qq_gating_matrix[query_id] == 1)[0]
+
+    rows = 1
+    cols = 3
+    fig, axes = plt.subplots()
+
+    # 将 tgt_id mask 绘制到图像上
+    tgt_ids = [21]
+    for tgt_id in tgt_ids:
+        rgb_value = (255, 0, 0)
+        tgt_mask = tgt_masks[tgt_id].astype(np.bool)
+        img_rgb[tgt_mask] = 0.25 * img_rgb[tgt_mask] + 0.75 * np.array(rgb_value).astype(np.float32)
 
     # 将 Mask 绘制到图像上
+    alpha = 0.8
+    img_rgb = img_rgb.copy().astype(np.float32)
     for i, mask in enumerate(pred_masks):
-        rgb_value = get_random_rgb()
-        binary_mask = (mask > 0.5).astype('uint8')  # 二值化
-        colored_mask = np.zeros(img_rgb.shape, dtype=np.uint8)
-        colored_mask[binary_mask == 1] = rgb_value
-        img_rgb = cv2.addWeighted(img_rgb, 0.5, colored_mask, 0.5, 0)
+        # if i not in set(np.append(qq_ids, query_id)):
+        #     continue
+        rgb_value = get_random_rgb().astype(np.float32)
+        binary_mask = (mask > 0.5)
+        if not binary_mask.any():
+            continue
+        if i == query_id:
+            rgb_value = np.array([0, 255, 0]).astype(np.float32)
+            alpha = 0.5
+            img_rgb[binary_mask] = (1 - alpha) * img_rgb[binary_mask] + alpha * rgb_value
+        # img_rgb[binary_mask] = (1 - alpha) * img_rgb[binary_mask] + alpha * rgb_value
+        bbox = pred_boxes[i]
+        cx, cy, w, h = bbox
+        x1 = int((cx - w / 2.0) * W)
+        y1 = int((cy - h / 2.0) * H)
+        x2 = int((cx + w / 2.0) * W)
+        y2 = int((cy + h / 2.0) * H)
+        cv2.rectangle(img_rgb, (x1, y1), (x2, y2), rgb_value.astype(np.uint8).tolist(), 2)
+
+
+
     save_path = '/public/home/zncui/pycharm_project/MaskDINO/myscripts/pred_masks_overlay.jpg'
-    cv2.imwrite(save_path, cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR))
+    cv2.imwrite(save_path, cv2.cvtColor(img_rgb.astype(np.uint8), cv2.COLOR_RGB2BGR))
+
     print(1)
 
 
