@@ -17,6 +17,7 @@ import warnings
 import cv2
 import numpy as np
 import tqdm
+from pathlib import Path
 
 from detectron2.config import get_cfg
 from detectron2.data.detection_utils import read_image
@@ -127,7 +128,9 @@ if __name__ == "__main__":
             )
 
             if args.output:
+
                 if os.path.isdir(args.output):
+                    os.makedirs(args.output, exist_ok=True)
                     assert os.path.isdir(args.output), args.output
                     out_filename = os.path.join(args.output, os.path.basename(path))
                 else:

@@ -207,7 +207,7 @@ class TransformerDecoder(nn.Module):
                 self_attn_mask=tgt_mask,
                 cross_attn_mask=memory_mask, # None
                 # kwargs
-                query_query_gating_matrix=query_query_gating_matrix
+                query_query_gating_matrix=query_query_gating_matrix if layer_id >= len(self.layers) - 3 else None,
             )
             attn_output_weights_list.append(attn_output_weights)
             # refinement of reference points
@@ -278,6 +278,7 @@ class DeformableTransformerDecoderLayer(nn.Module):
         self.norm1 = nn.LayerNorm(d_model)
 
         # self attention
+        self.n_heads = n_heads
         # self.self_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout)
         self.self_attn = CustomMultiheadAttention(d_model, n_heads, dropout=dropout)
         self.dropout2 = nn.Dropout(dropout)
@@ -347,14 +348,21 @@ class DeformableTransformerDecoderLayer(nn.Module):
         attn_output_weights = None
         if self.self_attn is not None:
             q = k = self.with_pos_embed(tgt, tgt_query_pos)
+            # 将 Matrix 转换为 bool 类型
+            # if query_query_gating_matrix is not None:
+            #     self_attn_mask = (query_query_gating_matrix == 0.0) # (bs, nq, nq)
+            #     self_attn_mask = self_attn_mask.repeat(self.n_heads, 1, 1) # (bs*nhead, nq, nq)
             # tgt2 = self.self_attn(q, k, tgt, attn_mask=self_attn_mask)[0]
+            # ============================
             # 以下属于能跑就行，形状正确即可
             tgt2 = self.self_attn(q.transpose(0, 1),
                                   k.transpose(0, 1),
                                   tgt.transpose(0, 1),
                                   attn_mask=self_attn_mask.transpose(0, 1) if self_attn_mask is not None else None,
-                                  query_query_gating_matrix=query_query_gating_matrix)[0]
+                                  query_query_gating_matrix=query_query_gating_matrix
+                                  )[0]
             tgt2 = tgt2.transpose(0, 1)
+            # ============================
             # (nq, bs, d_model), (bs, nq, nq)
             # tgt2, attn_output_weights = self.self_attn(q, k, tgt, attn_mask=self_attn_mask, average_attn_weights=True)
 
