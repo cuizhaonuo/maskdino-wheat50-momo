@@ -464,6 +464,9 @@ class CustomMultiheadAttention(nn.Module):
 
         self.attn_drop = nn.Dropout(dropout)
 
+        # 增加 beta 可学习参数
+        self.beta = nn.Parameter(torch.zeros(n_heads))  # shape: (n_heads, 1, 1)
+
         # Optional: if you want to keep same init style as common practice
         self._reset_parameters()
 
@@ -557,7 +560,9 @@ class CustomMultiheadAttention(nn.Module):
         if query_query_gating_matrix is not None:
             # query_query_gating_matrix: [B, Lq, Lk]
             gating_matrix = query_query_gating_matrix.unsqueeze(1)  # [B, 1, Lq, Lk]
-            logits = logits * gating_matrix
+            # logits = logits * gating_matrix # hard gating
+            logits = logits + self.beta[None, :, None, None] * gating_matrix # soft gating
+            # logits = logits + gating_matrix # soft gating
 
         # 5) Softmax -> probs
         attn = F.softmax(logits, dim=-1)
