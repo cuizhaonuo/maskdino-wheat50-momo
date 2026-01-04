@@ -191,6 +191,9 @@ class TransformerDecoder(nn.Module):
             # memory_pos, cross_attn_mask 此处均为 None
             # ---
             # (300, 1, 256) --> (300, 1, 256)
+            from maskdino.ctx import current_iter_ctx
+            current_iter = current_iter_ctx.get()
+
             output, attn_output_weights = layer(
                 tgt=output,
                 tgt_query_pos=query_pos,
@@ -279,8 +282,23 @@ class DeformableTransformerDecoderLayer(nn.Module):
 
         # self attention
         self.n_heads = n_heads
-        # self.self_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout)
-        self.self_attn = CustomMultiheadAttention(d_model, n_heads, dropout=dropout)
+        self.self_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout)
+        self.cus_self_attn = CustomMultiheadAttention(d_model, n_heads, dropout=dropout)
+        self.cus_self_attn.load_from_torch_mha(self.self_attn)
+
+        # with torch.no_grad():
+        #     B, L, C = 2, 100, d_model
+        #     x = torch.randn(B, L, C, device=next(self.parameters()).device)
+        #
+        #     old = nn.MultiheadAttention(C, n_heads, dropout=dropout, batch_first=True).to(x.device)
+        #     new = CustomMultiheadAttention(C, n_heads, dropout=dropout, batch_first=True).to(x.device)
+        #     new.load_from_torch_mha(old)
+        #
+        #     y_old, _ = old(x, x, x, need_weights=False)
+        #     y_new, _ = new(x, x, x, need_weights=False)
+        #
+        #     print((y_old - y_new).abs().max().item())
+
         self.dropout2 = nn.Dropout(dropout)
         self.norm2 = nn.LayerNorm(d_model)
 
@@ -355,10 +373,10 @@ class DeformableTransformerDecoderLayer(nn.Module):
             # tgt2 = self.self_attn(q, k, tgt, attn_mask=self_attn_mask)[0]
             # ============================
             # 以下属于能跑就行，形状正确即可
-            tgt2 = self.self_attn(q.transpose(0, 1),
+            tgt2 = self.cus_self_attn(q.transpose(0, 1),
                                   k.transpose(0, 1),
                                   tgt.transpose(0, 1),
-                                  attn_mask=self_attn_mask.transpose(0, 1) if self_attn_mask is not None else None,
+                                  attn_mask=self_attn_mask,
                                   query_query_gating_matrix=query_query_gating_matrix
                                   )[0]
             tgt2 = tgt2.transpose(0, 1)
@@ -490,6 +508,45 @@ class CustomMultiheadAttention(nn.Module):
         x = x.view(B, L, self.n_heads, self.head_dim)
         return x.transpose(1, 2).contiguous()
 
+    @torch.no_grad()
+    def load_from_torch_mha(self, mha: nn.MultiheadAttention):
+        """
+        将 nn.MultiheadAttention 的权重拷贝到 CustomMultiheadAttention
+        要求: mha.embed_dim == self.d_model 且 mha.num_heads == self.n_heads
+        """
+        assert mha.embed_dim == self.d_model
+        assert mha.num_heads == self.n_heads
+
+        d = self.d_model
+
+        # 1) 拆 in_proj_weight: [3d, d] -> q/k/v: [d, d]
+        W = mha.in_proj_weight
+        self.q_proj.weight.copy_(W[0:d, :])
+        self.k_proj.weight.copy_(W[d:2 * d, :])
+        self.v_proj.weight.copy_(W[2 * d:3 * d, :])
+
+        # 2) 拆 in_proj_bias: [3d] -> [d]
+        if mha.in_proj_bias is not None:
+            b = mha.in_proj_bias
+            self.q_proj.bias.copy_(b[0:d])
+            self.k_proj.bias.copy_(b[d:2 * d])
+            self.v_proj.bias.copy_(b[2 * d:3 * d])
+        else:
+            # 你的 q/k/v 可能有 bias=True，这时建议置零，避免随机 bias 影响
+            if self.q_proj.bias is not None:
+                self.q_proj.bias.zero_()
+                self.k_proj.bias.zero_()
+                self.v_proj.bias.zero_()
+
+        # 3) out_proj 直接拷贝
+        self.out_proj.weight.copy_(mha.out_proj.weight)
+        if mha.out_proj.bias is not None and self.out_proj.bias is not None:
+            self.out_proj.bias.copy_(mha.out_proj.bias)
+
+        # 4) 新增参数 beta：保持 0（等价于“不影响原模型”）
+        if hasattr(self, "beta") and self.beta is not None:
+            self.beta.zero_()
+
     def forward(
         self,
         query: torch.Tensor,
@@ -561,8 +618,8 @@ class CustomMultiheadAttention(nn.Module):
             # query_query_gating_matrix: [B, Lq, Lk]
             gating_matrix = query_query_gating_matrix.unsqueeze(1)  # [B, 1, Lq, Lk]
             # logits = logits * gating_matrix # hard gating
-            logits = logits + self.beta[None, :, None, None] * gating_matrix # soft gating
-            # logits = logits + gating_matrix # soft gating
+            # logits = logits + self.beta[None, :, None, None] * gating_matrix # soft gating
+            logits = logits + gating_matrix # soft gating
 
         # 5) Softmax -> probs
         attn = F.softmax(logits, dim=-1)
