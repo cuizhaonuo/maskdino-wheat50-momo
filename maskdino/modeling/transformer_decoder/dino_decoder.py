@@ -207,7 +207,7 @@ class TransformerDecoder(nn.Module):
                 self_attn_mask=tgt_mask,
                 cross_attn_mask=memory_mask, # None
                 # kwargs
-                query_query_gating_matrix=query_query_gating_matrix if layer_id >= len(self.layers) - 3 else None,
+                query_query_gating_matrix=query_query_gating_matrix,
             )
             attn_output_weights_list.append(attn_output_weights)
             # refinement of reference points
