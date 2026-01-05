@@ -22,7 +22,7 @@ from detectron2.projects.point_rend.point_features import (
 
 from ..utils.misc import is_dist_avail_and_initialized, nested_tensor_from_tensor_list
 from maskdino.utils import box_ops
-
+from maskdino.utils.box_ops import box_iou, box_cxcywh_to_xyxy
 
 def sigmoid_focal_loss(inputs, targets, num_boxes, alpha: float = 0.25, gamma: float = 2):
     """
@@ -178,7 +178,7 @@ class SetCriterion(nn.Module):
         losses = {"loss_ce": loss_ce}
         return losses
 
-    def loss_labels(self, outputs, targets, indices, num_boxes, log=True):
+    def _loss_labels(self, outputs, targets, indices, num_boxes, log=True):
         """Classification loss (Binary focal loss)
         targets dicts must contain the key "labels" containing a tensor of dim [nb_target_boxes]
         """
@@ -198,6 +198,59 @@ class SetCriterion(nn.Module):
         target_classes_onehot = target_classes_onehot[:,:,:-1]
         loss_ce = sigmoid_focal_loss(src_logits, target_classes_onehot, num_boxes, alpha=self.focal_alpha, gamma=2) * src_logits.shape[1]
         losses = {'loss_ce': loss_ce}
+
+        return losses
+
+    def loss_labels(self, outputs, targets, indices, num_boxes, **kwargs):
+        assert "pred_logits" in outputs
+        src_logits = outputs["pred_logits"].float()
+
+        idx = self._get_src_permutation_idx(indices)
+        target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
+        target_classes = torch.full(
+            src_logits.shape[:2],
+            self.num_classes,
+            dtype=torch.int64,
+            device=src_logits.device,
+        )
+        target_classes[idx] = target_classes_o
+
+        src_boxes = outputs['pred_boxes'][idx].float()
+        target_boxes = torch.cat([t['boxes'][i].float() for t, (_, i) in zip(targets, indices)], dim=0)
+        ious, _ = box_iou(box_cxcywh_to_xyxy(src_boxes), box_cxcywh_to_xyxy(target_boxes))
+        ious = torch.diag(ious).detach()
+
+        alpha, gamma = 0.25, 2
+
+        # Ensure pred_score is in FP32 for operations that require higher precision
+        pred_score = torch.sigmoid(src_logits)
+
+        pos_weights = torch.zeros_like(src_logits)
+        neg_weights = pred_score ** gamma
+        pos_ind = [id for id in idx]
+        pos_ind.append(target_classes_o)
+
+        # Ensure t is in FP32 for operations that require higher precision
+        t = pred_score[pos_ind].pow(alpha) * ious.pow(1 - alpha)
+        t = torch.clamp(t, 0.01).detach()
+        # tau = 1.5
+        # if 'userank' in kwargs and kwargs['userank']:
+        #     rank = self.get_local_rank_o2m(t, indices)
+        #     rank_weight = torch.exp(-rank / tau).cuda()
+        # else:
+        #     rank_weight = 1
+
+        rank_weight = 1
+
+        t = t * rank_weight
+        pos_weights[pos_ind] = t
+        neg_weights[pos_ind] = 1 - t
+
+        # Ensure loss_ce is calculated in FP32
+        loss_ce = - pos_weights * pred_score.log() - neg_weights * (1 - pred_score).log()
+        loss_ce = loss_ce.sum().float() / num_boxes
+        losses = {"loss_ce": loss_ce}
+        # self.rank_weight = rank_weight
 
         return losses
 
