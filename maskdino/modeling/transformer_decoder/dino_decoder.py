@@ -102,7 +102,7 @@ class TransformerDecoder(nn.Module):
                 level_start_index: Optional[Tensor] = None,  # num_levels
                 spatial_shapes: Optional[Tensor] = None,  # bs, num_levels, 2
                 valid_ratios: Optional[Tensor] = None,
-
+                **kwargs
                 ):
         """
         Input:
@@ -115,6 +115,8 @@ class TransformerDecoder(nn.Module):
         output = tgt
         device = tgt.device
 
+        pred_head = kwargs.get('pred_head', None)
+
         intermediate = []
         # refpoints_unsigmoid (reference_points_unsigmoid) --> reference_points
         # 一共 10 组参考点，也就是 10 组预测框，N=9，初始参考点 + 9 次迭代更新参考点
@@ -124,6 +126,7 @@ class TransformerDecoder(nn.Module):
         reference_points = refpoints_unsigmoid.sigmoid().to(device)
         ref_points = [reference_points]
 
+        distinct_masks = []
         attn_output_weights_list = []
         for layer_id, layer in enumerate(self.layers):
             # preprocess ref points
@@ -169,6 +172,7 @@ class TransformerDecoder(nn.Module):
             # refinement of reference points
             # reference_points (sigmoid) --> reference_before_sigmoid (logit) --> outputs_unsig (logit)--> new_reference_points (sigmoid)
             # iter update
+            layer_boxes = None
             if self.bbox_embed is not None:
                 reference_before_sigmoid = inverse_sigmoid(reference_points)
                 delta_unsig = self.bbox_embed[layer_id](output).to(device)
@@ -176,10 +180,58 @@ class TransformerDecoder(nn.Module):
                 new_reference_points = outputs_unsig.sigmoid()
 
                 reference_points = new_reference_points.detach()
+                layer_boxes = new_reference_points
                 # if layer_id != self.num_layers - 1:
                 ref_points.append(new_reference_points)
 
             intermediate.append(self.norm(output))
+
+            # layer-wise ddq
+            decoder_output = pred_head.decoder_norm(self.norm(output))
+            decoder_output = decoder_output.transpose(0, 1)
+            outputs_class = pred_head.class_embed(decoder_output)
+            outputs_class = outputs_class.transpose(0, 1) # (nq, bs, num_classes)
+            layer_classes = outputs_class
+
+            if layer_boxes is not None:
+                scores = layer_classes.sigmoid().max(-1)[0]  # (nq, bs)
+                boxes = layer_boxes # (nq, bs, 4)
+                scores_b = scores.transpose(0, 1).contiguous() # (bs, nq)
+                boxes_b = boxes.transpose(0, 1).contiguous() # (bs, nq, 4)
+
+                from torchvision.ops import nms
+                from maskdino.utils import box_ops
+                def dqs_keep_mask(boxes_cxcywh: torch.Tensor,
+                                  scores: torch.Tensor,
+                                  iou_thr: float = 0.8) -> torch.Tensor:
+                    """
+                    boxes_cxcywh: (nq, 4) normalized
+                    scores: (nq,)
+                    return: keep_mask (nq,) bool
+                    """
+                    boxes_xyxy = box_ops.box_cxcywh_to_xyxy(boxes_cxcywh)
+                    keep = nms(boxes_xyxy, scores, iou_thr)
+                    mask = boxes_cxcywh.new_zeros((boxes_cxcywh.size(0),), dtype=torch.bool)
+                    mask[keep] = True
+                    return mask
+
+                keep_mask = []
+                for b in range(boxes_b.size(0)):
+                    keep_mask_b = dqs_keep_mask(boxes_b[b], scores_b[b], iou_thr=0.8)
+                    keep_mask.append(keep_mask_b)
+                keep_mask = torch.stack(keep_mask, dim=0) # (bs, nq)
+                distinct_masks.append(keep_mask)
+
+                if keep_mask.size(0) == 1:  # bs==1
+                    keep = keep_mask[0]  # (nq,)
+                    idx = keep.nonzero(as_tuple=False).view(-1)
+                    if idx.numel() == 0:
+                        idx = scores_b[0].argmax().view(1)
+                    new_tgt_mask = torch.ones((keep.numel(), keep.numel()),
+                                              device=device, dtype=torch.bool)
+                    new_tgt_mask[idx, :] = False
+                    new_tgt_mask[:, idx] = False
+                    tgt_mask = new_tgt_mask
 
         # debug: 对每一层的 attn_output_weights 进行分析
         # stacked_attn_output_weights = torch.stack(attn_output_weights_list, dim=0).squeeze() # (9, 300, 300)
@@ -203,7 +255,8 @@ class TransformerDecoder(nn.Module):
         # ref_points: [(nq, bs, 4), ...] --> 【(bs, nq, 4)， ...]
         return [
             [itm_out.transpose(0, 1) for itm_out in intermediate],
-            [itm_refpoint.transpose(0, 1) for itm_refpoint in ref_points]
+            [itm_refpoint.transpose(0, 1) for itm_refpoint in ref_points],
+            distinct_masks
         ]
 
 

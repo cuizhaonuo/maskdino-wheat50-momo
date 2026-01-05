@@ -1,0 +1,63 @@
+_BASE_: ./config_v1.yaml
+
+OUTPUT_DIR: output/maskdino_swinl-time-10-19-20-00-v1-patch
+
+SOLVER:
+  LR_SCHEDULER_NAME: WarmupMultiStepLR
+  MAX_ITER: 2000
+  CHECKPOINT_PERIOD: 200   # 或者 500，随你
+  WARMUP_ITERS: 50         # 534 * (2000/50000) ≈ 21，这里取 50 更稳
+  STEPS: [850, 960]        # 21333/50000≈0.4267, 24000/50000≈0.48
+  IMS_PER_BATCH: 1         # 先不动，避免引入新变量
+  BASE_LR: 0.0001          # 先不动；如果你只训head或冻结backbone，再调整
+
+MODEL:
+  MaskDINO:
+    LEARN_TGT: false
+    DN: 'no'
+    NUM_OBJECT_QUERIES: 900
+    # COST
+    COST_BOX_WEIGHT: 5.0
+    COST_CLASS_WEIGHT: 1.0
+    COST_DICE_WEIGHT: 5.0
+    COST_GIOU_WEIGHT: 2.0
+    COST_MASK_WEIGHT: 5.0
+    # LOSS
+    BOX_WEIGHT: 5.0
+    CLASS_WEIGHT: 1.0
+    DICE_WEIGHT: 5.0
+    GIOU_WEIGHT: 2.0
+    MASK_WEIGHT: 5.0
+
+
+# 默认
+#Model:
+#  MaskDINO:
+#    # COST
+#    COST_BOX_WEIGHT: 5.0
+#    COST_CLASS_WEIGHT: 4.0
+#    COST_DICE_WEIGHT: 5.0
+#    COST_GIOU_WEIGHT: 2.0
+#    COST_MASK_WEIGHT: 5.0
+#    # LOSS
+#    BOX_WEIGHT: 5.0
+#    CLASS_WEIGHT: 4.0
+#    DICE_WEIGHT: 5.0
+#    GIOU_WEIGHT: 2.0
+#    MASK_WEIGHT: 5.0
+
+#MODEL:
+#  MaskDINO:
+#    # COST
+#    COST_BOX_WEIGHT: 5.0
+#    COST_CLASS_WEIGHT: 4.0
+#    COST_DICE_WEIGHT: 5.0
+#    COST_GIOU_WEIGHT: 2.0
+#    COST_MASK_WEIGHT: 5.0
+#    # LOSS
+#    BOX_WEIGHT: 5.0
+#    CLASS_WEIGHT: 4.0
+#    DICE_WEIGHT: 5.0
+#    GIOU_WEIGHT: 2.0
+#    MASK_WEIGHT: 5.0
+
