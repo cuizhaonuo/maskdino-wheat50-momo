@@ -414,8 +414,55 @@ class MaskDINODecoder(nn.Module):
             enc_outputs_coord_unselected = self._bbox_embed(
                 output_memory) + output_proposals  # (bs, \sum{hw}, 4) unsigmoid
             # enc_outputs_coord_unselected = output_proposals
+
+            # 增加 dense distinct query selection 机制
+            from torchvision.ops import nms
+
+            def dqs_nms_xyxy(boxes_xyxy: torch.Tensor,
+                             scores: torch.Tensor,
+                             iou_thr: float = 0.8,
+                             topk: int = 900):
+                """
+                boxes_xyxy: (N,4) in [0,1] or pixel coords都可以，只要一致
+                scores: (N,)
+                return: keep indices (<=topk)
+                """
+                keep = nms(boxes_xyxy, scores, iou_thr)
+                if topk is not None:
+                    keep = keep[:topk]
+                return keep
+
             topk = self.num_queries
-            topk_proposals = torch.topk(enc_outputs_class_unselected.max(-1)[0], topk, dim=1)[1]
+            iou_thr = 0.8
+            num_imgs = enc_outputs_class_unselected.shape[0]
+
+            # 1) scores: (bs, N)
+            scores = enc_outputs_class_unselected.max(-1)[0].sigmoid()  # 建议加 sigmoid，和 DDQ 一致
+            # 2) boxes: (bs, N, 4) -> xyxy
+            proposals = enc_outputs_coord_unselected.sigmoid()
+            proposals_xyxy = box_ops.box_cxcywh_to_xyxy(proposals)  # 你已有 box_ops
+
+            topk_proposals_list = []
+            for b in range(num_imgs):
+                keep = dqs_nms_xyxy(proposals_xyxy[b], scores[b], iou_thr=iou_thr, topk=None)
+
+                # 这里的 keep 是“按 score 降序经过 NMS 的序列”（torchvision nms按scores排序输出）
+                # 取前 topk 个 distinct proposals（不足则后面再 pad）
+                keep = keep[:topk]
+                topk_proposals_list.append(keep)
+
+            # 把 list 对齐成 tensor (bs, topk)，不足用最后一个 index 或 0 pad
+            topk_proposals = []
+            for b, keep in enumerate(topk_proposals_list):
+                if keep.numel() < topk:
+                    pad = keep.new_full((topk - keep.numel(),), keep[-1] if keep.numel() > 0 else 0)
+                    keep = torch.cat([keep, pad], dim=0)
+                topk_proposals.append(keep)
+            topk_proposals = torch.stack(topk_proposals, dim=0)  # (bs, topk)
+
+            # 原版
+            # topk = self.num_queries
+            # topk_proposals = torch.topk(enc_outputs_class_unselected.max(-1)[0], topk, dim=1)[1]
 
             # from maskdino.ctx import indices_ctx
             # indices = indices_ctx.get()
@@ -515,6 +562,31 @@ class MaskDINODecoder(nn.Module):
             # 暂时注释
             outputs_class, outputs_mask = self.forward_prediction_heads(tgt.transpose(0, 1), mask_features, self.training)
 
+            boxes_b = refpoint_embed.sigmoid()
+            scores_b = outputs_class.sigmoid().max(-1)[0]
+            from torchvision.ops import nms
+            # from maskdino.utils import box_ops
+            def dqs_keep_mask(boxes_cxcywh: torch.Tensor,
+                              scores: torch.Tensor,
+                              iou_thr: float = 0.8) -> torch.Tensor:
+                """
+                boxes_cxcywh: (nq, 4) normalized
+                scores: (nq,)
+                return: keep_mask (nq,) bool
+                """
+                boxes_xyxy = box_ops.box_cxcywh_to_xyxy(boxes_cxcywh)
+                keep = nms(boxes_xyxy, scores, iou_thr)
+                mask = boxes_cxcywh.new_zeros((boxes_cxcywh.size(0),), dtype=torch.bool)
+                mask[keep] = True
+                return mask
+
+            keep_mask = []
+            for b in range(boxes_b.size(0)):
+                keep_mask_b = dqs_keep_mask(boxes_b[b], scores_b[b], iou_thr=0.8)
+                keep_mask.append(keep_mask_b)
+            keep_mask = torch.stack(keep_mask, dim=0)  # (bs, nq)
+            initial_keep_mask = keep_mask
+
             # debug: 查看推理时每一层的预测结果
             # outputs_class, outputs_mask = self.forward_prediction_heads(tgt.transpose(0, 1), mask_features, pred_mask=True)
 
@@ -544,7 +616,7 @@ class MaskDINODecoder(nn.Module):
         '''
         # hs <-- intermediate, references <-- ref_points
         # hs List 9, references List (9+1=10)
-        hs, references = self.decoder(
+        hs, references, distinct_masks = self.decoder(
             tgt=tgt.transpose(0, 1),
             memory=src_flatten.transpose(0, 1),
             memory_key_padding_mask=mask_flatten,
@@ -553,7 +625,8 @@ class MaskDINODecoder(nn.Module):
             level_start_index=level_start_index,
             spatial_shapes=spatial_shapes,
             valid_ratios=valid_ratios,
-            tgt_mask=tgt_mask
+            tgt_mask=tgt_mask,
+            pred_head=self
         )
         # 为所有 decoder 层的输出，添加预测头，得到每一层的分类和掩码预测，所有的特征层共用一个预测头，也就是说参数是共享的
         # PS：类别和掩码预测头的参数也是共享的，但是预测框的参数不共享
@@ -628,6 +701,24 @@ class MaskDINODecoder(nn.Module):
         # debug: 可视化每次 decoder 的输出结果
         # from maskdino.analysis.tool_lab import visualize_decoder_outputs
         # visualize_decoder_outputs(out)
+        bs = out['pred_logits'].shape[0]
+        if bs == 1:
+            distinct_masks.insert(0, initial_keep_mask)
+            last_mask = distinct_masks.pop()
+
+            last_mask_q = last_mask[0]  # or last_mask.squeeze(0)
+            out['pred_logits'] = out['pred_logits'][:, last_mask_q, :]
+            out['pred_boxes'] = out['pred_boxes'][:, last_mask_q, :]
+            out['pred_masks'] = out['pred_masks'][:, last_mask_q, :, :] if out['pred_masks'] is not None else None
+            for aux, mask in zip(out['aux_outputs'], distinct_masks):
+                m = mask[0]  # (nq,)
+                aux['pred_logits'] = aux['pred_logits'][:, m, :]
+                aux['pred_boxes'] = aux['pred_boxes'][:, m, :]
+                if aux.get('pred_masks', None) is not None:
+                    aux['pred_masks'] = aux['pred_masks'][:, m, :, :]
+        else:
+            raise ValueError(f"Batch size {bs} != 1")
+
         return out, mask_dict
 
     def forward_prediction_heads(self, output, mask_features, pred_mask=True):
