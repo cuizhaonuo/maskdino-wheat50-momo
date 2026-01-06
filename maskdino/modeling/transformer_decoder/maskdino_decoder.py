@@ -639,9 +639,9 @@ class MaskDINODecoder(nn.Module):
         if pred_mask:
             mask_embed = self.mask_embed(decoder_output)
             outputs_mask = torch.einsum("bqc,bchw->bqhw", mask_embed, mask_features)
-        from maskdino.analysis.tool_lab import vis_einsum_process
-        vis_einsum_process("/public/home/zncui/pycharm_project/MaskDINO/myscripts/D6-122-20230529.jpg",
-                           mask_features, mask_embed, outputs_mask, b=0, q=8, topk=8)
+        # from maskdino.analysis.tool_lab import vis_einsum_process
+        # vis_einsum_process("/public/home/zncui/pycharm_project/MaskDINO/myscripts/D6-122-20230529.jpg",
+        #                    mask_features, mask_embed, outputs_mask, b=0, q=8, topk=8)
         return outputs_class, outputs_mask
 
     @torch.jit.unused
