@@ -254,7 +254,7 @@ class HungarianMatcher(nn.Module):
             #         # print("index match found in min cost rows:", i)
             # print(f"Matched count in min cost rows: {matched_count} / {len(tgt_id)}")
 
-            C_list.append(C)
+            # C_list.append(C)
             # C_list.append(self.cost_class * cost_class.cpu())
             indices.append(linear_sum_assignment(C))
 

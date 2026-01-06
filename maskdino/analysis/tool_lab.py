@@ -3371,7 +3371,99 @@ def vis_decoder_layer_results(outputs, batched_inputs, stacked_attn_output_weigh
     plt.savefig(save_path, dpi=200)
     plt.close()
 
+def vis_einsum_process(
+    img_path, mask_features, mask_embed, outputs_mask,
+    b=0, q=0, topk=8, upsample_to_img=True
+):
+    import torch
+    import numpy as np
+    import matplotlib.pyplot as plt
+    import torch.nn.functional as F
+    import cv2
+    """
+    可视化 torch.einsum("bqc,bchw->bqhw") 的过程：
+    1) 输出 mask heatmap
+    2) mask_embed 权重 top-k 通道
+    3) top-k 通道的 feature map
+    4) top-k 通道的贡献图 w_c * f_c(h,w)
+    """
+    assert mask_features.dim() == 4
+    assert mask_embed.dim() == 3
+    assert outputs_mask.dim() == 4
+    img_bgr = cv2.imread(img_path)
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
+    B, C, Hm, Wm = mask_features.shape
+    _, Q, C2 = mask_embed.shape
+    assert C == C2
+
+    w = mask_embed[b, q]              # (C,)
+    f = mask_features[b]              # (C,Hm,Wm)
+    out = outputs_mask[b, q]          # (Hm,Wm)
+
+    # 选 top-k 绝对值最大的通道
+    idx = torch.topk(w.abs(), k=min(topk, C)).indices.cpu().tolist()
+
+    # upsample 到原图大小（可选）
+    def up(x2d):
+        if not upsample_to_img:
+            return x2d
+        H, W = img_rgb.shape[:2]
+        return F.interpolate(x2d[None, None], size=(H, W), mode="bilinear", align_corners=False)[0, 0]
+
+    out_up = up(out).sigmoid().detach().cpu().numpy()
+
+    # 画 1) mask 输出热图（sigmoid）
+    plt.figure(figsize=(6, 5))
+    plt.title(f"outputs_mask sigmoid (b={b}, q={q})")
+    plt.imshow(img_rgb)
+    plt.imshow(out_up, alpha=0.55)
+    plt.axis("off")
+    plt.show()
+
+    # 画 2) mask_embed 权重 top-k（柱状图）
+    w_np = w.detach().cpu().numpy()
+    plt.figure(figsize=(8, 3))
+    plt.title(f"mask_embed top-{len(idx)} channels (abs)")
+    plt.bar(range(len(idx)), w_np[idx])
+    plt.xticks(range(len(idx)), [str(i) for i in idx], rotation=45)
+    plt.tight_layout()
+    plt.show()
+
+    # 画 3) top-k feature map & 4) 贡献图
+    for c in idx:
+        fmap = f[c]                 # (Hm,Wm)
+        contrib = w[c] * fmap       # (Hm,Wm)
+
+        fmap_up = up(fmap).detach().cpu().numpy()
+        contrib_up = up(contrib).detach().cpu().numpy()
+
+        plt.figure(figsize=(12, 4))
+        plt.suptitle(f"channel {c}: w={w[c].item():+.4f}")
+
+        plt.subplot(1, 3, 1)
+        plt.title("feature map")
+        plt.imshow(fmap_up)
+        plt.axis("off")
+
+        plt.subplot(1, 3, 2)
+        plt.title("contribution = w * feature")
+        plt.imshow(contrib_up)
+        plt.axis("off")
+
+        plt.subplot(1, 3, 3)
+        plt.title("img + contribution overlay")
+        plt.imshow(img_rgb)
+        plt.imshow(contrib_up, alpha=0.55)
+        plt.axis("off")
+
+        plt.tight_layout()
+        plt.show()
+
+    # 验证：sum_c w_c * f_c == out（在 mask 分辨率上）
+    recon = torch.einsum("c,chw->hw", w, f)
+    max_err = (recon - out).abs().max().item()
+    print(f"[check] max |recon - outputs_mask| = {max_err:.6e}")
 
 
 
