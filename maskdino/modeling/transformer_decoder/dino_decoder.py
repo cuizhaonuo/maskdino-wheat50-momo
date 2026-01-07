@@ -309,10 +309,10 @@ class DeformableTransformerDecoderLayer(nn.Module):
             # attn_output_weights_ctx.set(attn_output_weights)
 
             # gated attention
-            tgt, score = self.query_embed(tgt).split([self.d_model, self.d_model], dim=-1)
-            q = k = self.with_pos_embed(tgt, tgt_query_pos)
-            tgt2 = self.self_attn(q, k, tgt, attn_mask=self_attn_mask)[0]
-            tgt2 = tgt2 * score.sigmoid()
+            # tgt, score = self.query_embed(tgt).split([self.d_model, self.d_model], dim=-1)
+            # q = k = self.with_pos_embed(tgt, tgt_query_pos)
+            # tgt2 = self.self_attn(q, k, tgt, attn_mask=self_attn_mask)[0]
+            # tgt2 = tgt2 * score.sigmoid()
 
             # debug: 可视化 attention weights
             # tgt2, attn_output_weights = self.self_attn(q, k, tgt, attn_mask=self_attn_mask, average_attn_weights=False)
