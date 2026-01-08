@@ -297,24 +297,50 @@ def create_coco(train_ratio, val_ratio, test_ratio, seed=42):
         print(f"[COCO] {split_name}: images={len(coco_dict['images'])}, anns={len(coco_dict['annotations'])} -> {out_json}")
 
 
-def create_yolo(train_ratio, val_ratio, test_ratio, seed=42):
+def create_yolo(train_ratio, val_ratio, test_ratio, seed=42, resize=None):
     """
     生成 YOLO 检测格式：
-    yolo/
+    - resize=None        -> yolo/
+    - resize=(1024,1024)-> yolo_1024x1024/
+
+    yolo_xxx/
       images/train|val|test/
       labels/train|val|test/
       data.yaml
-    每个 label txt：class cx cy w h (归一化到 0~1)
     """
-    YOLO_ROOT.mkdir(parents=True, exist_ok=True)
+    from PIL import Image
+
+    # ------------------------------------------------
+    # 1. 根据 resize 动态决定 YOLO_ROOT
+    # ------------------------------------------------
+    if resize is None:
+        yolo_root = SRC_ROOT / "yolo"
+        resize_tag = "orig"
+    else:
+        assert isinstance(resize, tuple) and len(resize) == 2
+        new_w, new_h = resize
+        yolo_root = SRC_ROOT / f"yolo_{new_w}x{new_h}"
+        resize_tag = f"{new_w}x{new_h}"
+
+    # ------------------------------------------------
+    # 2. 创建目录结构
+    # ------------------------------------------------
+    yolo_root.mkdir(parents=True, exist_ok=True)
     for split in ["train", "val", "test"]:
-        (YOLO_ROOT / "images" / split).mkdir(parents=True, exist_ok=True)
-        (YOLO_ROOT / "labels" / split).mkdir(parents=True, exist_ok=True)
+        (yolo_root / "images" / split).mkdir(parents=True, exist_ok=True)
+        (yolo_root / "labels" / split).mkdir(parents=True, exist_ok=True)
 
+    # ------------------------------------------------
+    # 3. 收集 & 划分数据
+    # ------------------------------------------------
     pairs = _collect_pairs(OUT_IMAGES, OUT_LABELS, IMG_EXTS, XML_EXTS)
-    train_pairs, val_pairs, test_pairs = _split_pairs(pairs, train_ratio, val_ratio, test_ratio, seed=seed)
+    train_pairs, val_pairs, test_pairs = _split_pairs(
+        pairs, train_ratio, val_ratio, test_ratio, seed=seed
+    )
 
-    # 1) 类别集合（YOLO: class_id 从 0 开始）
+    # ------------------------------------------------
+    # 4. 类别映射（YOLO class id 从 0 开始）
+    # ------------------------------------------------
     cat_names = set()
     for _, xml_path in pairs:
         _, _, objs = _parse_voc_xml(xml_path)
@@ -323,82 +349,104 @@ def create_yolo(train_ratio, val_ratio, test_ratio, seed=42):
     cat_names = sorted(cat_names)
     name_to_classid = {n: i for i, n in enumerate(cat_names)}
 
-    def write_split(split_name: str, split_pairs):
-        img_out_dir = YOLO_ROOT / "images" / split_name
-        lab_out_dir = YOLO_ROOT / "labels" / split_name
+    # ------------------------------------------------
+    # 5. 图片保存函数
+    # ------------------------------------------------
+    def save_image(src: Path, dst: Path):
+        if resize is None:
+            if not dst.exists():
+                shutil.copy2(src, dst)
+            return True
 
-        n_img = 0
-        n_lab = 0
+        new_w, new_h = resize
+        try:
+            with Image.open(src) as im:
+                im = im.convert("RGB")
+                im = im.resize((new_w, new_h), Image.BILINEAR)
+                im.save(dst, quality=95, subsampling=0)
+            return True
+        except Exception as e:
+            print(f"[BAD IMAGE] {src} -> {e}")
+            return False
+
+    # ------------------------------------------------
+    # 6. 写每个 split
+    # ------------------------------------------------
+    def write_split(split_name: str, split_pairs):
+        img_out = yolo_root / "images" / split_name
+        lab_out = yolo_root / "labels" / split_name
+
+        n_img, n_lab = 0, 0
+
         for img_path, xml_path in split_pairs:
             w, h, objs = _parse_voc_xml(xml_path)
 
-            # copy image
-            dst_img = img_out_dir / img_path.name
-            if not dst_img.exists():
-                shutil.copy2(img_path, dst_img)
+            # image
+            dst_img = img_out / img_path.name
+            ok = save_image(img_path, dst_img)
+            if not ok:
+                # 失败就跳过这个样本，避免生成不对应的标签
+                continue
             n_img += 1
 
-            # write label txt (same stem as image)
-            txt_path = lab_out_dir / f"{img_path.stem}.txt"
+            # label
+            txt_path = lab_out / f"{img_path.stem}.txt"
             lines = []
+
             for o in objs:
                 xmin, ymin, xmax, ymax = o["bbox"]
-                # clamp
+
                 xmin = max(0, min(xmin, w - 1))
                 ymin = max(0, min(ymin, h - 1))
                 xmax = max(0, min(xmax, w - 1))
                 ymax = max(0, min(ymax, h - 1))
 
-                bw = max(0.0, float(xmax - xmin))
-                bh = max(0.0, float(ymax - ymin))
-                cx = float(xmin) + bw / 2.0
-                cy = float(ymin) + bh / 2.0
+                bw = max(0.0, xmax - xmin)
+                bh = max(0.0, ymax - ymin)
+                cx = xmin + bw / 2.0
+                cy = ymin + bh / 2.0
 
-                # normalize
-                cx /= float(w)
-                cy /= float(h)
-                bw /= float(w)
-                bh /= float(h)
+                # YOLO 归一化（纯 resize 不需要改）
+                cx /= w
+                cy /= h
+                bw /= w
+                bh /= h
 
                 cls = name_to_classid[o["name"]]
                 lines.append(f"{cls} {cx:.8f} {cy:.8f} {bw:.8f} {bh:.8f}")
 
             with open(txt_path, "w", encoding="utf-8") as f:
                 f.write("\n".join(lines) + ("\n" if lines else ""))
+
             n_lab += 1
 
-        print(f"[YOLO] {split_name}: images={n_img}, labels={n_lab}")
+        print(f"[YOLO-{resize_tag}] {split_name}: images={n_img}, labels={n_lab}")
 
     write_split("train", train_pairs)
     write_split("val", val_pairs)
     write_split("test", test_pairs)
 
-    # 2) 写 data.yaml（用绝对路径更省事）
-    data = {
-        "path": str(YOLO_ROOT),
-        "train": "images/train",
-        "val": "images/val",
-        "test": "images/test",
-        "names": {i: n for i, n in enumerate(cat_names)},
-        "nc": len(cat_names),
-    }
-
-    yaml_path = YOLO_ROOT / "data.yaml"
-    # 不依赖 pyyaml：手写一个简易 yaml
+    # ------------------------------------------------
+    # 7. data.yaml
+    # ------------------------------------------------
+    yaml_path = yolo_root / "data.yaml"
     with open(yaml_path, "w", encoding="utf-8") as f:
-        f.write(f"path: {data['path']}\n")
-        f.write(f"train: {data['train']}\n")
-        f.write(f"val: {data['val']}\n")
-        f.write(f"test: {data['test']}\n")
-        f.write(f"nc: {data['nc']}\n")
+        f.write(f"path: {yolo_root}\n")
+        f.write("train: images/train\n")
+        f.write("val: images/val\n")
+        f.write("test: images/test\n")
+        f.write(f"nc: {len(cat_names)}\n")
         f.write("names:\n")
-        for i in range(data["nc"]):
-            f.write(f"  {i}: {data['names'][i]}\n")
+        for i, n in enumerate(cat_names):
+            f.write(f"  {i}: {n}\n")
 
-    print(f"[YOLO] data.yaml -> {yaml_path}")
+    print(f"[YOLO-{resize_tag}] data.yaml -> {yaml_path}")
+
+
+
 
 if __name__ == "__main__":
     # copy_files(overwrite=True)   # 若不想覆盖：overwrite=False
     # clean_files()
-    create_coco(train_ratio=0.0, val_ratio=0.1, test_ratio=0.9)
-    create_yolo(train_ratio=0.0, val_ratio=0.1, test_ratio=0.9)
+    # create_coco(train_ratio=0.0, val_ratio=0.1, test_ratio=0.9)
+    create_yolo(train_ratio=0.0, val_ratio=0.1, test_ratio=0.9, resize=(800, 800))
