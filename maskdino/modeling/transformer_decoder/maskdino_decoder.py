@@ -135,8 +135,10 @@ class MaskDINODecoder(nn.Module):
         if self.mask_classification:
             if self.semantic_ce_loss:
                 self.class_embed = nn.Linear(hidden_dim, num_classes+1)
+                self.one2many_class_embed = nn.Linear(hidden_dim, num_classes+1)
             else:
                 self.class_embed = nn.Linear(hidden_dim, num_classes)
+                self.one2many_class_embed = nn.Linear(hidden_dim, num_classes)
         self.label_enc=nn.Embedding(num_classes,hidden_dim)
         self.mask_embed = MLP(hidden_dim, hidden_dim, mask_dim, 3)
 
@@ -165,6 +167,7 @@ class MaskDINODecoder(nn.Module):
 
         self.hidden_dim = hidden_dim
         self._bbox_embed = _bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
+        self._one2many_bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
         nn.init.constant_(_bbox_embed.layers[-1].weight.data, 0)
         nn.init.constant_(_bbox_embed.layers[-1].bias.data, 0)
         box_embed_layerlist = [_bbox_embed for i in range(self.num_layers)]  # share box prediction each layer
@@ -427,55 +430,47 @@ class MaskDINODecoder(nn.Module):
         if self.two_stage:
             output_memory, output_proposals = gen_encoder_output_proposals(src_flatten, mask_flatten, spatial_shapes)
             output_memory = self.enc_output_norm(self.enc_output(output_memory))
+
             enc_outputs_class_unselected = self.class_embed(output_memory)
             enc_outputs_coord_unselected = self._bbox_embed(
                 output_memory) + output_proposals  # (bs, \sum{hw}, 4) unsigmoid
             # enc_outputs_coord_unselected = output_proposals
 
+            # if self.training:
+            one2many_enc_outputs_class_unselected = self.class_embed(output_memory)
+            one2many_enc_outputs_class_unselected = self._bbox_embed(
+                output_memory) + output_proposals  # (bs, \sum{hw}, 4) unsigmoid
+
             # 增加 dense distinct query selection 机制
             from torchvision.ops import nms
-
-            def dqs_nms_xyxy(boxes_xyxy: torch.Tensor,
-                             scores: torch.Tensor,
-                             iou_thr: float = 0.8,
-                             topk: int = 900):
-                """
-                boxes_xyxy: (N,4) in [0,1] or pixel coords都可以，只要一致
-                scores: (N,)
-                return: keep indices (<=topk)
-                """
-                keep = nms(boxes_xyxy, scores, iou_thr)
-                if topk is not None:
-                    keep = keep[:topk]
-                return keep
 
             topk = self.num_queries
             iou_thr = 0.8
             num_imgs = enc_outputs_class_unselected.shape[0]
 
-            # 1) scores: (bs, N)
-            scores = enc_outputs_class_unselected.max(-1)[0].sigmoid()  # 建议加 sigmoid，和 DDQ 一致
-            # 2) boxes: (bs, N, 4) -> xyxy
-            proposals = enc_outputs_coord_unselected.sigmoid()
-            proposals_xyxy = box_ops.box_cxcywh_to_xyxy(proposals)  # 你已有 box_ops
+            one2one_scores_list = []
+            one2one_proposals_list = []
+            one2many_scores_list = []
+            one2many_proposals_list = []
 
-            topk_proposals_list = []
-            for b in range(num_imgs):
-                keep = dqs_nms_xyxy(proposals_xyxy[b], scores[b], iou_thr=iou_thr, topk=None)
+            def get_scores_and_proposals_list(enc_outputs_class, enc_outputs_coord):
+                pass
 
-                # 这里的 keep 是“按 score 降序经过 NMS 的序列”（torchvision nms按scores排序输出）
-                # 取前 topk 个 distinct proposals（不足则后面再 pad）
-                keep = keep[:topk]
-                topk_proposals_list.append(keep)
 
-            # 把 list 对齐成 tensor (bs, topk)，不足用最后一个 index 或 0 pad
-            topk_proposals = []
-            for b, keep in enumerate(topk_proposals_list):
-                if keep.numel() < topk:
-                    pad = keep.new_full((topk - keep.numel(),), keep[-1] if keep.numel() > 0 else 0)
-                    keep = torch.cat([keep, pad], dim=0)
-                topk_proposals.append(keep)
-            topk_proposals = torch.stack(topk_proposals, dim=0)  # (bs, topk)
+            for img_id in range(num_imgs):
+                single_scores = enc_outputs_class_unselected[img_id].max(-1)[0].sigmoid()
+                single_proposals = enc_outputs_coord_unselected[img_id].sigmoid()
+                single_proposals_xyxy = box_ops.box_cxcywh_to_xyxy(single_proposals)
+                keep = nms(single_proposals_xyxy, single_scores, iou_thr)
+                one2one_scores_list.append(single_scores[keep])
+                one2one_proposals_list.append(single_proposals[keep])
+
+                single_scores_om = one2many_enc_outputs_class_unselected[img_id].max(-1)[0].sigmoid()
+                single_proposals_om = enc_outputs_coord_unselected[img_id].sigmoid()
+                single_proposals_xyxy_om = box_ops.box_cxcywh_to_xyxy(single_proposals_om)
+                keep_om = nms(single_proposals_xyxy_om, single_scores_om, iou_thr)
+                one2many_scores_list.append(single_scores_om[keep_om])
+                one2many_proposals_list.append(single_proposals_om[keep_om])
 
             # 原版
             # topk = self.num_queries
