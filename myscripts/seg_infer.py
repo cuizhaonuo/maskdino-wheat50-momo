@@ -401,7 +401,7 @@ class SegInferenceTemplate:
     def _proposals_for_image(self, img_path: str) -> List[DetProposal]:
         img = cv2.imread(img_path)
         if img is None: raise FileNotFoundError(img_path)
-        img = cv2.resize(img, (800, 800))  # resize to fixed size for wheat dataset
+        # img = cv2.resize(img, (800, 800))  # resize to fixed size for wheat dataset
         H, W = img.shape[:2]
         tile, overlap = self.sw.tile, self.sw.overlap
         stride = max(1, tile - overlap); padv = self.sw.pad_value
