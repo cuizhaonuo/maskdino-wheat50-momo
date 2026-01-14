@@ -156,7 +156,7 @@ class MaskDINO(nn.Module):
         weight_dict = {"loss_ce": class_weight}
         weight_dict.update({"loss_mask": mask_weight, "loss_dice": dice_weight})
         weight_dict.update({"loss_bbox":box_weight,"loss_giou":giou_weight})
-        # weight_dict.update({'loss_iou': iou_weight})
+        weight_dict.update({'loss_iou': box_weight})
         # two stage is the query selection scheme
         if cfg.MODEL.MaskDINO.TWO_STAGE:
             interm_weight_dict = {}
@@ -302,7 +302,7 @@ class MaskDINO(nn.Module):
             # indices_ctx.set(None)
 
             # 预处理时已经 pad 好了，不需要在这里 pad 了，因此不传入 mask，即 mask=None
-            outputs, mask_dict = self.sem_seg_head(features, targets=targets)
+            outputs, outputs_one2many, mask_dict = self.sem_seg_head(features, targets=targets)
 
             # # debug: 可视化每一层 decoder 的结果，观察这些结果所各自预测的对象
             # from maskdino.analysis.tool_lab import vis_decoder_layer_results
@@ -313,34 +313,34 @@ class MaskDINO(nn.Module):
 
             # one-to-one loss, one-to-one query and denoising query
             # bipartite matching-based loss
-            losses, indices = self.criterion(outputs, targets, mask_dict)
+            losses, _ = self.criterion(outputs, targets, mask_dict)
 
             # one-to-many loss, one-to-many query
-            one_to_many_flag = True
-            if one_to_many_flag:
+            one2many_flag = True
+            if one2many_flag:
                 multi_targets = copy.deepcopy(targets)
 
-                def duplicate_targets(src_targets, k_one_to_many):
+                def duplicate_targets(src_targets, k_one2many):
                     for t in src_targets:
-                        t['labels'] = t['labels'].repeat(k_one_to_many)
-                        t['masks'] = t['masks'].repeat(k_one_to_many, 1, 1)
-                        t['boxes'] = t['boxes'].repeat(k_one_to_many, 1)
+                        t['labels'] = t['labels'].repeat(k_one2many)
+                        t['masks'] = t['masks'].repeat(k_one2many, 1, 1)
+                        t['boxes'] = t['boxes'].repeat(k_one2many, 1)
                     return src_targets
 
-                multi_targets = duplicate_targets(multi_targets, k_one_to_many=18)
-                outputs_one_to_many = dict()
-                outputs_one_to_many['pred_logits'] = outputs['pred_logits_one_to_many']
-                outputs_one_to_many['pred_boxes'] = outputs['pred_boxes_one_to_many']
-                outputs_one_to_many['pred_masks'] = outputs['pred_masks_one_to_many']
-                outputs_one_to_many['aux_outputs'] = outputs['aux_outputs_one_to_many']
-                outputs_one_to_many['interm_outputs'] = outputs['interm_outputs_one_to_many']
+                multi_targets = duplicate_targets(multi_targets, k_one2many=18)
+                # outputs_one_to_many = dict()
+                # outputs_one_to_many['pred_logits'] = outputs_one2many['pred_logits_one_to_many']
+                # outputs_one_to_many['pred_boxes'] = outputs_one2many['pred_boxes_one_to_many']
+                # outputs_one_to_many['pred_masks'] = outputs_one2many['pred_masks_one_to_many']
+                # outputs_one_to_many['aux_outputs'] = outputs_one2many['aux_outputs_one_to_many']
+                # outputs_one_to_many['interm_outputs'] = outputs_one2many['interm_outputs_one_to_many']
                 # mask_dict = None # 表示关闭 dn-query
-                losses_one_to_many, _ = self.criterion(outputs_one_to_many, multi_targets, mask_dict)
-                lambda_one_to_many = 1.0
-                for key, value in losses_one_to_many.items():
-                    losses[key + '_one_to_many'] = value * lambda_one_to_many
+                losses_one2many, _ = self.criterion(outputs_one2many, multi_targets, mask_dict)
+                lambda_one2many = 1.0
+                for key, value in losses_one2many.items():
+                    losses[key + '_one2many'] = value * lambda_one2many
                     weight = self.criterion.weight_dict[key]
-                    self.criterion.weight_dict[key + '_one_to_many'] = weight
+                    self.criterion.weight_dict[key + '_one2many'] = weight
 
             # bid = 0
             # target_index = torch.where(indices[bid][1] == 22)[0]  # 这里 target_id = 22

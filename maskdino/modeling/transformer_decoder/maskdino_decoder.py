@@ -121,6 +121,8 @@ class MaskDINODecoder(nn.Module):
         if two_stage:
             self.enc_output = nn.Linear(hidden_dim, hidden_dim)
             self.enc_output_norm = nn.LayerNorm(hidden_dim)
+            self.one2many_enc_output = nn.Linear(hidden_dim, hidden_dim)
+            self.one2many_enc_output_norm = nn.LayerNorm(hidden_dim)
 
         self.input_proj = nn.ModuleList()
         for _ in range(self.num_feature_levels):
@@ -434,43 +436,80 @@ class MaskDINODecoder(nn.Module):
             enc_outputs_class_unselected = self.class_embed(output_memory)
             enc_outputs_coord_unselected = self._bbox_embed(
                 output_memory) + output_proposals  # (bs, \sum{hw}, 4) unsigmoid
-            # enc_outputs_coord_unselected = output_proposals
 
-            # if self.training:
-            one2many_enc_outputs_class_unselected = self.class_embed(output_memory)
-            one2many_enc_outputs_class_unselected = self._bbox_embed(
+            one2many_enc_outputs_class_unselected = self.one2many_class_embed(output_memory)
+            one2many_enc_outputs_coord_unselected = self._one2many_bbox_embed(
                 output_memory) + output_proposals  # (bs, \sum{hw}, 4) unsigmoid
 
             # 增加 dense distinct query selection 机制
             from torchvision.ops import nms
 
-            topk = self.num_queries
+            one2one_len = topk = self.num_queries
+            one2many_len = topk_o2m = 1350
             iou_thr = 0.8
             num_imgs = enc_outputs_class_unselected.shape[0]
 
             one2one_scores_list = []
             one2one_proposals_list = []
+            one2one_queries_list = []
             one2many_scores_list = []
             one2many_proposals_list = []
-
-            def get_scores_and_proposals_list(enc_outputs_class, enc_outputs_coord):
-                pass
-
+            one2many_queries_list = []
 
             for img_id in range(num_imgs):
                 single_scores = enc_outputs_class_unselected[img_id].max(-1)[0].sigmoid()
-                single_proposals = enc_outputs_coord_unselected[img_id].sigmoid()
+                single_proposals_logits = enc_outputs_coord_unselected[img_id]
+                single_proposals = single_proposals_logits.sigmoid()
                 single_proposals_xyxy = box_ops.box_cxcywh_to_xyxy(single_proposals)
                 keep = nms(single_proposals_xyxy, single_scores, iou_thr)
-                one2one_scores_list.append(single_scores[keep])
-                one2one_proposals_list.append(single_proposals[keep])
+                one2one_scores_list.append(single_scores[keep][:topk])
+                one2one_proposals_list.append(single_proposals_logits[keep][:topk])
+                one2one_queries_list.append(output_memory[img_id][keep][:topk])
 
                 single_scores_om = one2many_enc_outputs_class_unselected[img_id].max(-1)[0].sigmoid()
-                single_proposals_om = enc_outputs_coord_unselected[img_id].sigmoid()
+                single_proposals_logits_om = one2many_enc_outputs_coord_unselected[img_id]
+                single_proposals_om = single_proposals_logits_om.sigmoid()
                 single_proposals_xyxy_om = box_ops.box_cxcywh_to_xyxy(single_proposals_om)
                 keep_om = nms(single_proposals_xyxy_om, single_scores_om, iou_thr)
-                one2many_scores_list.append(single_scores_om[keep_om])
-                one2many_proposals_list.append(single_proposals_om[keep_om])
+                one2many_scores_list.append(single_scores_om[keep_om][:topk_o2m])
+                one2many_proposals_list.append(single_proposals_logits_om[keep_om][:topk_o2m])
+                one2many_queries_list.append(output_memory[img_id][keep_om][:topk_o2m])
+
+            def align_tensor(inputs, max_len=None):
+                if max_len is None:
+                    max_len = max([len(item) for item in inputs])
+
+                return torch.stack([padding_to(item, max_len) for item in inputs])
+
+            def padding_to(inputs, max=300):
+                if max is None:
+                    return inputs
+                num_padding = max - len(inputs)
+                if inputs.dim() > 1:
+                    padding = inputs.new_zeros(num_padding,
+                                               *inputs.size()[1:],
+                                               dtype=inputs.dtype)
+                else:
+                    padding = inputs.new_zeros(num_padding, dtype=inputs.dtype)
+                inputs = torch.cat([inputs, padding], dim=0)
+                return inputs
+
+            # one2one_scores_tensor = align_tensor(one2one_scores_list, max_len=topk)
+            one2one_proposals_tensor = align_tensor(one2one_proposals_list, max_len=topk)
+            one2one_queries_tensor = align_tensor(one2one_queries_list, max_len=topk)
+            # one2many_scores_tensor = align_tensor(one2many_scores_list, max_len=topk_o2m)
+            one2many_proposals_tensor = align_tensor(one2many_proposals_list, max_len=topk_o2m)
+            one2many_queries_tensor = align_tensor(one2many_queries_list, max_len=topk_o2m)
+
+            # scores_tensor = torch.cat([one2one_scores_tensor, one2many_scores_tensor], dim=1)
+            proposals_tensor = torch.cat([one2one_proposals_tensor, one2many_proposals_tensor], dim=1)
+            queries_tensor = torch.cat([one2one_queries_tensor, one2many_queries_tensor], dim=1)
+
+            refpoint_embed_undetach = proposals_tensor # unsigmoid
+            refpoint_embed = refpoint_embed_undetach.detach()
+
+            tgt_undetach = queries_tensor  # unsigmoid
+            tgt = tgt_undetach.detach()
 
             # 原版
             # topk = self.num_queries
@@ -498,9 +537,9 @@ class MaskDINODecoder(nn.Module):
             # from maskdino.analysis.tool_lab import check_topk_proposals
             # check_topk_proposals(topk_proposals, level_start_index)
 
-            refpoint_embed_undetach = torch.gather(enc_outputs_coord_unselected, 1,
-                                                   topk_proposals.unsqueeze(-1).repeat(1, 1, 4))  # unsigmoid
-            refpoint_embed = refpoint_embed_undetach.detach()
+            # refpoint_embed_undetach = torch.gather(enc_outputs_coord_unselected, 1,
+            #                                        topk_proposals.unsqueeze(-1).repeat(1, 1, 4))  # unsigmoid
+            # refpoint_embed = refpoint_embed_undetach.detach()
 
             # debug: 观察偏移点
             # from maskdino.analysis.tool_lab import draw_center_point_on_image
@@ -509,8 +548,8 @@ class MaskDINODecoder(nn.Module):
             # draw_center_point_on_image(refpoint_embed.sigmoid()[0], proposal_boxes.sigmoid()[0])
 
 
-            tgt_undetach = torch.gather(output_memory, 1,
-                                  topk_proposals.unsqueeze(-1).repeat(1, 1, self.hidden_dim))  # unsigmoid
+            # tgt_undetach = torch.gather(output_memory, 1,
+            #                       topk_proposals.unsqueeze(-1).repeat(1, 1, self.hidden_dim))  # unsigmoid
 
             outputs_class, outputs_mask = self.forward_prediction_heads(tgt_undetach.transpose(0, 1), mask_features)
             # ================
@@ -521,7 +560,7 @@ class MaskDINODecoder(nn.Module):
 
             # outputs_dice = self.dice_head(self.dice_head_before_norm(tgt_undetach))
             # ================
-            tgt = tgt_undetach.detach()
+            # tgt = tgt_undetach.detach()
             if self.learn_tgt:
                 tgt = self.query_feat.weight[None].repeat(bs, 1, 1)
             interm_outputs=dict()
@@ -606,25 +645,18 @@ class MaskDINODecoder(nn.Module):
 
             boxes_b = refpoint_embed.sigmoid()
             scores_b = outputs_class.sigmoid().max(-1)[0]
-            from torchvision.ops import nms
-            # from maskdino.utils import box_ops
-            def dqs_keep_mask(boxes_cxcywh: torch.Tensor,
-                              scores: torch.Tensor,
-                              iou_thr: float = 0.8) -> torch.Tensor:
-                """
-                boxes_cxcywh: (nq, 4) normalized
-                scores: (nq,)
-                return: keep_mask (nq,) bool
-                """
-                boxes_xyxy = box_ops.box_cxcywh_to_xyxy(boxes_cxcywh)
-                keep = nms(boxes_xyxy, scores, iou_thr)
-                mask = boxes_cxcywh.new_zeros((boxes_cxcywh.size(0),), dtype=torch.bool)
+
+            def initial_dqs_keep_mask(boxes_cxcywh, scores, iou_thr, one2one_len, one2many_len):
+                one2one_boxes = boxes_cxcywh[:one2one_len]
+                one2one_scores = scores[:one2one_len]
+                keep = nms(one2one_boxes, one2one_scores, iou_thr)
+                mask = torch.zeros((one2one_len + one2many_len,), dtype=torch.bool, device=boxes_cxcywh.device)
                 mask[keep] = True
                 return mask
 
             keep_mask = []
             for b in range(boxes_b.size(0)):
-                keep_mask_b = dqs_keep_mask(boxes_b[b], scores_b[b], iou_thr=0.8)
+                keep_mask_b = initial_dqs_keep_mask(boxes_b[b], scores_b[b], iou_thr=0.8, one2one_len=one2one_len, one2many_len=one2many_len)
                 keep_mask.append(keep_mask_b)
             keep_mask = torch.stack(keep_mask, dim=0)  # (bs, nq)
             initial_keep_mask = keep_mask
@@ -798,6 +830,66 @@ class MaskDINODecoder(nn.Module):
         # debug: 可视化每次 decoder 的输出结果
         # from maskdino.analysis.tool_lab import visualize_decoder_outputs
         # visualize_decoder_outputs(out)
+
+        # 将 out 转换为包含 one-to-many 的格式
+        num_queries_one_to_one = self.num_queries
+        aux_outputs_one_to_many = []
+        for aux_output in out['aux_outputs']:
+            aux_output_one_to_many = {
+                'pred_logits': aux_output['pred_logits'][:, num_queries_one_to_one:],
+                'pred_masks': aux_output['pred_masks'][:, num_queries_one_to_one:] if self.training else None,
+                'pred_boxes': aux_output['pred_boxes'][:, num_queries_one_to_one:],
+                'pred_logits_iou': aux_output['pred_logits_iou'][:, num_queries_one_to_one:],
+            }
+            aux_outputs_one_to_many.append(aux_output_one_to_many)
+        # aux_outputs = []
+        # for aux in out['aux_outputs']:
+        #     aux_one_to_one = {
+        #         'pred_logits': aux['pred_logits'][:, :num_queries_one_to_one],
+        #         'pred_masks': aux['pred_masks'][:, :num_queries_one_to_one] if self.training else None,
+        #         'pred_boxes': aux['pred_boxes'][:, :num_queries_one_to_one],
+        #     }
+        #     aux_outputs.append(aux_one_to_one)
+        # interm_outputs = out['interm_outputs']
+        # interm_outputs_one_to_many = {
+        #     'pred_logits': interm_outputs['pred_logits'].repeat(1, 5, 1),
+        #     'pred_masks': interm_outputs['pred_masks'].repeat(1, 5, 1, 1),
+        #     'pred_boxes': interm_outputs['pred_boxes'].repeat(1, 5, 1),
+        # }
+        # interm_outputs_one_to_many = interm_outputs
+        interm_outputs_one_to_many = {
+            'pred_logits': interm_outputs['pred_logits'][:, num_queries_one_to_one:],
+            'pred_masks': interm_outputs['pred_masks'][:, num_queries_one_to_one:],
+            'pred_boxes': interm_outputs['pred_boxes'][:, num_queries_one_to_one:],
+            'pred_logits_iou': interm_outputs['pred_logits_iou'][:, num_queries_one_to_one:],
+        }
+        # out_one_to_many = {
+        #     # 'pred_logits': out['pred_logits'][:, :num_queries_one_to_one],
+        #     # 'pred_masks': out['pred_masks'][:, :num_queries_one_to_one],
+        #     # 'pred_boxes': out['pred_boxes'][:, :num_queries_one_to_one],
+        #     'pred_logits_one_to_many': out['pred_logits'][:, num_queries_one_to_one:],
+        #     'pred_masks_one_to_many': out['pred_masks'][:, num_queries_one_to_one:],
+        #     'pred_boxes_one_to_many': out['pred_boxes'][:, num_queries_one_to_one:],
+        #     # 'aux_outputs': aux_outputs,
+        #     'aux_outputs_one_to_many': aux_outputs_one_to_many,
+        #     # 'interm_outputs': interm_outputs,
+        #     'interm_outputs_one_to_many': interm_outputs_one_to_many,
+        # }
+        out_one_to_many = {
+            # 'pred_logits': out['pred_logits'][:, :num_queries_one_to_one],
+            # 'pred_masks': out['pred_masks'][:, :num_queries_one_to_one],
+            # 'pred_boxes': out['pred_boxes'][:, :num_queries_one_to_one],
+            'pred_logits': out['pred_logits'][:, num_queries_one_to_one:],
+            'pred_masks': out['pred_masks'][:, num_queries_one_to_one:],
+            'pred_boxes': out['pred_boxes'][:, num_queries_one_to_one:],
+            'pred_logits_iou': out['pred_logits_iou'][:, num_queries_one_to_one:],
+            # 'aux_outputs': aux_outputs,
+            'aux_outputs': aux_outputs_one_to_many,
+            # 'interm_outputs': interm_outputs,
+            'interm_outputs': interm_outputs_one_to_many,
+        }
+
+
         bs = out['pred_logits'].shape[0]
         if bs == 1:
             distinct_masks.insert(0, initial_keep_mask)
@@ -815,10 +907,18 @@ class MaskDINODecoder(nn.Module):
                 if aux.get('pred_masks', None) is not None:
                     aux['pred_masks'] = aux['pred_masks'][:, m, :, :]
                 aux['pred_logits_iou'] = aux['pred_logits_iou'][:, m, :]
+            interm_outputs = out['interm_outputs']
+            interm_outputs['pred_logits'] = interm_outputs['pred_logits'][:, :num_queries_one_to_one]
+            interm_outputs['pred_boxes'] = interm_outputs['pred_boxes'][:, :num_queries_one_to_one]
+            interm_outputs['pred_masks'] = interm_outputs['pred_masks'][:, :num_queries_one_to_one]
+            interm_outputs['pred_logits_iou'] = interm_outputs['pred_logits_iou'][:, :num_queries_one_to_one]
+            out['interm_outputs'] = interm_outputs
         else:
             raise ValueError(f"Batch size {bs} != 1")
 
-        return out, mask_dict
+
+
+        return out, out_one_to_many, mask_dict
 
     def forward_prediction_heads(self, output, mask_features, pred_mask=True):
         decoder_output = self.decoder_norm(output)

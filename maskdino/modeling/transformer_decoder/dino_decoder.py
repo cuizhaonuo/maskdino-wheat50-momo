@@ -201,18 +201,17 @@ class TransformerDecoder(nn.Module):
 
                 from torchvision.ops import nms
                 from maskdino.utils import box_ops
-                def dqs_keep_mask(boxes_cxcywh: torch.Tensor,
-                                  scores: torch.Tensor,
-                                  iou_thr: float = 0.8) -> torch.Tensor:
-                    """
-                    boxes_cxcywh: (nq, 4) normalized
-                    scores: (nq,)
-                    return: keep_mask (nq,) bool
-                    """
-                    boxes_xyxy = box_ops.box_cxcywh_to_xyxy(boxes_cxcywh)
-                    keep = nms(boxes_xyxy, scores, iou_thr)
-                    mask = boxes_cxcywh.new_zeros((boxes_cxcywh.size(0),), dtype=torch.bool)
-                    mask[keep] = True
+
+                one2one_len = 900
+                one2many_len = 1350
+
+                def dqs_keep_mask(boxes_cxcywh, scores, iou_thr=0.8):
+                    one2one_boxes = boxes_cxcywh[:one2one_len]
+                    one2one_scores = scores[:one2one_len]
+                    one2one_boxes_xyxy = box_ops.box_cxcywh_to_xyxy(one2one_boxes)
+                    keep_one2one = nms(one2one_boxes_xyxy, one2one_scores, iou_thr)
+                    mask = torch.zeros((one2one_len + one2many_len,), device=boxes_cxcywh.device, dtype=torch.bool)
+                    mask[keep_one2one] = True
                     return mask
 
                 keep_mask = []
@@ -222,16 +221,59 @@ class TransformerDecoder(nn.Module):
                 keep_mask = torch.stack(keep_mask, dim=0) # (bs, nq)
                 distinct_masks.append(keep_mask)
 
-                if keep_mask.size(0) == 1:  # bs==1
-                    keep = keep_mask[0]  # (nq,)
-                    idx = keep.nonzero(as_tuple=False).view(-1)
-                    if idx.numel() == 0:
-                        idx = scores_b[0].argmax().view(1)
-                    new_tgt_mask = torch.ones((keep.numel(), keep.numel()),
-                                              device=device, dtype=torch.bool)
-                    new_tgt_mask[idx, :] = False
-                    new_tgt_mask[:, idx] = False
-                    tgt_mask = new_tgt_mask
+                # 目前只是支持 bs=1 的情况
+                if keep_mask.size(0) == 1:
+                    bs1_mask = keep_mask[0]  # (nq,)
+                    idx = bs1_mask.nonzero()
+                    attn_mask = torch.ones((one2one_len, one2one_len), device=device, dtype=torch.bool)
+                    attn_mask[idx, :] = False
+                    attn_mask[:, idx] = False
+                    tgt_mask[:one2one_len, :one2one_len] = attn_mask
+
+                # if keep_mask.size(0) == 1:  # bs==1
+                #     keep = keep_mask[0]  # (nq,)
+                #     idx = keep.nonzero(as_tuple=False).view(-1)
+                #     if idx.numel() == 0:
+                #         idx = scores_b[0].argmax().view(1)
+                #     new_tgt_mask = torch.ones((keep.numel(), keep.numel()),
+                #                               device=device, dtype=torch.bool)
+                #     new_tgt_mask[idx, :] = False
+                #     new_tgt_mask[:, idx] = False
+                #     tgt_mask = new_tgt_mask
+
+                # from torchvision.ops import nms
+                # from maskdino.utils import box_ops
+                # def dqs_keep_mask(boxes_cxcywh: torch.Tensor,
+                #                   scores: torch.Tensor,
+                #                   iou_thr: float = 0.8) -> torch.Tensor:
+                #     """
+                #     boxes_cxcywh: (nq, 4) normalized
+                #     scores: (nq,)
+                #     return: keep_mask (nq,) bool
+                #     """
+                #     boxes_xyxy = box_ops.box_cxcywh_to_xyxy(boxes_cxcywh)
+                #     keep = nms(boxes_xyxy, scores, iou_thr)
+                #     mask = boxes_cxcywh.new_zeros((boxes_cxcywh.size(0),), dtype=torch.bool)
+                #     mask[keep] = True
+                #     return mask
+                #
+                # keep_mask = []
+                # for b in range(boxes_b.size(0)):
+                #     keep_mask_b = dqs_keep_mask(boxes_b[b], scores_b[b], iou_thr=0.8)
+                #     keep_mask.append(keep_mask_b)
+                # keep_mask = torch.stack(keep_mask, dim=0) # (bs, nq)
+                # distinct_masks.append(keep_mask)
+                #
+                # if keep_mask.size(0) == 1:  # bs==1
+                #     keep = keep_mask[0]  # (nq,)
+                #     idx = keep.nonzero(as_tuple=False).view(-1)
+                #     if idx.numel() == 0:
+                #         idx = scores_b[0].argmax().view(1)
+                #     new_tgt_mask = torch.ones((keep.numel(), keep.numel()),
+                #                               device=device, dtype=torch.bool)
+                #     new_tgt_mask[idx, :] = False
+                #     new_tgt_mask[:, idx] = False
+                #     tgt_mask = new_tgt_mask
 
         # debug: 对每一层的 attn_output_weights 进行分析
         # stacked_attn_output_weights = torch.stack(attn_output_weights_list, dim=0).squeeze() # (9, 300, 300)
