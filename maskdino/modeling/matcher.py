@@ -10,13 +10,14 @@ Modules to compute the matching cost and solve the corresponding LSAP.
 """
 import torch
 import torch.nn.functional as F
+from mpmath import inf
 from scipy.optimize import linear_sum_assignment
 from torch import nn
 from torch.cuda.amp import autocast
 
 from detectron2.projects.point_rend.point_features import point_sample
 
-from maskdino.utils.box_ops import generalized_box_iou,box_cxcywh_to_xyxy
+from maskdino.utils.box_ops import generalized_box_iou,box_cxcywh_to_xyxy, box_iou
 
 from torch.utils.tensorboard import SummaryWriter
 
@@ -141,10 +142,13 @@ class HungarianMatcher(nn.Module):
                 print("source cxcywh:", out_bbox[idx])
                 raise
 
+            mask_iou = None
             if 'box' in cost:
                 tgt_bbox=targets[b]["boxes"]
                 cost_bbox = torch.cdist(out_bbox, tgt_bbox, p=1)
                 cost_giou = -generalized_box_iou(box_cxcywh_to_xyxy(out_bbox), box_cxcywh_to_xyxy(tgt_bbox))
+                matrix_iou, _ = box_iou(box_cxcywh_to_xyxy(out_bbox), box_cxcywh_to_xyxy(tgt_bbox))
+                mask_iou = matrix_iou > 0.5
             else:
                 cost_bbox = torch.tensor(0).to(out_bbox)
                 cost_giou = torch.tensor(0).to(out_bbox)
@@ -231,6 +235,7 @@ class HungarianMatcher(nn.Module):
             )
             C = C.reshape(num_queries, -1).cpu()
 
+
             # if 'interm_outputs' in outputs:
             #     interm_outputs = outputs['interm_outputs']
             #     pred_boxes = interm_outputs['pred_boxes'][b].cpu() # (bs, nq, 4) --> (nq, 4)
@@ -308,8 +313,19 @@ class HungarianMatcher(nn.Module):
 
             C_list.append(C)
             # C_list.append(self.cost_class * cost_class.cpu())
-            indices.append(linear_sum_assignment(C))
+            # indices.append(linear_sum_assignment(C))
 
+            if mask_iou is not None:
+                index = linear_sum_assignment(C)
+                rows = []
+                cols = []
+                for row_id, col_id in zip(index[0], index[1]):
+                    if mask_iou[row_id, col_id]:
+                        rows.append(row_id)
+                        cols.append(col_id)
+                indices.append((rows, cols))
+            else:
+                indices.append(linear_sum_assignment(C))
 
         # debug: 统计每个query被匹配的次数
         # from maskdino.analysis.tool_lab import count_query_frequency

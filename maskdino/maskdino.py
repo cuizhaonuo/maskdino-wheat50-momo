@@ -327,7 +327,7 @@ class MaskDINO(nn.Module):
                         t['boxes'] = t['boxes'].repeat(k_one2many, 1)
                     return src_targets
 
-                multi_targets = duplicate_targets(multi_targets, k_one2many=18)
+                multi_targets = duplicate_targets(multi_targets, k_one2many=6)
                 # outputs_one_to_many = dict()
                 # outputs_one_to_many['pred_logits'] = outputs_one2many['pred_logits_one_to_many']
                 # outputs_one_to_many['pred_boxes'] = outputs_one2many['pred_boxes_one_to_many']
@@ -386,7 +386,7 @@ class MaskDINO(nn.Module):
         else:
 
             # 在推理过程中 aux_outputs.pred_masks 是 None，但是在训练的过程中是 (bs, num_queries, H/4, W/4)
-            outputs, _ = self.sem_seg_head(features)
+            outputs, _, _ = self.sem_seg_head(features)
             # test the outputs of interm_outputs and aux_outputs
             # ...
             # outputs = outputs['interm_outputs']
