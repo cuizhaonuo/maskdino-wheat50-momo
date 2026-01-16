@@ -387,45 +387,59 @@ class DeformableTransformerDecoderLayer(nn.Module):
         query = key = tgt + tgt_query_pos
         value = tgt
         '''
-        # self attention
-        attn_output_weights = None
-        # self.self_attn = None
-        debug = False
-        if self.self_attn is not None and not debug:
-            q = k = self.with_pos_embed(tgt, tgt_query_pos)
-            tgt2 = self.self_attn(q, k, tgt, attn_mask=self_attn_mask)[0]
-            # (nq, bs, d_model), (bs, nq, nq)
-            # tgt2, attn_output_weights = self.self_attn(q, k, tgt, attn_mask=self_attn_mask, average_attn_weights=True)
+        num_queries = 900
+        o2o_tgt = tgt[:num_queries]
+        o2o_tgt_query_pos = tgt_query_pos[:num_queries]
+        o2o_self_attn_mask = self_attn_mask[:num_queries, :num_queries]
 
-            # debug: 可视化一个 num_queries x num_queries 的 attention mask 矩阵
-            # from maskdino.analysis.tool_lab import vis_attention_matrix
-            # vis_attention_matrix(attn_output_weights[0])
-            # from maskdino.ctx import attn_output_weights_ctx
-            # attn_output_weights_ctx.set(attn_output_weights)
+        o2m_tgt = tgt[num_queries:]
 
-            # gated attention
-            # tgt, score = self.query_embed(tgt).split([self.d_model, self.d_model], dim=-1)
-            # q = k = self.with_pos_embed(tgt, tgt_query_pos)
-            # tgt2 = self.self_attn(q, k, tgt, attn_mask=self_attn_mask)[0]
-            # tgt2 = tgt2 * score.sigmoid()
+        if self.self_attn is not None:
+            q = k = self.with_pos_embed(o2o_tgt, o2o_tgt_query_pos)
+            o2o_tgt2 = self.self_attn(q, k, o2o_tgt, attn_mask=o2o_self_attn_mask)[0]
+            o2o_tgt = o2o_tgt + self.dropout2(o2o_tgt2)
+            o2o_tgt = self.norm2(o2o_tgt)
+        tgt = torch.cat([o2o_tgt, o2m_tgt], dim=0)
 
-            # debug: 可视化 attention weights
-            # tgt2, attn_output_weights = self.self_attn(q, k, tgt, attn_mask=self_attn_mask, average_attn_weights=False)
-            # from maskdino.analysis.tool_lab import visualize_attn_weights
-            # visualize_attn_weights(attn_output_weights[0], average_attn_weights=False)
-
-            # debug: 可视化每个 head 的最大 attention 权重对应的索引
-            # from maskdino.analysis.tool_lab import visualize_attn_indices
-            # visualize_attn_indices(attn_output_weights[0])
-            # from maskdino.analysis.tool_lab import visualize_attn_indices_heatmap
-            # visualize_attn_indices_heatmap(attn_output_weights[0])
-
-            # debug: 将 attn_indices 保存到 csv 文件中，一行一行写入
-            # from maskdino.analysis.tool_lab import save_attn_indices_to_csv
-            # save_attn_indices_to_csv(attn_output_weights[0])
-
-            tgt = tgt + self.dropout2(tgt2)
-            tgt = self.norm2(tgt)
+        # # self attention
+        # attn_output_weights = None
+        # # self.self_attn = None
+        # debug = False
+        # if self.self_attn is not None and not debug:
+        #     q = k = self.with_pos_embed(tgt, tgt_query_pos)
+        #     tgt2 = self.self_attn(q, k, tgt, attn_mask=self_attn_mask)[0]
+        #     # (nq, bs, d_model), (bs, nq, nq)
+        #     # tgt2, attn_output_weights = self.self_attn(q, k, tgt, attn_mask=self_attn_mask, average_attn_weights=True)
+        #
+        #     # debug: 可视化一个 num_queries x num_queries 的 attention mask 矩阵
+        #     # from maskdino.analysis.tool_lab import vis_attention_matrix
+        #     # vis_attention_matrix(attn_output_weights[0])
+        #     # from maskdino.ctx import attn_output_weights_ctx
+        #     # attn_output_weights_ctx.set(attn_output_weights)
+        #
+        #     # gated attention
+        #     # tgt, score = self.query_embed(tgt).split([self.d_model, self.d_model], dim=-1)
+        #     # q = k = self.with_pos_embed(tgt, tgt_query_pos)
+        #     # tgt2 = self.self_attn(q, k, tgt, attn_mask=self_attn_mask)[0]
+        #     # tgt2 = tgt2 * score.sigmoid()
+        #
+        #     # debug: 可视化 attention weights
+        #     # tgt2, attn_output_weights = self.self_attn(q, k, tgt, attn_mask=self_attn_mask, average_attn_weights=False)
+        #     # from maskdino.analysis.tool_lab import visualize_attn_weights
+        #     # visualize_attn_weights(attn_output_weights[0], average_attn_weights=False)
+        #
+        #     # debug: 可视化每个 head 的最大 attention 权重对应的索引
+        #     # from maskdino.analysis.tool_lab import visualize_attn_indices
+        #     # visualize_attn_indices(attn_output_weights[0])
+        #     # from maskdino.analysis.tool_lab import visualize_attn_indices_heatmap
+        #     # visualize_attn_indices_heatmap(attn_output_weights[0])
+        #
+        #     # debug: 将 attn_indices 保存到 csv 文件中，一行一行写入
+        #     # from maskdino.analysis.tool_lab import save_attn_indices_to_csv
+        #     # save_attn_indices_to_csv(attn_output_weights[0])
+        #
+        #     tgt = tgt + self.dropout2(tgt2)
+        #     tgt = self.norm2(tgt)
 
         # cross attention
         if self.key_aware_type is not None:
@@ -461,6 +475,6 @@ class DeformableTransformerDecoderLayer(nn.Module):
         # ffn
         tgt = self.forward_ffn(tgt)
 
-        return tgt, attn_output_weights
+        return tgt, None
 
 
