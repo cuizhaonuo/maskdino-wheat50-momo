@@ -14,7 +14,7 @@ SOLVER:
 MODEL:
   MaskDINO:
     LEARN_TGT: false
-    DN: 'no'
+    DN: seg
     NUM_OBJECT_QUERIES: 900 # 900 + 1500
     # COST
     COST_BOX_WEIGHT: 5.0

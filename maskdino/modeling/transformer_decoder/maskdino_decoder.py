@@ -618,6 +618,15 @@ class MaskDINODecoder(nn.Module):
         # 此处 tgt 变成了 (bs, dn_pad + num_queries, hidden_dim)，content query + denoising query
         # 增加了 dn_pad 个 denoising query
 
+        if self.dn != "no" and self.training and mask_dict is not None:
+            refpoint_embed=torch.cat([input_query_bbox,refpoint_embed],dim=1)
+
+        tgt_len = tgt.shape[1]
+        tgt_mask_new = torch.ones((tgt_len, tgt_len), device=tgt.device).bool()
+        tgt_mask_new[-one2many_len:, -one2many_len:] = False
+        tgt_mask_new[:-one2many_len, :-one2many_len] = tgt_mask if tgt_mask is not None else False
+        tgt_mask = tgt_mask_new
+
         def get_refpoint_embed(outputs_mask):
             flaten_mask = outputs_mask.detach().flatten(0, 1)
             h, w = outputs_mask.shape[-2:]
@@ -643,22 +652,30 @@ class MaskDINODecoder(nn.Module):
             # tgt_with_bbox_undetach = torch.concat([refpoint_embed_undetach, tgt], dim=-1)
             # outputs_iou = self.iou_head(self.iou_head_before_norm(tgt_with_bbox_undetach))
 
-            boxes_b = refpoint_embed.sigmoid()
-            scores_b = outputs_class.sigmoid().max(-1)[0]
 
-            def initial_dqs_keep_mask(boxes_cxcywh, scores, iou_thr, one2one_len, one2many_len):
-                one2one_boxes = boxes_cxcywh[:one2one_len]
-                one2one_scores = scores[:one2one_len]
-                keep = nms(one2one_boxes, one2one_scores, iou_thr)
-                mask = torch.zeros((one2one_len + one2many_len,), dtype=torch.bool, device=boxes_cxcywh.device)
-                mask[keep] = True
-                return mask
+            def get_initial_keep_mask(out_boxes, out_classes, one2one_len=900, one2many_len=1350):
+                boxes_b = out_boxes.sigmoid()
+                scores_b = out_classes.sigmoid().max(-1)[0]
 
-            keep_mask = []
-            for b in range(boxes_b.size(0)):
-                keep_mask_b = initial_dqs_keep_mask(boxes_b[b], scores_b[b], iou_thr=0.8, one2one_len=one2one_len, one2many_len=one2many_len)
-                keep_mask.append(keep_mask_b)
-            keep_mask = torch.stack(keep_mask, dim=0)  # (bs, nq)
+                def initial_dqs_keep_mask(boxes_cxcywh, scores, iou_thr, one2one_len, one2many_len):
+                    one2one_boxes = boxes_cxcywh[:one2one_len]
+                    one2one_scores = scores[:one2one_len]
+                    keep = nms(one2one_boxes, one2one_scores, iou_thr)
+                    mask = torch.zeros((one2one_len + one2many_len,), dtype=torch.bool, device=boxes_cxcywh.device)
+                    mask[keep] = True
+                    return mask
+
+                keep_mask = []
+                for b in range(boxes_b.size(0)):
+                    keep_mask_b = initial_dqs_keep_mask(boxes_b[b], scores_b[b], iou_thr=0.8, one2one_len=one2one_len, one2many_len=one2many_len)
+                    keep_mask.append(keep_mask_b)
+                keep_mask = torch.stack(keep_mask, dim=0)  # (bs, nq)
+                return keep_mask
+            dn_query_len = mask_dict['pad_size'] if mask_dict is not None else 0
+            ddq_boxes = refpoint_embed[:, dn_query_len:dn_query_len + self.num_queries, :]
+            ddq_classes = outputs_class[:, dn_query_len:dn_query_len + self.num_queries, :]
+            keep_mask = get_initial_keep_mask(ddq_boxes, ddq_classes, one2one_len=one2one_len, one2many_len=one2many_len)
+            # tgt_mask[dn_query_len:dn_query_len + self.num_queries, dn_query_len:dn_query_len + self.num_queries]=keep_mask
             initial_keep_mask = keep_mask
 
             # debug: 查看推理时每一层的预测结果
@@ -667,48 +684,6 @@ class MaskDINODecoder(nn.Module):
             predictions_class.append(outputs_class)
             predictions_mask.append(outputs_mask)
             predictions_iou.append(outputs_iou)
-
-        if self.dn != "no" and self.training and mask_dict is not None:
-            refpoint_embed=torch.cat([input_query_bbox,refpoint_embed],dim=1)
-        # 此处 refpoint_embed 变成了 (bs, dn_pad + num_queries, 4)，position query + denoising query
-
-        # 此处可以取消，位置编码由 two-stage 阶段产生 select 1800
-        # # 增加 one-to-many query
-        # # 位置编码进行复制
-        # refpoint_embed_one_to_one = refpoint_embed[:, -self.num_queries:, :]
-        # refpoint_embed_one_to_many = refpoint_embed_one_to_one.repeat(1, 5, 1)
-        # refpoint_embed = torch.cat([refpoint_embed, refpoint_embed_one_to_many],
-        #                            dim=1)  # (bs, dn_queries + one-to-one + one-to-many, 4)
-
-        # 此处必须添加
-        # 增加 one-to-many query
-        # 现在默认 denoising query 是添加的，tgt = [denoising query, one-to-one matching query, one-to-many matching query]
-        # query_total_len = tgt_len = tgt.shape[1]
-        # tgt_mask_new = torch.ones((tgt_len, tgt_len), device=tgt.device).bool()
-        # group_len = int(mask_dict['pad_size'] / 2)
-        # group0_start = 0
-        # group1_start = group_len
-        # query_one_to_one_start = group_len * 2
-        # query_one_to_many_start = mask_dict['pad_size'] + 300
-        # query_one_to_one_len = self.num_queries
-        # query_one_to_many_len = self.num_queries * 5
-        # tgt_mask_new[group0_start:group0_start + group_len, group0_start:group0_start + group_len] = False
-        # tgt_mask_new[group0_start:group0_start + group_len, query_one_to_one_start:] = False
-        # tgt_mask_new[group1_start:group1_start + group_len, group1_start:] = False
-        # tgt_mask_new[query_one_to_one_start: query_one_to_one_start + query_one_to_one_len,
-        # query_one_to_one_start: query_one_to_one_start + query_one_to_one_len] = False
-        # tgt_mask_new[query_one_to_many_start:, query_one_to_many_start:] = False
-        # tgt_mask = tgt_mask_new
-
-        # 给出一个没有 dn 版本的
-        tgt_len = tgt.shape[1]
-        tgt_mask_new = torch.ones((tgt_len, tgt_len), device=tgt.device).bool()
-        query_one_to_one_len = 900
-        # query_one_to_many_len = 1500
-        tgt_mask_new[:query_one_to_one_len, :query_one_to_one_len] = False
-        tgt_mask_new[query_one_to_one_len:, query_one_to_one_len:] = False
-        tgt_mask = tgt_mask_new
-        # 增加了 dn_pad 个 denoising query
 
         '''
         Result 
@@ -741,6 +716,9 @@ class MaskDINODecoder(nn.Module):
             tgt_mask=tgt_mask,
             pred_head=self
         )
+        if mask_dict is not None:
+            num_dn_queries = mask_dict['pad_size']
+            distinct_masks = [mask[:, num_dn_queries:] for mask in distinct_masks]
         # 为所有 decoder 层的输出，添加预测头，得到每一层的分类和掩码预测，所有的特征层共用一个预测头，也就是说参数是共享的
         # PS：类别和掩码预测头的参数也是共享的，但是预测框的参数不共享
         # 所有的 hs 都是包含了 denoising query 的

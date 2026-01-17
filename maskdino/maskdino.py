@@ -335,7 +335,7 @@ class MaskDINO(nn.Module):
                 # outputs_one_to_many['aux_outputs'] = outputs_one2many['aux_outputs_one_to_many']
                 # outputs_one_to_many['interm_outputs'] = outputs_one2many['interm_outputs_one_to_many']
                 # mask_dict = None # 表示关闭 dn-query
-                losses_one2many, _ = self.criterion(outputs_one2many, multi_targets, mask_dict)
+                losses_one2many, _ = self.criterion(outputs_one2many, multi_targets, None)
                 lambda_one2many = 1.0
                 for key, value in losses_one2many.items():
                     losses[key + '_one2many'] = value * lambda_one2many
