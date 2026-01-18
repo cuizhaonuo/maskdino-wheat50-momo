@@ -5,8 +5,10 @@ SOLVER:
   CHECKPOINT_PERIOD: 200   # 或者 500，随你
   WARMUP_ITERS: 50         # 534 * (2000/50000) ≈ 21，这里取 50 更稳
   STEPS: [850, 960]        # 21333/50000≈0.4267, 24000/50000≈0.48
-  IMS_PER_BATCH: 3         # 先不动，避免引入新变量
+  IMS_PER_BATCH: 1         # 先不动，避免引入新变量
   BASE_LR: 0.0001          # 先不动；如果你只训head或冻结backbone，再调整
 OUTPUT_DIR: output/maskdino_swinl-time-10-19-20-00-v1-patch
+
 MODEL:
-  NUM_OBJECT_QUERIES: 900
+  MaskDINO:
+    NUM_OBJECT_QUERIES: 300
