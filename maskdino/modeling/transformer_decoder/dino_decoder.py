@@ -14,6 +14,8 @@ from torch.cuda.amp import autocast
 from ...utils.utils import MLP, _get_clones, _get_activation_fn, gen_sineembed_for_position, inverse_sigmoid
 from ..pixel_decoder.ops.modules import MSDeformAttn
 
+from torchvision.ops import nms
+from maskdino.utils import box_ops
 
 class TransformerDecoder(nn.Module):
 
@@ -28,8 +30,17 @@ class TransformerDecoder(nn.Module):
                  rm_dec_query_scale=True,
                  dec_layer_share=False,
                  dec_layer_dropout_prob=None,
+                 ddq_enabled=True,
+                 o2m_matching_enabled=True,
+                 num_queries=900,
+                 num_queries_o2m=1350,
                  ):
         super().__init__()
+        self.ddq_enabled = ddq_enabled
+        self.o2m_matching_enabled = o2m_matching_enabled
+        self.num_queries = num_queries
+        self.num_queries_o2m = num_queries_o2m
+
         if num_layers > 0:
             self.layers = _get_clones(decoder_layer, num_layers, layer_share=dec_layer_share)
         else:
@@ -190,33 +201,37 @@ class TransformerDecoder(nn.Module):
             decoder_output = pred_head.decoder_norm(self.norm(output))
             decoder_output = decoder_output.transpose(0, 1)
             outputs_class = pred_head.class_embed(decoder_output)
-            outputs_class = outputs_class.transpose(0, 1) # (nq, bs, num_classes)
+            outputs_class = outputs_class.transpose(0, 1)  # (nq, bs, num_classes)
             layer_classes = outputs_class
 
-            if layer_boxes is not None:
+            if self.ddq_enabled and (layer_boxes is not None):
                 scores = layer_classes.sigmoid().max(-1)[0]  # (nq, bs)
                 boxes = layer_boxes  # (nq, bs, 4)
                 scores_b = scores.transpose(0, 1).contiguous()  # (bs, nq)
                 boxes_b = boxes.transpose(0, 1).contiguous()  # (bs, nq, 4)
 
-                from torchvision.ops import nms
-                from maskdino.utils import box_ops
+                # ====== dn + one2one (+ optional one2many) ======
+                # 你自己已有的 one2one 数
+                one2one_len = self.num_queries
 
-                # ====== 这里改成 dn + one2one + one2many ======
-                   # 你自己已有的 dn query 数（例如 dn_meta['pad_size'] 或 dn_num）
-                one2one_len = 900
-                one2many_len = 1350
+                # one2many 是否存在由开关控制
+                one2many_len = self.num_queries_o2m if self.training and self.o2m_matching_enabled else 0
+
+                # dn_len 从总长度里扣出来
                 dn_len = boxes_b.size(1) - one2one_len - one2many_len
                 total_len = dn_len + one2one_len + one2many_len
 
-                def dqs_keep_mask_dn_one2one_one2many(boxes_cxcywh, scores_1d, iou_thr=0.8):
+                def dqs_keep_mask_dn_one2one_one2many(
+                        boxes_cxcywh, scores_1d, dn_len, one2one_len, one2many_len, iou_thr=0.8
+                ):
                     """
-                    boxes_cxcywh: (total_len, 4)  顺序: dn | one2one | one2many
+                    boxes_cxcywh: (total_len, 4)  顺序: dn | one2one | (optional) one2many
                     scores_1d:    (total_len,)
                     return:       (total_len,) bool mask，仅在 one2one 段上置 True(keep)，其余默认 False
                     """
-                    assert boxes_cxcywh.size(0) >= total_len, \
-                        f"expect >= {total_len}, got {boxes_cxcywh.size(0)}"
+                    total_len_local = dn_len + one2one_len + one2many_len
+                    assert boxes_cxcywh.size(0) >= total_len_local, \
+                        f"expect >= {total_len_local}, got {boxes_cxcywh.size(0)}"
 
                     # 只对 one2one 段做 NMS
                     o2o_s = dn_len
@@ -226,60 +241,47 @@ class TransformerDecoder(nn.Module):
                     one2one_scores = scores_1d[o2o_s:o2o_e]  # (one2one_len,)
 
                     one2one_boxes_xyxy = box_ops.box_cxcywh_to_xyxy(one2one_boxes)
-                    keep_local = nms(one2one_boxes_xyxy, one2one_scores, iou_thr)  # 索引范围: [0, one2one_len)
+                    keep_local = nms(one2one_boxes_xyxy, one2one_scores, iou_thr)  # [0, one2one_len)
 
-                    # mask 是全长（dn+one2one+one2many），但只在 one2one 段标 True
-                    mask = torch.zeros((total_len,), device=boxes_cxcywh.device, dtype=torch.bool)
-                    mask[o2o_s + keep_local] = True  # 加 dn 偏移
+                    # mask 是全长（dn+one2one(+one2many)），但只在 one2one 段标 True
+                    mask = torch.zeros((total_len_local,), device=boxes_cxcywh.device, dtype=torch.bool)
+                    mask[o2o_s + keep_local] = True
                     return mask
 
+                # 逐 batch 计算 keep mask
                 keep_mask = []
                 for b in range(boxes_b.size(0)):
                     keep_mask_b = dqs_keep_mask_dn_one2one_one2many(
-                        boxes_b[b], scores_b[b], iou_thr=0.8
+                        boxes_b[b], scores_b[b],
+                        dn_len=dn_len, one2one_len=one2one_len, one2many_len=one2many_len,
+                        iou_thr=0.8
                     )
                     keep_mask.append(keep_mask_b)
-
                 keep_mask = torch.stack(keep_mask, dim=0)  # (bs, total_len)
+
                 distinct_masks.append(keep_mask)
 
-                # 目前只是支持 bs=1 的情况
+                # 目前只支持 bs=1
                 if keep_mask.size(0) == 1:
                     bs1_mask = keep_mask[0]  # (total_len,)
-                    # 只取 one2one 段里 keep 的 index（并变成 one2one 段内部的 local index）
+
                     o2o_s = dn_len
                     o2o_e = dn_len + one2one_len
 
-                    idx_global = bs1_mask[o2o_s:o2o_e].nonzero(as_tuple=False).squeeze(1)  # local: [0, one2one_len)
-                    # 如果你后面希望用 global 下标，也可以：idx_global = idx_local + o2o_s
+                    # one2one 段内部 local index：[0, one2one_len)
+                    idx_local = bs1_mask[o2o_s:o2o_e].nonzero(as_tuple=False).squeeze(1)
 
+                    # one2one 的 self-attn mask：默认全 True(不可见)，保留的 idx 互相可见 -> False
                     attn_mask = torch.ones((one2one_len, one2one_len), device=device, dtype=torch.bool)
-                    attn_mask[idx_global, :] = False
-                    attn_mask[:, idx_global] = False
+                    attn_mask[idx_local, :] = False
+                    attn_mask[:, idx_local] = False
 
-                    # 把 mask 写回 tgt_mask 的 one2one block（注意 dn 偏移）
+                    # 写回 tgt_mask 的 one2one block（注意有 dn 偏移）
                     tgt_mask[o2o_s:o2o_e, o2o_s:o2o_e] = attn_mask
 
-        # debug: 对每一层的 attn_output_weights 进行分析
-        # stacked_attn_output_weights = torch.stack(attn_output_weights_list, dim=0).squeeze() # (9, 300, 300)
-        # from maskdino.ctx import stacked_attn_output_weights_ctx
-        # stacked_attn_output_weights_ctx.set(stacked_attn_output_weights)
+                else:
+                    raise ValueError(f"Batch size {keep_mask.size(0)} != 1")
 
-        # topk_attn_output_weights_indices = torch.topk(stacked_attn_output_weights, k=5, dim=-1)[1].transpose(0, 1) # (300, 9, 5)
-        # selected_topk_attn_output_weights_indices = topk_attn_output_weights_indices[:50] # (50, 9, 5)
-        # for item in selected_topk_attn_output_weights_indices:
-        #     print(item.tolist())
-
-        # for i, attn_output_weights in enumerate(stacked_attn_output_weights):
-        #     topk_attn_output_weights = torch.topk(attn_output_weights, 5, dim=-1)[0]
-        #     selected_topk_attn_output_weights = topk_attn_output_weights[:50]
-
-
-        # 把 batch size 放到第 0 维度
-        # (300, 1, 256) --> (1, 300, 256)
-        # (300, 1, 4) --> (1, 300, 4)
-        # intermediate: [(nq, bs, d_model), ...] --> 【(bs, nq, d_model)， ...]
-        # ref_points: [(nq, bs, 4), ...] --> 【(bs, nq, 4)， ...]
         return [
             [itm_out.transpose(0, 1) for itm_out in intermediate],
             [itm_refpoint.transpose(0, 1) for itm_refpoint in ref_points],
@@ -386,46 +388,6 @@ class DeformableTransformerDecoderLayer(nn.Module):
             o2o_tgt = self.norm2(o2o_tgt)
         tgt = torch.cat([o2o_tgt, o2m_tgt], dim=0)
 
-        # # self attention
-        # attn_output_weights = None
-        # # self.self_attn = None
-        # debug = False
-        # if self.self_attn is not None and not debug:
-        #     q = k = self.with_pos_embed(tgt, tgt_query_pos)
-        #     tgt2 = self.self_attn(q, k, tgt, attn_mask=self_attn_mask)[0]
-        #     # (nq, bs, d_model), (bs, nq, nq)
-        #     # tgt2, attn_output_weights = self.self_attn(q, k, tgt, attn_mask=self_attn_mask, average_attn_weights=True)
-        #
-        #     # debug: 可视化一个 num_queries x num_queries 的 attention mask 矩阵
-        #     # from maskdino.analysis.tool_lab import vis_attention_matrix
-        #     # vis_attention_matrix(attn_output_weights[0])
-        #     # from maskdino.ctx import attn_output_weights_ctx
-        #     # attn_output_weights_ctx.set(attn_output_weights)
-        #
-        #     # gated attention
-        #     # tgt, score = self.query_embed(tgt).split([self.d_model, self.d_model], dim=-1)
-        #     # q = k = self.with_pos_embed(tgt, tgt_query_pos)
-        #     # tgt2 = self.self_attn(q, k, tgt, attn_mask=self_attn_mask)[0]
-        #     # tgt2 = tgt2 * score.sigmoid()
-        #
-        #     # debug: 可视化 attention weights
-        #     # tgt2, attn_output_weights = self.self_attn(q, k, tgt, attn_mask=self_attn_mask, average_attn_weights=False)
-        #     # from maskdino.analysis.tool_lab import visualize_attn_weights
-        #     # visualize_attn_weights(attn_output_weights[0], average_attn_weights=False)
-        #
-        #     # debug: 可视化每个 head 的最大 attention 权重对应的索引
-        #     # from maskdino.analysis.tool_lab import visualize_attn_indices
-        #     # visualize_attn_indices(attn_output_weights[0])
-        #     # from maskdino.analysis.tool_lab import visualize_attn_indices_heatmap
-        #     # visualize_attn_indices_heatmap(attn_output_weights[0])
-        #
-        #     # debug: 将 attn_indices 保存到 csv 文件中，一行一行写入
-        #     # from maskdino.analysis.tool_lab import save_attn_indices_to_csv
-        #     # save_attn_indices_to_csv(attn_output_weights[0])
-        #
-        #     tgt = tgt + self.dropout2(tgt2)
-        #     tgt = self.norm2(tgt)
-
         # cross attention
         if self.key_aware_type is not None:
             if self.key_aware_type == 'mean':
@@ -450,12 +412,6 @@ class DeformableTransformerDecoderLayer(nn.Module):
                                memory_key_padding_mask).transpose(0, 1)
         tgt = tgt + self.dropout1(tgt2)
         tgt = self.norm1(tgt)
-
-        # # self attention
-        # q = k = self.with_pos_embed(tgt, tgt_query_pos)
-        # tgt2 = self.self_attn(q, k, tgt, attn_mask=self_attn_mask)[0]
-        # tgt = tgt + self.dropout2(tgt2)
-        # tgt = self.norm2(tgt)
 
         # ffn
         tgt = self.forward_ffn(tgt)

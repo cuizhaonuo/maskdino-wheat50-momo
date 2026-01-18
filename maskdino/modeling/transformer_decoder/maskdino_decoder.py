@@ -19,6 +19,7 @@ from .dino_decoder import TransformerDecoder, DeformableTransformerDecoderLayer
 from ...utils.utils import MLP, gen_encoder_output_proposals, inverse_sigmoid
 from ...utils import box_ops
 
+from torchvision.ops import nms
 
 TRANSFORMER_DECODER_REGISTRY = Registry("TRANSFORMER_MODULE")
 TRANSFORMER_DECODER_REGISTRY.__doc__ = """
@@ -45,6 +46,7 @@ class MaskDINODecoder(nn.Module):
             num_classes: int,
             hidden_dim: int,
             num_queries: int,
+            # num_queries_o2m: int,
             nheads: int,
             dim_feedforward: int,
             dec_layers: int,
@@ -66,6 +68,14 @@ class MaskDINODecoder(nn.Module):
             query_dim: int = 4,
             dec_layer_share: bool = False,
             semantic_ce_loss: bool = False,
+
+            num_queries_o2m,
+            o2m_matching_enabled,
+            num_targets_k,
+            ddq_enabled,
+            ddq_iou_threshold,
+            layer_wise_iou_enabled,
+            align_loss_enabled,
     ):
         """
         NOTE: this interface is experimental.
@@ -96,6 +106,14 @@ class MaskDINODecoder(nn.Module):
         super().__init__()
 
         assert mask_classification, "Only support mask classification model"
+        self.o2m_matching_enabled = o2m_matching_enabled
+        self.num_queries_o2m = num_queries_o2m
+        self.num_targets_k = num_targets_k
+        self.ddq_enabled = ddq_enabled
+        self.ddq_iou_threshold = ddq_iou_threshold
+        self.layer_wise_iou_enabled = layer_wise_iou_enabled
+        self.align_loss_enabled = align_loss_enabled
+
         self.mask_classification = mask_classification
         self.num_feature_levels = total_num_feature_levels
         self.initial_pred = initial_pred
@@ -115,7 +133,8 @@ class MaskDINODecoder(nn.Module):
         self.semantic_ce_loss = semantic_ce_loss
         # learnable query features
         if not two_stage or self.learn_tgt:
-            self.query_feat = nn.Embedding(self.num_queries, hidden_dim)
+            num_queries = self.num_queries if not self.o2m_matching_enabled else self.num_queries + self.num_queries_o2m
+            self.query_feat = nn.Embedding(num_queries, hidden_dim)
         if not two_stage and initialize_box_type == 'no':
             self.query_embed = nn.Embedding(self.num_queries, 4)
         if two_stage:
@@ -144,16 +163,8 @@ class MaskDINODecoder(nn.Module):
         self.label_enc=nn.Embedding(num_classes,hidden_dim)
         self.mask_embed = MLP(hidden_dim, hidden_dim, mask_dim, 3)
 
-        # self.refpoints_mapping = MLP(4, 16, 16, 1)
-        # self.refpoints_mapping = nn.Linear(4, 64)
-        # self.iou_head = MLP(hidden_dim, hidden_dim, 1, 1)
-        # self.iou_head_before_norm = nn.LayerNorm(hidden_dim)
-
         self.iou_head = MLP(hidden_dim, hidden_dim, 1, 1)
         self.iou_head_before_norm = nn.LayerNorm(hidden_dim)
-
-        # self.dice_head = MLP(hidden_dim, hidden_dim, 1, 1)
-        # self.dice_head_before_norm = nn.LayerNorm(hidden_dim)
 
         # init decoder
         self.decoder_norm = decoder_norm = nn.LayerNorm(hidden_dim)
@@ -165,6 +176,10 @@ class MaskDINODecoder(nn.Module):
                                           d_model=hidden_dim, query_dim=query_dim,
                                           num_feature_levels=self.num_feature_levels,
                                           dec_layer_share=dec_layer_share,
+                                          ddq_enabled = self.ddq_enabled,
+                                          o2m_matching_enabled = self.o2m_matching_enabled,
+                                          num_queries = self.num_queries,
+                                          num_queries_o2m = self.num_queries_o2m,
                                           )
 
         self.hidden_dim = hidden_dim
@@ -201,6 +216,14 @@ class MaskDINODecoder(nn.Module):
         ret["learn_tgt"] = cfg.MODEL.MaskDINO.LEARN_TGT
         ret["total_num_feature_levels"] = cfg.MODEL.SEM_SEG_HEAD.TOTAL_NUM_FEATURE_LEVELS
         ret["semantic_ce_loss"] = cfg.MODEL.MaskDINO.TEST.SEMANTIC_ON and cfg.MODEL.MaskDINO.SEMANTIC_CE_LOSS and ~cfg.MODEL.MaskDINO.TEST.PANOPTIC_ON
+
+        ret["num_queries_o2m"] = cfg.MODEL.MaskDINO.NUM_OBJECT_QUERIES_O2M
+        ret["o2m_matching_enabled"] = cfg.MODEL.MaskDINO.O2M_MATCHING_ENABLED
+        ret["num_targets_k"] = cfg.MODEL.MaskDINO.NUM_TARGETS_K
+        ret["ddq_enabled"] = cfg.MODEL.MaskDINO.DDQ_ENABLED
+        ret["ddq_iou_threshold"] = cfg.MODEL.MaskDINO.DDQ_IOU_THRESHOLD
+        ret["layer_wise_iou_enabled"] = cfg.MODEL.MaskDINO.LAYER_WISE_IOU_ENABLED
+        ret["align_loss_enabled"] = cfg.MODEL.MaskDINO.ALIGN_LOSS_ENABLED
 
         return ret
 
@@ -338,15 +361,20 @@ class MaskDINODecoder(nn.Module):
         outputs_class = outputs_class[:, :, mask_dict['pad_size']:, :]
         output_known_coord = outputs_coord[:, :, :mask_dict['pad_size'], :]
         outputs_coord = outputs_coord[:, :, mask_dict['pad_size']:, :]
-        outputs_known_iou = outputs_iou[:, :, :mask_dict['pad_size'], :]
-        outputs_iou = outputs_iou[:, :, mask_dict['pad_size']:, :]
+
         if outputs_mask is not None:
             output_known_mask = outputs_mask[:, :, :mask_dict['pad_size'], :]
             outputs_mask = outputs_mask[:, :, mask_dict['pad_size']:, :]
-        out = {'pred_logits': output_known_class[-1],
-               'pred_boxes': output_known_coord[-1],
-               'pred_masks': output_known_mask[-1],
-               'pred_logits_iou': outputs_known_iou[-1]}
+        out = {
+            'pred_logits': output_known_class[-1],
+            'pred_boxes': output_known_coord[-1],
+            'pred_masks': output_known_mask[-1],
+        }
+        outputs_known_iou = None
+        if len(outputs_iou) > 0 and outputs_iou is not None:
+            outputs_known_iou = outputs_iou[:, :, :mask_dict['pad_size'], :]
+            outputs_iou = outputs_iou[:, :, mask_dict['pad_size']:, :]
+            out.update({'pred_logits_iou': outputs_known_iou[-1]})
 
         out['aux_outputs'] = self._set_aux_loss(output_known_class, output_known_mask, outputs_known_iou, output_known_coord)
         mask_dict['output_known_lbs_bboxes']=out
@@ -390,14 +418,8 @@ class MaskDINODecoder(nn.Module):
         :param targets: used for denoising training
         """
 
-        # debug: encoder 输出的 feature 画热力图
-        # x: dict of feature maps Tensor (B, C, H, W)
-        # from maskdino.analysis.tool_lab import draw_encoder_heatmap
-        # draw_encoder_heatmap(x)
-
         assert len(x) == self.num_feature_levels
         device = x[0].device
-        # size_list = []
         # disable mask, it does not affect performance
         enable_mask = 0
         if masks is not None:
@@ -412,7 +434,6 @@ class MaskDINODecoder(nn.Module):
         for i in range(self.num_feature_levels):
             idx=self.num_feature_levels-1-i
             bs, c , h, w=x[idx].shape
-            # size_list.append(x[i].shape[-2:])
             spatial_shapes.append(x[idx].shape[-2:])
             src_flatten.append(self.input_proj[idx](x[idx]).flatten(2).transpose(1, 2))
             mask_flatten.append(masks[i].flatten(1))
@@ -421,161 +442,140 @@ class MaskDINODecoder(nn.Module):
         spatial_shapes = torch.as_tensor(spatial_shapes, dtype=torch.long, device=src_flatten.device)
         level_start_index = torch.cat((spatial_shapes.new_zeros((1,)), spatial_shapes.prod(1).cumsum(0)[:-1]))
         valid_ratios = torch.stack([self.get_valid_ratio(m) for m in masks], 1)
-        # 以上的代码主要是为了将多尺度的 feature map 展平，并计算相关的空间形状和有效比例
-        # 主要关注：src_flatten, level_start_index
-        # 其中 size_list 没有用到，而 mask_flatten 全为 False，valid_ratios 全是 1 可以不必过多关注
-        # 此处的 mask_flatten 和 valid_ratios 是为了解决解决图像 padding 后的无效区域对注意力机制的影响，但在这里由于没有 padding，所以它们不会影响结果
 
         predictions_class = []
         predictions_mask = []
         predictions_iou = []
         if self.two_stage:
-            output_memory, output_proposals = gen_encoder_output_proposals(src_flatten, mask_flatten, spatial_shapes)
+            # --------------------------------------------------------
+            # 1) encoder outputs
+            # --------------------------------------------------------
+            output_memory, output_proposals = gen_encoder_output_proposals(
+                src_flatten, mask_flatten, spatial_shapes
+            )
             output_memory = self.enc_output_norm(self.enc_output(output_memory))
 
-            enc_outputs_class_unselected = self.class_embed(output_memory)
-            enc_outputs_coord_unselected = self._bbox_embed(
-                output_memory) + output_proposals  # (bs, \sum{hw}, 4) unsigmoid
+            bs = output_memory.shape[0]
+            topk_o2o = self.num_queries
 
-            one2many_enc_outputs_class_unselected = self.one2many_class_embed(output_memory)
-            one2many_enc_outputs_coord_unselected = self._one2many_bbox_embed(
-                output_memory) + output_proposals  # (bs, \sum{hw}, 4) unsigmoid
+            # --------------------------------------------------------
+            # 2) o2o logits (always)
+            # --------------------------------------------------------
+            enc_outputs_class_o2o = self.class_embed(output_memory)
+            enc_outputs_coord_o2o = self._bbox_embed(output_memory) + output_proposals  # (bs, sum(hw), 4) unsigmoid
 
-            # 增加 dense distinct query selection 机制
-            from torchvision.ops import nms
+            # --------------------------------------------------------
+            # 3) o2m logits (ONLY training & enabled)
+            # --------------------------------------------------------
+            use_o2m = bool(self.training and self.o2m_matching_enabled)
+            if use_o2m:
+                topk_o2m = self.num_queries_o2m
+                enc_outputs_class_o2m = self.one2many_class_embed(output_memory)
+                enc_outputs_coord_o2m = self._one2many_bbox_embed(output_memory) + output_proposals  # unsigmoid
 
-            one2one_len = topk = self.num_queries
-            one2many_len = topk_o2m = 1350
-            iou_thr = 0.8
-            num_imgs = enc_outputs_class_unselected.shape[0]
-
-            one2one_scores_list = []
-            one2one_proposals_list = []
-            one2one_queries_list = []
-            one2many_scores_list = []
-            one2many_proposals_list = []
-            one2many_queries_list = []
-
-            for img_id in range(num_imgs):
-                single_scores = enc_outputs_class_unselected[img_id].max(-1)[0].sigmoid()
-                single_proposals_logits = enc_outputs_coord_unselected[img_id]
-                single_proposals = single_proposals_logits.sigmoid()
-                single_proposals_xyxy = box_ops.box_cxcywh_to_xyxy(single_proposals)
-                keep = nms(single_proposals_xyxy, single_scores, iou_thr)
-                one2one_scores_list.append(single_scores[keep][:topk])
-                one2one_proposals_list.append(single_proposals_logits[keep][:topk])
-                one2one_queries_list.append(output_memory[img_id][keep][:topk])
-
-                single_scores_om = one2many_enc_outputs_class_unselected[img_id].max(-1)[0].sigmoid()
-                single_proposals_logits_om = one2many_enc_outputs_coord_unselected[img_id]
-                single_proposals_om = single_proposals_logits_om.sigmoid()
-                single_proposals_xyxy_om = box_ops.box_cxcywh_to_xyxy(single_proposals_om)
-                keep_om = nms(single_proposals_xyxy_om, single_scores_om, iou_thr)
-                one2many_scores_list.append(single_scores_om[keep_om][:topk_o2m])
-                one2many_proposals_list.append(single_proposals_logits_om[keep_om][:topk_o2m])
-                one2many_queries_list.append(output_memory[img_id][keep_om][:topk_o2m])
-
-            def align_tensor(inputs, max_len=None):
-                if max_len is None:
-                    max_len = max([len(item) for item in inputs])
-
-                return torch.stack([padding_to(item, max_len) for item in inputs])
-
-            def padding_to(inputs, max=300):
-                if max is None:
-                    return inputs
-                num_padding = max - len(inputs)
-                if inputs.dim() > 1:
-                    padding = inputs.new_zeros(num_padding,
-                                               *inputs.size()[1:],
-                                               dtype=inputs.dtype)
+            # --------------------------------------------------------
+            # helpers
+            # --------------------------------------------------------
+            def padding_to(x, max_len):
+                if x is None:
+                    return None
+                pad = max_len - x.shape[0]
+                if pad <= 0:
+                    return x[:max_len]
+                if x.dim() > 1:
+                    padding = x.new_zeros(pad, *x.size()[1:], dtype=x.dtype)
                 else:
-                    padding = inputs.new_zeros(num_padding, dtype=inputs.dtype)
-                inputs = torch.cat([inputs, padding], dim=0)
-                return inputs
+                    padding = x.new_zeros(pad, dtype=x.dtype)
+                return torch.cat([x, padding], dim=0)
 
-            # one2one_scores_tensor = align_tensor(one2one_scores_list, max_len=topk)
-            one2one_proposals_tensor = align_tensor(one2one_proposals_list, max_len=topk)
-            one2one_queries_tensor = align_tensor(one2one_queries_list, max_len=topk)
-            # one2many_scores_tensor = align_tensor(one2many_scores_list, max_len=topk_o2m)
-            one2many_proposals_tensor = align_tensor(one2many_proposals_list, max_len=topk_o2m)
-            one2many_queries_tensor = align_tensor(one2many_queries_list, max_len=topk_o2m)
+            def align_tensor(list_of_tensors, max_len):
+                return torch.stack([padding_to(t, max_len) for t in list_of_tensors], dim=0)
 
-            # scores_tensor = torch.cat([one2one_scores_tensor, one2many_scores_tensor], dim=1)
-            proposals_tensor = torch.cat([one2one_proposals_tensor, one2many_proposals_tensor], dim=1)
-            queries_tensor = torch.cat([one2one_queries_tensor, one2many_queries_tensor], dim=1)
+            # --------------------------------------------------------
+            # 4) query selection
+            # --------------------------------------------------------
+            if self.ddq_enabled:
+                # ddq ONLY for o2o
+                iou_thr = self.ddq_iou_threshold
 
-            refpoint_embed_undetach = proposals_tensor # unsigmoid
+                o2o_scores_list, o2o_props_list, o2o_queries_list = [], [], []
+                for img_id in range(bs):
+                    scores = enc_outputs_class_o2o[img_id].max(-1)[0].sigmoid()  # (sum(hw),)
+                    props_logits = enc_outputs_coord_o2o[img_id]  # (sum(hw), 4) unsigmoid
+                    props = props_logits.sigmoid()
+                    props_xyxy = box_ops.box_cxcywh_to_xyxy(props)
+
+                    keep = nms(props_xyxy, scores, iou_thr)
+
+                    o2o_scores_list.append(scores[keep][:topk_o2o])
+                    o2o_props_list.append(props_logits[keep][:topk_o2o])
+                    o2o_queries_list.append(output_memory[img_id][keep][:topk_o2o])
+
+                o2o_proposals_tensor = align_tensor(o2o_props_list, max_len=topk_o2o)
+                o2o_queries_tensor = align_tensor(o2o_queries_list, max_len=topk_o2o)
+
+                # o2m (if enabled) uses ORIGINAL topk (no ddq)
+                if use_o2m:
+                    topk_idx_o2m = torch.topk(enc_outputs_class_o2m.max(-1)[0], topk_o2m, dim=1)[1]
+                    o2m_proposals_tensor = torch.gather(
+                        enc_outputs_coord_o2m, 1, topk_idx_o2m.unsqueeze(-1).repeat(1, 1, 4)
+                    )
+                    o2m_queries_tensor = torch.gather(
+                        output_memory, 1, topk_idx_o2m.unsqueeze(-1).repeat(1, 1, self.hidden_dim)
+                    )
+
+                    proposals_tensor = torch.cat([o2o_proposals_tensor, o2m_proposals_tensor], dim=1)
+                    queries_tensor = torch.cat([o2o_queries_tensor, o2m_queries_tensor], dim=1)
+                else:
+                    proposals_tensor = o2o_proposals_tensor
+                    queries_tensor = o2o_queries_tensor
+
+            else:
+                # ORIGINAL selection for o2o
+                topk_idx_o2o = torch.topk(enc_outputs_class_o2o.max(-1)[0], topk_o2o, dim=1)[1]
+                o2o_proposals_tensor = torch.gather(
+                    enc_outputs_coord_o2o, 1, topk_idx_o2o.unsqueeze(-1).repeat(1, 1, 4)
+                )
+                o2o_queries_tensor = torch.gather(
+                    output_memory, 1, topk_idx_o2o.unsqueeze(-1).repeat(1, 1, self.hidden_dim)
+                )
+
+                if use_o2m:
+                    topk_idx_o2m = torch.topk(enc_outputs_class_o2m.max(-1)[0], topk_o2m, dim=1)[1]
+                    o2m_proposals_tensor = torch.gather(
+                        enc_outputs_coord_o2m, 1, topk_idx_o2m.unsqueeze(-1).repeat(1, 1, 4)
+                    )
+                    o2m_queries_tensor = torch.gather(
+                        output_memory, 1, topk_idx_o2m.unsqueeze(-1).repeat(1, 1, self.hidden_dim)
+                    )
+
+                    proposals_tensor = torch.cat([o2o_proposals_tensor, o2m_proposals_tensor], dim=1)
+                    queries_tensor = torch.cat([o2o_queries_tensor, o2m_queries_tensor], dim=1)
+                else:
+                    proposals_tensor = o2o_proposals_tensor
+                    queries_tensor = o2o_queries_tensor
+
+            # --------------------------------------------------------
+            # 5) finalize (detach)
+            # --------------------------------------------------------
+            refpoint_embed_undetach = proposals_tensor  # unsigmoid
             refpoint_embed = refpoint_embed_undetach.detach()
 
-            tgt_undetach = queries_tensor  # unsigmoid
+            tgt_undetach = queries_tensor
             tgt = tgt_undetach.detach()
 
-            # 原版
-            # topk = self.num_queries
-            # topk_proposals = torch.topk(enc_outputs_class_unselected.max(-1)[0], topk, dim=1)[1]
-
-            # from maskdino.ctx import indices_ctx
-            # indices = indices_ctx.get()
-
-            # debug: 检查预测 target_id = 22 实例的位点
-            # if indices is not None:
-            #     target_index = torch.where(indices[0][1] == 22)[0]  # 这里 target_id = 22
-            #     # target_id = indices[0][1][target_index]
-            #     pred_id = indices[0][0][target_index]
-            #     print('pred_id: ', pred_id)
-
-            # debug: 查看 enc_outputs_class_unselected 类别热力图
-            # from maskdino.analysis.tool_lab import draw_encoder_class_heatmap
-            # draw_encoder_class_heatmap(enc_outputs_class_unselected.max(-1)[0][0], level_start_index, spatial_shapes)
-
-            # from maskdino.ctx import draw_encoder_class_vars_ctx
-            # draw_encoder_class_vars = (enc_outputs_class_unselected.max(-1)[0][0], level_start_index, spatial_shapes)
-            # draw_encoder_class_vars_ctx.set(draw_encoder_class_vars)
-
-            # debug: 探索 topk 来自哪些 feature level
-            # from maskdino.analysis.tool_lab import check_topk_proposals
-            # check_topk_proposals(topk_proposals, level_start_index)
-
-            # refpoint_embed_undetach = torch.gather(enc_outputs_coord_unselected, 1,
-            #                                        topk_proposals.unsqueeze(-1).repeat(1, 1, 4))  # unsigmoid
-            # refpoint_embed = refpoint_embed_undetach.detach()
-
-            # debug: 观察偏移点
-            # from maskdino.analysis.tool_lab import draw_center_point_on_image
-            # proposal_boxes = torch.gather(output_proposals, 1,
-            #                                        topk_proposals.unsqueeze(-1).repeat(1, 1, 4))
-            # draw_center_point_on_image(refpoint_embed.sigmoid()[0], proposal_boxes.sigmoid()[0])
-
-
-            # tgt_undetach = torch.gather(output_memory, 1,
-            #                       topk_proposals.unsqueeze(-1).repeat(1, 1, self.hidden_dim))  # unsigmoid
-
             outputs_class, outputs_mask = self.forward_prediction_heads(tgt_undetach.transpose(0, 1), mask_features)
-            # ================
 
-            outputs_iou = self.iou_head(self.iou_head_before_norm(tgt_undetach))
-            # tgt_with_bbox_undetach = torch.concat([refpoint_embed_undetach.sigmoid(), tgt_undetach], dim=-1)
-            # outputs_iou = self.iou_head(self.iou_head_before_norm(tgt_with_bbox_undetach))
-
-            # outputs_dice = self.dice_head(self.dice_head_before_norm(tgt_undetach))
-            # ================
-            # tgt = tgt_undetach.detach()
             if self.learn_tgt:
                 tgt = self.query_feat.weight[None].repeat(bs, 1, 1)
+
             interm_outputs=dict()
             interm_outputs['pred_logits'] = outputs_class
             interm_outputs['pred_boxes'] = refpoint_embed_undetach.sigmoid()
             interm_outputs['pred_masks'] = outputs_mask
-            interm_outputs['pred_logits_iou'] = outputs_iou
-            # interm_outputs['pred_logits_dice'] = outputs_dice
-
-            # debug: pred_boxes 中间结果绘制到图像上
-            # from maskdino.analysis.tool_lab import draw_bboxes_on_image
-            # draw_bboxes_on_image(interm_outputs['pred_boxes'][0])
-            # debug: pred_boxes 绘制到 heatmap 上
-            # from maskdino.analysis.tool_lab import draw_bboxes_on_heatmap
-            # draw_bboxes_on_heatmap(x, refpoint_embed.sigmoid()[0], proposal_boxes.sigmoid()[0], topk_proposals[0], level_start_index)
+            if self.layer_wise_iou_enabled:
+                outputs_iou = self.iou_head(self.iou_head_before_norm(tgt_undetach))
+                interm_outputs['pred_logits_iou'] = outputs_iou
 
             if self.initialize_box_type != 'no':
                 # convert masks into boxes to better initialize box in the decoder
@@ -591,21 +591,10 @@ class MaskDINODecoder(nn.Module):
                 refpoint_embed = box_ops.box_xyxy_to_cxcywh(refpoint_embed) / torch.as_tensor([w, h, w, h],
                                                                                               dtype=torch.float).to(device)
                 refpoint_embed = refpoint_embed.reshape(outputs_mask.shape[0], outputs_mask.shape[1], 4)
-
-                # debug 检查召回率
-                # from maskdino.analysis.tool_lab import check_recall
-                # check_recall(refpoint_embed, targets)
-
                 refpoint_embed = inverse_sigmoid(refpoint_embed)
         elif not self.two_stage:
             tgt = self.query_feat.weight[None].repeat(bs, 1, 1)
             refpoint_embed = self.query_embed.weight[None].repeat(bs, 1, 1)
-
-        # 此处，产生了几个重要的变量
-        # tgt: (bs, num_queries, hidden_dim), decoder 的 content query
-        # refpoint_embed: (bs, num_queries, 4), decoder 的 position query
-        # tgt, refpoint_embed 都是 learnable 的参数
-        # output_memory: (bs, \sum{hw}, hidden_dim), encoder 的输出
 
         tgt_mask = None
         mask_dict = None
@@ -615,95 +604,52 @@ class MaskDINODecoder(nn.Module):
                 self.prepare_for_dn(targets, None, None, x[0].shape[0])
             if mask_dict is not None:
                 tgt=torch.cat([input_query_label, tgt],dim=1)
-        # 此处 tgt 变成了 (bs, dn_pad + num_queries, hidden_dim)，content query + denoising query
-        # 增加了 dn_pad 个 denoising query
 
         if self.dn != "no" and self.training and mask_dict is not None:
             refpoint_embed=torch.cat([input_query_bbox,refpoint_embed],dim=1)
 
-        tgt_len = tgt.shape[1]
-        tgt_mask_new = torch.ones((tgt_len, tgt_len), device=tgt.device).bool()
-        tgt_mask_new[-one2many_len:, -one2many_len:] = False
-        tgt_mask_new[:-one2many_len, :-one2many_len] = tgt_mask if tgt_mask is not None else False
-        tgt_mask = tgt_mask_new
-
-        def get_refpoint_embed(outputs_mask):
-            flaten_mask = outputs_mask.detach().flatten(0, 1)
-            h, w = outputs_mask.shape[-2:]
-            if self.initialize_box_type == 'bitmask':  # slower, but more accurate
-                refpoint_embed = BitMasks(flaten_mask > 0).get_bounding_boxes().tensor.to(device)
-            elif self.initialize_box_type == 'mask2box':  # faster conversion
-                refpoint_embed = box_ops.masks_to_boxes(flaten_mask > 0).to(device)
-            else:
-                assert NotImplementedError
-            refpoint_embed = box_ops.box_xyxy_to_cxcywh(refpoint_embed) / torch.as_tensor([w, h, w, h],
-                                                                                          dtype=torch.float).to(device)
-            refpoint_embed = refpoint_embed.reshape(outputs_mask.shape[0], outputs_mask.shape[1], 4)
-            # refpoint_embed = inverse_sigmoid(refpoint_embed)
-            return refpoint_embed.sigmoid()
+        if self.training and self.o2m_matching_enabled:
+            tgt_len = tgt.shape[1]
+            tgt_mask_new = torch.ones((tgt_len, tgt_len), device=tgt.device).bool()
+            tgt_mask_new[-self.num_queries_o2m:, -self.num_queries_o2m:] = False
+            tgt_mask_new[:-self.num_queries_o2m, :-self.num_queries_o2m] = tgt_mask if tgt_mask is not None else False
+            tgt_mask = tgt_mask_new
 
         # direct prediction from the matching and denoising part in the begining
         if self.initial_pred:
-            # 暂时注释
-            # outputs_class, outputs_mask = self.forward_prediction_heads(tgt.transpose(0, 1), mask_features, self.training)
             outputs_class, outputs_mask = self.forward_prediction_heads(tgt.transpose(0, 1), mask_features, True)
-            outputs_iou = self.iou_head(self.iou_head_before_norm(tgt))
-            # refpoint_embed_undetach = get_refpoint_embed(outputs_mask)
-            # tgt_with_bbox_undetach = torch.concat([refpoint_embed_undetach, tgt], dim=-1)
-            # outputs_iou = self.iou_head(self.iou_head_before_norm(tgt_with_bbox_undetach))
 
+            if self.ddq_enabled:
+                def get_initial_keep_mask(out_boxes, out_classes, one2one_len=900, one2many_len=1350):
+                    boxes_b = out_boxes.sigmoid()
+                    scores_b = out_classes.sigmoid().max(-1)[0]
 
-            def get_initial_keep_mask(out_boxes, out_classes, one2one_len=900, one2many_len=1350):
-                boxes_b = out_boxes.sigmoid()
-                scores_b = out_classes.sigmoid().max(-1)[0]
+                    def initial_dqs_keep_mask(boxes_cxcywh, scores, iou_thr, one2one_len, one2many_len):
+                        one2one_boxes = boxes_cxcywh[:one2one_len]
+                        one2one_scores = scores[:one2one_len]
+                        keep = nms(one2one_boxes, one2one_scores, iou_thr)
+                        mask = torch.zeros((one2one_len + one2many_len,), dtype=torch.bool, device=boxes_cxcywh.device)
+                        mask[keep] = True
+                        return mask
 
-                def initial_dqs_keep_mask(boxes_cxcywh, scores, iou_thr, one2one_len, one2many_len):
-                    one2one_boxes = boxes_cxcywh[:one2one_len]
-                    one2one_scores = scores[:one2one_len]
-                    keep = nms(one2one_boxes, one2one_scores, iou_thr)
-                    mask = torch.zeros((one2one_len + one2many_len,), dtype=torch.bool, device=boxes_cxcywh.device)
-                    mask[keep] = True
-                    return mask
-
-                keep_mask = []
-                for b in range(boxes_b.size(0)):
-                    keep_mask_b = initial_dqs_keep_mask(boxes_b[b], scores_b[b], iou_thr=0.8, one2one_len=one2one_len, one2many_len=one2many_len)
-                    keep_mask.append(keep_mask_b)
-                keep_mask = torch.stack(keep_mask, dim=0)  # (bs, nq)
-                return keep_mask
-            dn_query_len = mask_dict['pad_size'] if mask_dict is not None else 0
-            ddq_boxes = refpoint_embed[:, dn_query_len:dn_query_len + self.num_queries, :]
-            ddq_classes = outputs_class[:, dn_query_len:dn_query_len + self.num_queries, :]
-            keep_mask = get_initial_keep_mask(ddq_boxes, ddq_classes, one2one_len=one2one_len, one2many_len=one2many_len)
-            # tgt_mask[dn_query_len:dn_query_len + self.num_queries, dn_query_len:dn_query_len + self.num_queries]=keep_mask
-            initial_keep_mask = keep_mask
-
-            # debug: 查看推理时每一层的预测结果
-            # outputs_class, outputs_mask = self.forward_prediction_heads(tgt.transpose(0, 1), mask_features, pred_mask=True)
+                    keep_mask = []
+                    for b in range(boxes_b.size(0)):
+                        keep_mask_b = initial_dqs_keep_mask(boxes_b[b], scores_b[b], iou_thr=0.8, one2one_len=one2one_len, one2many_len=one2many_len)
+                        keep_mask.append(keep_mask_b)
+                    keep_mask = torch.stack(keep_mask, dim=0)  # (bs, nq)
+                    return keep_mask
+                dn_query_len = mask_dict['pad_size'] if mask_dict is not None else 0
+                ddq_boxes = refpoint_embed[:, dn_query_len:dn_query_len + self.num_queries, :]
+                ddq_classes = outputs_class[:, dn_query_len:dn_query_len + self.num_queries, :]
+                keep_mask = get_initial_keep_mask(ddq_boxes, ddq_classes, one2one_len=self.num_queries, one2many_len=self.num_queries_o2m)
+                initial_keep_mask = keep_mask
 
             predictions_class.append(outputs_class)
             predictions_mask.append(outputs_mask)
-            predictions_iou.append(outputs_iou)
+            if self.layer_wise_iou_enabled:
+                outputs_iou = self.iou_head(self.iou_head_before_norm(tgt))
+                predictions_iou.append(outputs_iou)
 
-        '''
-        Result 
-          hs: (num_layers, dn_pad + num_queries, bs, hidden_dim) output content | hidden states of decoder
-          解码器每一层的输出特征
-          references: (num_layers, dn_pad + num_queries, bs, 4) output
-          解码器每一层迭代优化后的参考点（reference points），即边界框的坐标
-        Q K V
-          tgt: (dn_pad + num_queries, bs, hidden_dim) content query
-          refpoint_embed: (dn_pad + num_queries, bs, 4) position query
-          memeory: (\sum{hw}, bs, hidden_dim) key and value
-          以上三个变量都是 transpose 过的，最为关键，是 Transformer decoder 的 Q K V
-        Mask
-          memory_key_padding_mask: (bs, \sum{hw}) padding mask for key and value 
-          此处的 memory_key_padding_mask 全是 False
-          tgt_mask: (dn_pad + num_queries, dn_pad + num_queries) attn mask for content query
-          此处的 tgt_mask 主要是为了让 matching query 看不到 denoising query 之间的信息，让 denoising query 之间也看不到彼此的信息
-        '''
-        # hs <-- intermediate, references <-- ref_points
-        # hs List 9, references List (9+1=10)
         hs, references, distinct_masks = self.decoder(
             tgt=tgt.transpose(0, 1),
             memory=src_flatten.transpose(0, 1),
@@ -714,51 +660,25 @@ class MaskDINODecoder(nn.Module):
             spatial_shapes=spatial_shapes,
             valid_ratios=valid_ratios,
             tgt_mask=tgt_mask,
-            pred_head=self
+            pred_head=self,
+
         )
         if mask_dict is not None:
             num_dn_queries = mask_dict['pad_size']
             distinct_masks = [mask[:, num_dn_queries:] for mask in distinct_masks]
-        # 为所有 decoder 层的输出，添加预测头，得到每一层的分类和掩码预测，所有的特征层共用一个预测头，也就是说参数是共享的
-        # PS：类别和掩码预测头的参数也是共享的，但是预测框的参数不共享
-        # 所有的 hs 都是包含了 denoising query 的
-        for i, output in enumerate(hs):
-            # def forward_prediction_heads(self, output, mask_features, pred_mask=True) 这里 pred_mask 与 self.training or (i == len(hs)-1) 等价
-            # 因此只有在训练时，或者在最后一层解码器时，才会进行掩码预测，否则只进行类别预测
-            # 这样做的目的是减少计算量，因为掩码预测比较耗时
 
-            # 暂时注释
-            # outputs_class, outputs_mask = self.forward_prediction_heads(output.transpose(0, 1), mask_features, self.training or (i == len(hs)-1))
+        for i, output in enumerate(hs):
             outputs_class, outputs_mask = self.forward_prediction_heads(output.transpose(0, 1), mask_features, True)
-            # refpoint_embed_undetach = get_refpoint_embed(outputs_mask)
-            # tgt_with_bbox_undetach = torch.concat([refpoint_embed_undetach, output], dim=-1)
-            # outputs_iou = self.iou_head(self.iou_head_before_norm(tgt_with_bbox_undetach))
-            outputs_iou = self.iou_head(self.iou_head_before_norm(output))
-            # debug: 查看推理时每一层的预测结果
-            # outputs_class, outputs_mask = self.forward_prediction_heads(output.transpose(0, 1), mask_features, pred_mask=True)
 
             predictions_class.append(outputs_class)
             predictions_mask.append(outputs_mask)
-            predictions_iou.append(outputs_iou)
+
+            if self.layer_wise_iou_enabled:
+                outputs_iou = self.iou_head(self.iou_head_before_norm(output))
+                predictions_iou.append(outputs_iou)
 
         # iteratively box prediction
-        '''
-        调用 self.pred_box 函数。该函数利用解码器每一层输出的隐藏状态 (hs) 和参考点 (references) 来迭代地优化和预测边界框坐标。
-        如果 self.initial_pred 为 True（表示在解码器之前有一次初始预测），则会将初始的参考点 refpoint_embed 作为优化的起点传入。
-        最终得到 out_boxes，它是一个包含了所有解码层（以及可能的初始预测层）预测的边界框的张量。
-        '''
         if self.initial_pred:
-            '''
-            reference: List num_layers + 1 -- (bs, dn_pad + num_queries, 4)
-            hs: List num_layers -- (bs, dn_pad + num_queries, hidden_dim)
-            refpoint_embed: (bs, dn_pad + num_queries, 4)
-            out_boxes: List num_layers + 1 -- (bs, dn_pad + num_queries, 4)
-            之所以 num_layers + 1，是因为加上了 initial_pred
-            这个 out_boxes 是解码器每一层的预测结果
-            这个 out_boxes 也是包含了 denoising query 的
-            这个 out_boxes 也是包含了 initial_pred 的
-            需要在后续的 loss 和 post-process 中去除
-            '''
             out_boxes = self.pred_box(references, hs, refpoint_embed.sigmoid())
             assert len(predictions_class) == self.num_layers + 1
         else:
@@ -766,11 +686,9 @@ class MaskDINODecoder(nn.Module):
         if mask_dict is not None:
             predictions_mask=torch.stack(predictions_mask)
             predictions_class=torch.stack(predictions_class)
-            predictions_iou = torch.stack(predictions_iou)
-            # 包含中间的所有结果
-            # predictions_mask: (num_layers + 1, bs, dn_pad + num_queries, h, w)
-            # predictions_class: (num_layers + 1, bs, dn_pad + num_queries, num_classes)
-            # out_boxes: (num_layers + 1, bs, dn_pad + num_queries, 4)
+            if self.layer_wise_iou_enabled:
+                predictions_iou = torch.stack(predictions_iou)
+
             predictions_class, out_boxes, predictions_mask, predictions_iou = self.dn_post_process(
                 predictions_class,
                 out_boxes,
@@ -782,16 +700,10 @@ class MaskDINODecoder(nn.Module):
         elif self.training:  # this is to insure self.label_enc participate in the model
             predictions_class[-1] += 0.0*self.label_enc.weight.sum()
 
-        # 最终的返回结果
-        # 训练中，返回 9 个 decoder 的结果，加上 1 个 tgt 的结果：pred_logits, pred_masks, pred_boxes 是最后一层解码器的结果
-        # aux_outputs 按照顺序，第一个是 tgt 的结果，后面依次是每一层解码器的结果，也就是 1, 2 ... 8 层的结果
-        # 推理中，依然是返回全部的结果，但是不会计算 pred_masks，也就是所有的 pred_masks 都是 None，不论 tgt 还是 9 层解码器的结果
-        # 补: predictions_class, predictions_mask, out_boxes 都是 10 层
         out = {
             'pred_logits': predictions_class[-1],
             'pred_masks': predictions_mask[-1],
             'pred_boxes':out_boxes[-1],
-            'pred_logits_iou': predictions_iou[-1],
             'aux_outputs': self._set_aux_loss(
                 predictions_class if self.mask_classification else None,
                 predictions_mask,
@@ -799,102 +711,87 @@ class MaskDINODecoder(nn.Module):
                 out_boxes
             )
         }
+        if self.layer_wise_iou_enabled:
+            out['pred_logits_iou'] = predictions_iou[-1]
+
         if self.two_stage:
             out['interm_outputs'] = interm_outputs
-        # debug: 观察一下经过 decoder之后每个 query score 的变化
-        # from maskdino.analysis.tool_lab import analyze_query_scores
-        # analyze_query_scores(out)
 
-        # debug: 可视化每次 decoder 的输出结果
-        # from maskdino.analysis.tool_lab import visualize_decoder_outputs
-        # visualize_decoder_outputs(out)
-
-        # 将 out 转换为包含 one-to-many 的格式
+        # 将 out 转换为包含 one-to-many 的格式（仅在 o2m_matching_enabled 时生成）
         num_queries_one_to_one = self.num_queries
-        aux_outputs_one_to_many = []
-        for aux_output in out['aux_outputs']:
-            aux_output_one_to_many = {
-                'pred_logits': aux_output['pred_logits'][:, num_queries_one_to_one:],
-                'pred_masks': aux_output['pred_masks'][:, num_queries_one_to_one:] if self.training else None,
-                'pred_boxes': aux_output['pred_boxes'][:, num_queries_one_to_one:],
-                'pred_logits_iou': aux_output['pred_logits_iou'][:, num_queries_one_to_one:],
-            }
-            aux_outputs_one_to_many.append(aux_output_one_to_many)
-        # aux_outputs = []
-        # for aux in out['aux_outputs']:
-        #     aux_one_to_one = {
-        #         'pred_logits': aux['pred_logits'][:, :num_queries_one_to_one],
-        #         'pred_masks': aux['pred_masks'][:, :num_queries_one_to_one] if self.training else None,
-        #         'pred_boxes': aux['pred_boxes'][:, :num_queries_one_to_one],
-        #     }
-        #     aux_outputs.append(aux_one_to_one)
-        # interm_outputs = out['interm_outputs']
-        # interm_outputs_one_to_many = {
-        #     'pred_logits': interm_outputs['pred_logits'].repeat(1, 5, 1),
-        #     'pred_masks': interm_outputs['pred_masks'].repeat(1, 5, 1, 1),
-        #     'pred_boxes': interm_outputs['pred_boxes'].repeat(1, 5, 1),
-        # }
-        # interm_outputs_one_to_many = interm_outputs
-        interm_outputs_one_to_many = {
-            'pred_logits': interm_outputs['pred_logits'][:, num_queries_one_to_one:],
-            'pred_masks': interm_outputs['pred_masks'][:, num_queries_one_to_one:],
-            'pred_boxes': interm_outputs['pred_boxes'][:, num_queries_one_to_one:],
-            'pred_logits_iou': interm_outputs['pred_logits_iou'][:, num_queries_one_to_one:],
-        }
-        # out_one_to_many = {
-        #     # 'pred_logits': out['pred_logits'][:, :num_queries_one_to_one],
-        #     # 'pred_masks': out['pred_masks'][:, :num_queries_one_to_one],
-        #     # 'pred_boxes': out['pred_boxes'][:, :num_queries_one_to_one],
-        #     'pred_logits_one_to_many': out['pred_logits'][:, num_queries_one_to_one:],
-        #     'pred_masks_one_to_many': out['pred_masks'][:, num_queries_one_to_one:],
-        #     'pred_boxes_one_to_many': out['pred_boxes'][:, num_queries_one_to_one:],
-        #     # 'aux_outputs': aux_outputs,
-        #     'aux_outputs_one_to_many': aux_outputs_one_to_many,
-        #     # 'interm_outputs': interm_outputs,
-        #     'interm_outputs_one_to_many': interm_outputs_one_to_many,
-        # }
-        out_one_to_many = {
-            # 'pred_logits': out['pred_logits'][:, :num_queries_one_to_one],
-            # 'pred_masks': out['pred_masks'][:, :num_queries_one_to_one],
-            # 'pred_boxes': out['pred_boxes'][:, :num_queries_one_to_one],
-            'pred_logits': out['pred_logits'][:, num_queries_one_to_one:],
-            'pred_masks': out['pred_masks'][:, num_queries_one_to_one:],
-            'pred_boxes': out['pred_boxes'][:, num_queries_one_to_one:],
-            'pred_logits_iou': out['pred_logits_iou'][:, num_queries_one_to_one:],
-            # 'aux_outputs': aux_outputs,
-            'aux_outputs': aux_outputs_one_to_many,
-            # 'interm_outputs': interm_outputs,
-            'interm_outputs': interm_outputs_one_to_many,
-        }
-
-
         bs = out['pred_logits'].shape[0]
-        if bs == 1:
+
+        out_one_to_many = None
+        if self.training and self.o2m_matching_enabled:
+            aux_outputs_one_to_many = []
+            for aux_output in out.get('aux_outputs', []):
+                aux_output_one_to_many = {
+                    'pred_logits': aux_output['pred_logits'][:, num_queries_one_to_one:],
+                    'pred_masks': aux_output['pred_masks'][:, num_queries_one_to_one:] if self.training else None,
+                    'pred_boxes': aux_output['pred_boxes'][:, num_queries_one_to_one:],
+                }
+                # layer-wise iou 可选
+                if self.layer_wise_iou_enabled and ('pred_logits_iou' in aux_output) and (
+                        aux_output['pred_logits_iou'] is not None):
+                    aux_output_one_to_many['pred_logits_iou'] = aux_output['pred_logits_iou'][:, num_queries_one_to_one:]
+                aux_outputs_one_to_many.append(aux_output_one_to_many)
+
+            interm_outputs_one_to_many = {
+                'pred_logits': interm_outputs['pred_logits'][:, num_queries_one_to_one:],
+                'pred_masks': interm_outputs['pred_masks'][:, num_queries_one_to_one:],
+                'pred_boxes': interm_outputs['pred_boxes'][:, num_queries_one_to_one:],
+            }
+            if self.layer_wise_iou_enabled and ('pred_logits_iou' in interm_outputs) and (
+                    interm_outputs['pred_logits_iou'] is not None):
+                interm_outputs_one_to_many['pred_logits_iou'] = interm_outputs['pred_logits_iou'][:, num_queries_one_to_one:]
+
+            out_one_to_many = {
+                'pred_logits': out['pred_logits'][:, num_queries_one_to_one:],
+                'pred_masks': out['pred_masks'][:, num_queries_one_to_one:],
+                'pred_boxes': out['pred_boxes'][:, num_queries_one_to_one:],
+                'aux_outputs': aux_outputs_one_to_many,
+                'interm_outputs': interm_outputs_one_to_many,
+            }
+            if self.layer_wise_iou_enabled and ('pred_logits_iou' in out) and (out['pred_logits_iou'] is not None):
+                out_one_to_many['pred_logits_iou'] = out['pred_logits_iou'][:, num_queries_one_to_one:]
+
+        if bs == 1 and self.ddq_enabled:
             distinct_masks.insert(0, initial_keep_mask)
             last_mask = distinct_masks.pop()
 
-            last_mask_q = last_mask[0]  # or last_mask.squeeze(0)
+            last_mask_q = last_mask[0]  # (nq_o2o,)
             out['pred_logits'] = out['pred_logits'][:, last_mask_q, :]
             out['pred_boxes'] = out['pred_boxes'][:, last_mask_q, :]
-            out['pred_masks'] = out['pred_masks'][:, last_mask_q, :, :] if out['pred_masks'] is not None else None
-            out['pred_logits_iou'] = out['pred_logits_iou'][:, last_mask_q, :]
-            for aux, mask in zip(out['aux_outputs'], distinct_masks):
-                m = mask[0]  # (nq,)
+            out['pred_masks'] = out['pred_masks'][:, last_mask_q, :, :] if out.get('pred_masks',None) is not None else None
+
+            # layer-wise iou 可选
+            if self.layer_wise_iou_enabled and ('pred_logits_iou' in out) and (out['pred_logits_iou'] is not None):
+                out['pred_logits_iou'] = out['pred_logits_iou'][:, last_mask_q, :]
+
+            for aux, mask in zip(out.get('aux_outputs', []), distinct_masks):
+                m = mask[0]  # (nq_o2o,)
                 aux['pred_logits'] = aux['pred_logits'][:, m, :]
                 aux['pred_boxes'] = aux['pred_boxes'][:, m, :]
                 if aux.get('pred_masks', None) is not None:
                     aux['pred_masks'] = aux['pred_masks'][:, m, :, :]
-                aux['pred_logits_iou'] = aux['pred_logits_iou'][:, m, :]
-            interm_outputs = out['interm_outputs']
-            interm_outputs['pred_logits'] = interm_outputs['pred_logits'][:, :num_queries_one_to_one]
-            interm_outputs['pred_boxes'] = interm_outputs['pred_boxes'][:, :num_queries_one_to_one]
-            interm_outputs['pred_masks'] = interm_outputs['pred_masks'][:, :num_queries_one_to_one]
-            interm_outputs['pred_logits_iou'] = interm_outputs['pred_logits_iou'][:, :num_queries_one_to_one]
-            out['interm_outputs'] = interm_outputs
+
+                if self.layer_wise_iou_enabled and ('pred_logits_iou' in aux) and (aux['pred_logits_iou'] is not None):
+                    aux['pred_logits_iou'] = aux['pred_logits_iou'][:, m, :]
+
+            # interm_outputs：保留 one-to-one 前半段
+            interm_outputs_ = out['interm_outputs']
+            interm_outputs_['pred_logits'] = interm_outputs_['pred_logits'][:, :num_queries_one_to_one]
+            interm_outputs_['pred_boxes'] = interm_outputs_['pred_boxes'][:, :num_queries_one_to_one]
+            interm_outputs_['pred_masks'] = interm_outputs_['pred_masks'][:, :num_queries_one_to_one]
+
+            if self.layer_wise_iou_enabled and ('pred_logits_iou' in interm_outputs_) and (
+                    interm_outputs_['pred_logits_iou'] is not None):
+                interm_outputs_['pred_logits_iou'] = interm_outputs_['pred_logits_iou'][:, :num_queries_one_to_one]
+
+            out['interm_outputs'] = interm_outputs_
+
         else:
             raise ValueError(f"Batch size {bs} != 1")
-
-
 
         return out, out_one_to_many, mask_dict
 
@@ -921,7 +818,7 @@ class MaskDINODecoder(nn.Module):
                 for a, b in zip(outputs_class[:-1], outputs_seg_masks[:-1])
             ]
         else:
-            if outputs_iou is not None:
+            if outputs_iou is not None and self.layer_wise_iou_enabled:
                 return [
                     {'pred_logits': a, 'pred_masks': b, 'pred_logits_iou': c, 'pred_boxes': d}
                     for a, b, c, d in zip(outputs_class[:-1], outputs_seg_masks[:-1], outputs_iou[:-1], out_boxes[:-1])

@@ -54,6 +54,9 @@ class MaskDINO(nn.Module):
         focus_on_box: bool = False,
         transform_eval: bool = False,
         semantic_ce_loss: bool = False,
+        o2m_matching_enabled = False,
+        num_targets_k = 6,
+        layer_wise_iou_enabled = False,
     ):
         """
         Args:
@@ -82,6 +85,10 @@ class MaskDINO(nn.Module):
             semantic_ce_loss: whether use cross-entroy loss in classification
         """
         super().__init__()
+
+        self.o2m_matching_enabled = o2m_matching_enabled
+        self.num_targets_k = num_targets_k
+
         self.backbone = backbone
         self.pano_temp = pano_temp
         self.sem_seg_head = sem_seg_head
@@ -116,14 +123,14 @@ class MaskDINO(nn.Module):
 
     @classmethod
     def from_config(cls, cfg):
+        # one-to-many
+        o2m_matching_enabled = cfg.MODEL.MaskDINO.O2M_MATCHING_ENABLED
+        num_targets_k = cfg.MODEL.MaskDINO.NUM_TARGETS_K
+        layer_wise_iou_enabled = cfg.MODEL.MaskDINO.LAYER_WISE_IOU_ENABLED
+        align_loss_enabled = cfg.MODEL.MaskDINO.ALIGN_LOSS_ENABLED
+
         backbone = build_backbone(cfg)
         sem_seg_head = build_sem_seg_head(cfg, backbone.output_shape())
-
-        # one-to-many
-        # lambda_one_to_many = cfg.MODEL.MaskDINO.LAMBDA_ONE_TO_MANY
-        # one_to_many_flag = cfg.MODEL.MaskDINO.ONE_TO_MANY_FLAG
-        # k_one_to_many = cfg.MODEL.MaskDINO.K_ONE_TO_MANY
-
 
         # Loss parameters:
         deep_supervision = cfg.MODEL.MaskDINO.DEEP_SUPERVISION
@@ -151,6 +158,7 @@ class MaskDINO(nn.Module):
             cost_box=cost_box_weight,
             cost_giou=cost_giou_weight,
             num_points=cfg.MODEL.MaskDINO.TRAIN_NUM_POINTS,
+            matcher_nms_enabled=cfg.MODEL.MaskDINO.MATCHDER_NMS_ENABLED,
         )
 
         weight_dict = {"loss_ce": class_weight}
@@ -196,9 +204,14 @@ class MaskDINO(nn.Module):
             dn_losses=dn_losses,
             panoptic_on=cfg.MODEL.MaskDINO.PANO_BOX_LOSS,
             semantic_ce_loss=cfg.MODEL.MaskDINO.TEST.SEMANTIC_ON and cfg.MODEL.MaskDINO.SEMANTIC_CE_LOSS and not cfg.MODEL.MaskDINO.TEST.PANOPTIC_ON,
+            layer_wise_iou_enabled=layer_wise_iou_enabled,
+            align_loss_enabled=align_loss_enabled,
         )
 
         return {
+            "o2m_matching_enabled": o2m_matching_enabled,
+            "num_targets_k": num_targets_k,
+            "layer_wise_iou_enabled": layer_wise_iou_enabled,
             "backbone": backbone,
             "sem_seg_head": sem_seg_head,
             "criterion": criterion,
@@ -258,33 +271,10 @@ class MaskDINO(nn.Module):
         """
         images = [x["image"].to(self.device) for x in batched_inputs]
 
-        # debug: 处理过的图像名保存到一个 txt 文件中
-        # with open("/public/home/zncui/pycharm_project/MaskDINO/myscripts/processed_image_names.txt", "a") as f:
-        #     for x in batched_inputs:
-        #         if "file_name" in x:
-        #             f.write(x["file_name"] + "\n")
-
-        # debug: 可视化 transformed image
-        # 将张量从 GPU 移至 CPU，并转换为 NumPy 数组
-        # Detectron2 加载的图像通常是 BGR 格式，范围是 [0, 255]
-        # cv2.imwrite 也需要 BGR 格式的图像
-
-        # import cv2
-        # import numpy as np
-        # img = images[0].detach().cpu().permute(1, 2, 0).numpy()
-        # img = np.clip(img, 0, 255).astype(np.uint8)
-        # img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-        # save_path = "/public/home/zncui/pycharm_project/MaskDINO/myscripts/transformed_image_v1.jpg"
-        # cv2.imwrite(save_path, img_bgr)
-
         images = [(x - self.pixel_mean) / self.pixel_std for x in images]
         images = ImageList.from_tensors(images, self.size_divisibility)
 
         features = self.backbone(images.tensor)
-        # debug：可视化 backbone 热力图
-        # from maskdino.analysis.tool_lab import show_heatmap
-        # show_heatmap(features, batched_inputs,
-        #              save_path="/public/home/zncui/pycharm_project/MaskDINO/myscripts/output_heatmap/maskdino_mean_all_heatmaps.png")
 
         if self.training:
             # dn_args={"scalar":30,"noise_scale":0.4}
@@ -298,26 +288,15 @@ class MaskDINO(nn.Module):
             else:
                 targets = None
 
-            # from maskdino.ctx import indices_ctx
-            # indices_ctx.set(None)
-
             # 预处理时已经 pad 好了，不需要在这里 pad 了，因此不传入 mask，即 mask=None
             outputs, outputs_one2many, mask_dict = self.sem_seg_head(features, targets=targets)
-
-            # # debug: 可视化每一层 decoder 的结果，观察这些结果所各自预测的对象
-            # from maskdino.analysis.tool_lab import vis_decoder_layer_results
-            # # vis_decoder_layer_results(outputs, batched_inputs)
-            # from maskdino.ctx import stacked_attn_output_weights_ctx
-            # stacked_attn_output_weights = stacked_attn_output_weights_ctx.get()
-            # vis_decoder_layer_results(outputs, batched_inputs, stacked_attn_output_weights)
 
             # one-to-one loss, one-to-one query and denoising query
             # bipartite matching-based loss
             losses, _ = self.criterion(outputs, targets, mask_dict)
 
             # one-to-many loss, one-to-many query
-            one2many_flag = True
-            if one2many_flag:
+            if self.o2m_matching_enabled:
                 multi_targets = copy.deepcopy(targets)
 
                 def duplicate_targets(src_targets, k_one2many):
@@ -327,13 +306,7 @@ class MaskDINO(nn.Module):
                         t['boxes'] = t['boxes'].repeat(k_one2many, 1)
                     return src_targets
 
-                multi_targets = duplicate_targets(multi_targets, k_one2many=6)
-                # outputs_one_to_many = dict()
-                # outputs_one_to_many['pred_logits'] = outputs_one2many['pred_logits_one_to_many']
-                # outputs_one_to_many['pred_boxes'] = outputs_one2many['pred_boxes_one_to_many']
-                # outputs_one_to_many['pred_masks'] = outputs_one2many['pred_masks_one_to_many']
-                # outputs_one_to_many['aux_outputs'] = outputs_one2many['aux_outputs_one_to_many']
-                # outputs_one_to_many['interm_outputs'] = outputs_one2many['interm_outputs_one_to_many']
+                multi_targets = duplicate_targets(multi_targets, k_one2many=self.num_targets_k)
                 # mask_dict = None # 表示关闭 dn-query
                 losses_one2many, _ = self.criterion(outputs_one2many, multi_targets, None)
                 lambda_one2many = 1.0
@@ -341,34 +314,6 @@ class MaskDINO(nn.Module):
                     losses[key + '_one2many'] = value * lambda_one2many
                     weight = self.criterion.weight_dict[key]
                     self.criterion.weight_dict[key + '_one2many'] = weight
-
-            # bid = 0
-            # target_index = torch.where(indices[bid][1] == 22)[0]  # 这里 target_id = 22
-            # # target_id = indices[0][1][target_index]
-            # pred_id = indices[bid][0][target_index]
-            # print('pred_id: ', pred_id)
-
-            # from maskdino.analysis.tool_lab import vis_attention_bar_from_csv
-            # vis_attention_bar_from_csv(
-            #     pred_id=pred_id,
-            #     save_path="/public/home/zncui/pycharm_project/MaskDINO/myscripts/attn_query_bar.jpg"
-            # )
-
-            # from maskdino.ctx import draw_encoder_class_vars_ctx
-            # encoder_class_vars = draw_encoder_class_vars_ctx.get()
-            # from maskdino.ctx import attn_output_weights_ctx
-            # attn_output_weights_var = attn_output_weights_ctx.get()
-            # query_id = 200
-            # selected_attn_output_weights = attn_output_weights_var[bid][query_id].squeeze()
-            # # selected_attn_output_weights = attn_output_weights_var[bid][pred_id].squeeze()
-            # from maskdino.analysis.tool_lab import draw_encoder_class_heatmap
-            # draw_encoder_class_heatmap(encoder_class_vars[0], encoder_class_vars[1], encoder_class_vars[2], query_id, selected_attn_output_weights)
-            # # 另外观察废弃 query 在关注什么
-
-            # debug
-            # print('debug -----> indices: ', )
-            # indices_ctx.set(indices)  # 设置值
-            # outputs, mask_dict = self.sem_seg_head(features, targets=targets)
 
             for k in list(losses.keys()):
                 if k in self.criterion.weight_dict:
@@ -379,9 +324,6 @@ class MaskDINO(nn.Module):
                         continue
                     print(k)
                     losses.pop(k)
-            # debug: loss 的组成部分
-            # from maskdino.analysis.tool_lab import vis_loss_bar
-            # vis_loss_bar(losses, title="Example loss", save_path="loss_bar_no_weight.png")
             return losses
         else:
 

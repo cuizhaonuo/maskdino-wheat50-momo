@@ -85,7 +85,7 @@ class HungarianMatcher(nn.Module):
     """
 
     def __init__(self, cost_class: float = 1, cost_mask: float = 1, cost_dice: float = 1, num_points: int = 0,
-                 cost_box: float = 0, cost_giou: float = 0, panoptic_on: bool = False):
+                 cost_box: float = 0, cost_giou: float = 0, panoptic_on: bool = False, matcher_nms_enabled: bool = False):
         """Creates the matcher
 
         Params:
@@ -101,6 +101,7 @@ class HungarianMatcher(nn.Module):
         self.cost_giou = cost_giou
 
         self.panoptic_on = panoptic_on
+        self.matcher_nms_enabled = matcher_nms_enabled
 
         assert cost_class != 0 or cost_mask != 0 or cost_dice != 0, "all costs cant be 0"
 
@@ -147,28 +148,24 @@ class HungarianMatcher(nn.Module):
                 tgt_bbox=targets[b]["boxes"]
                 cost_bbox = torch.cdist(out_bbox, tgt_bbox, p=1)
                 cost_giou = -generalized_box_iou(box_cxcywh_to_xyxy(out_bbox), box_cxcywh_to_xyxy(tgt_bbox))
-                matrix_iou, _ = box_iou(box_cxcywh_to_xyxy(out_bbox), box_cxcywh_to_xyxy(tgt_bbox))
-                mask_iou = matrix_iou > 0.5
+                if self.matcher_nms_enabled:
+                    matrix_iou, _ = box_iou(box_cxcywh_to_xyxy(out_bbox), box_cxcywh_to_xyxy(tgt_bbox))
+                    mask_iou = matrix_iou > 0.5
             else:
                 cost_bbox = torch.tensor(0).to(out_bbox)
                 cost_giou = torch.tensor(0).to(out_bbox)
 
             out_prob = outputs["pred_logits"][b].sigmoid()  # [num_queries, num_classes]
-            out_iou = outputs['pred_logits_iou'][b].sigmoid()
-            out_prob = out_prob * out_iou
+            if 'pred_logits_iou' in outputs:
+                out_iou = outputs['pred_logits_iou'][b].sigmoid()
+                out_prob = out_prob * out_iou
+
             tgt_ids = targets[b]["labels"]
             # focal loss
             alpha = 0.25
             gamma = 2.0
             neg_cost_class = (1 - alpha) * (out_prob ** gamma) * (-(1 - out_prob + 1e-8).log())
             pos_cost_class = alpha * ((1 - out_prob) ** gamma) * (-(out_prob + 1e-8).log())
-            # debug: 获取 neg_cost_class 和 pos_cost_class 的柱状图
-            # from maskdino.analysis.tool_lab import draw_neg_and_post
-            # draw_neg_and_post(neg_cost_class, pos_cost_class)
-
-            # debug
-            # from maskdino.analysis.tool_lab import temporal_diff_bar_scatter
-            # temporal_diff_bar_scatter(self, neg_cost_class, pos_cost_class)
 
             cost_class = pos_cost_class[:, tgt_ids] - neg_cost_class[:, tgt_ids]
 
@@ -234,88 +231,9 @@ class HungarianMatcher(nn.Module):
                 + self.cost_giou*cost_giou
             )
             C = C.reshape(num_queries, -1).cpu()
-
-
-            # if 'interm_outputs' in outputs:
-            #     interm_outputs = outputs['interm_outputs']
-            #     pred_boxes = interm_outputs['pred_boxes'][b].cpu() # (bs, nq, 4) --> (nq, 4)
-            #     tgt_boxes = targets[b]['boxes'].to(pred_boxes.device) # (nt, 4)
-            #     from maskdino.utils.box_ops import box_iou
-            #     iou_matrix = box_iou(box_cxcywh_to_xyxy(pred_boxes),
-            #                          box_cxcywh_to_xyxy(tgt_boxes))[0]
-            #     # ===== min matching results
-            #     # iou_indices = C.min(dim=-1)[1] # (nq, nt) --> (nq,)
-            #     # nq = pred_boxes.shape[0]
-            #     # query_indices = torch.arange(nq, dtype=torch.int64, device=pred_boxes.device)
-            #     # pred_iou = interm_outputs['pred_logits_iou'][b].sigmoid().to(pred_boxes.device) # (nq,)
-            #     # ===== hungary matching results
-            #     query_indices, iou_indices = linear_sum_assignment(C)
-            #     tgt_iou = iou_matrix[query_indices, iou_indices]  # (nq,)
-            #     pred_iou = interm_outputs['pred_logits_iou'][b].sigmoid()[query_indices].to(pred_boxes.device) # (nq,)
-            #     from matplotlib import pyplot as plt
-            #     plt.figure()
-            #     nq = query_indices.shape[0]
-            #     x_indices = torch.arange(nq, dtype=torch.int64, device=pred_boxes.device)
-            #     plt.plot(x_indices, tgt_iou, marker='o', color='orange', label='tgt_iou')
-            #     plt.plot(x_indices, pred_iou, marker='s', color='green', label='pred_iou')
-            #     plt.xlabel('query id')
-            #     plt.ylabel('iou value')
-            #     plt.title('tgt_iou vs pred_iou')
-            #     plt.legend()
-            #     plt.savefig(f'hungary_matching_iou_plot_batch{b}.png')
-            #     plt.close()
-
-            # debug: 可视化 cost_xxx 在 C 中的占比
-            # from maskdino.analysis.tool_lab import visualize_cost_components, visualize_cost_components_bar_sorted
-            # no weighted
-            # visualize_cost_components(C, cost_class, cost_mask, cost_dice,
-            #                           cost_bbox, cost_giou)
-            # add weighted
-            # visualize_cost_components(C,
-            #                           self.cost_class * cost_class,
-            #                           self.cost_mask * cost_mask,
-            #                           self.cost_dice * cost_dice,
-            #                           self.cost_box * cost_bbox,
-            #                           self.cost_giou * cost_giou,
-            #                           outputs,
-            #                           targets)
-            # visualize_cost_components_bar_sorted(C,
-            #                           self.cost_class * cost_class,
-            #                           self.cost_mask * cost_mask,
-            #                           self.cost_dice * cost_dice,
-            #                           self.cost_box * cost_bbox,
-            #                           self.cost_giou * cost_giou,
-            #                           outputs,
-            #                           targets)
-
-
-            # debug: 绘制cost矩阵热力图
-            # from maskdino.analysis.tool_lab import save_cost_matrix_heatmap
-            # src_id, tgt_id = linear_sum_assignment(C)
-            # save_cost_matrix_heatmap(C, src_id, tgt_id, 'cost_matrix_C.jpg')
-
-            # debug: 检验是否 cost 最小的行就是匹配结果
-            # print(f"batch idx: {b}")
-            # import numpy as np
-            # C = np.asarray(C)
-            # src_id, tgt_id = linear_sum_assignment(C)
-            # min_cost_rows = np.sum(C, axis=1)
-            # idx = np.argsort(min_cost_rows)[:len(tgt_id)]
-            # # min_vals = min_cost_rows[idx]
-            # # for i, v in zip(idx, min_vals):
-            # #     print(f"Row {i} min cost: {v}")
-            # matched_count = 0
-            # for i in src_id:
-            #     if i in idx:
-            #         matched_count += 1
-            #         # print("index match found in min cost rows:", i)
-            # print(f"Matched count in min cost rows: {matched_count} / {len(tgt_id)}")
-
             C_list.append(C)
-            # C_list.append(self.cost_class * cost_class.cpu())
-            # indices.append(linear_sum_assignment(C))
 
-            if mask_iou is not None:
+            if mask_iou is not None and self.matcher_nms_enabled:
                 index = linear_sum_assignment(C)
                 rows = []
                 cols = []
@@ -326,18 +244,6 @@ class HungarianMatcher(nn.Module):
                 indices.append((rows, cols))
             else:
                 indices.append(linear_sum_assignment(C))
-
-        # debug: 统计每个query被匹配的次数
-        # from maskdino.analysis.tool_lab import count_query_frequency
-        # count_query_frequency(indices)
-
-        # debug: 可视化 target 对应的每个 query
-        # from maskdino.analysis.tool_lab import visualize_matched_queries
-        # visualize_matched_queries(outputs, targets, indices, C_list)
-
-        # debug: 绘制 class 柱形图
-        # from maskdino.analysis.tool_lab import plot_class_distribution
-        # plot_class_distribution(outputs)
 
         return [
             (torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64))

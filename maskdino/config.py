@@ -162,3 +162,18 @@ def add_maskdino_config(cfg):
     cfg.MODEL.DINOV3_STA.CONV_INPLANE = 32
 
     cfg.Default_loading=True  # a bug in my d2. resume use this; if first time ResNet load, set it false
+
+    # 改进
+    # 1
+    cfg.MODEL.MaskDINO.O2M_MATCHING_ENABLED = False
+    cfg.MODEL.MaskDINO.NUM_OBJECT_QUERIES_O2M = 1350
+    cfg.MODEL.MaskDINO.NUM_TARGETS_K = 6
+    # 2
+    cfg.MODEL.MaskDINO.DDQ_ENABLED = False
+    cfg.MODEL.MaskDINO.DDQ_IOU_THRESHOLD = 0.8
+    cfg.MODEL.MaskDINO.MATCHDER_NMS_ENABLED = False
+    # 3
+    cfg.MODEL.MaskDINO.LAYER_WISE_IOU_ENABLED = False
+    # 4
+    cfg.MODEL.MaskDINO.ALIGN_LOSS_ENABLED = False
+

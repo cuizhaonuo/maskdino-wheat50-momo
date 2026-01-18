@@ -130,7 +130,8 @@ class SetCriterion(nn.Module):
     """
 
     def __init__(self, num_classes, matcher, weight_dict, eos_coef, losses,
-                 num_points, oversample_ratio, importance_sample_ratio,dn="no",dn_losses=[], panoptic_on=False, semantic_ce_loss=False):
+                 num_points, oversample_ratio, importance_sample_ratio,dn="no",dn_losses=[], panoptic_on=False, semantic_ce_loss=False,
+                 layer_wise_iou_enabled=True, align_loss_enabled=True):
         """Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
@@ -140,6 +141,8 @@ class SetCriterion(nn.Module):
             losses: list of all the losses to be applied. See get_loss for list of available losses.
         """
         super().__init__()
+        self.layer_wise_iou_enabled = layer_wise_iou_enabled
+        self.align_loss_enabled = align_loss_enabled
         self.num_classes = num_classes
         self.matcher = matcher
         self.weight_dict = weight_dict
@@ -178,7 +181,7 @@ class SetCriterion(nn.Module):
         losses = {"loss_ce": loss_ce}
         return losses
 
-    def _loss_labels(self, outputs, targets, indices, num_boxes, log=True):
+    def loss_labels(self, outputs, targets, indices, num_boxes, log=True):
         """Classification loss (Binary focal loss)
         targets dicts must contain the key "labels" containing a tensor of dim [nb_target_boxes]
         """
@@ -201,7 +204,7 @@ class SetCriterion(nn.Module):
 
         return losses
 
-    def loss_labels(self, outputs, targets, indices, num_boxes, **kwargs):
+    def align_loss_labels(self, outputs, targets, indices, num_boxes, **kwargs):
         assert "pred_logits" in outputs
         src_logits = outputs["pred_logits"].float()
 
@@ -273,7 +276,7 @@ class SetCriterion(nn.Module):
             box_ops.box_cxcywh_to_xyxy(target_boxes)))
         losses['loss_giou'] = loss_giou.sum() / num_boxes
 
-        if 'pred_logits_iou' in outputs:
+        if 'pred_logits_iou' in outputs and self.layer_wise_iou_enabled:
             src_iou = outputs['pred_logits_iou'][idx].squeeze(-1).sigmoid()
 
             # unmatched_pred_iou = outputs['pred_logits_iou'].squeeze().sigmoid()
@@ -404,7 +407,7 @@ class SetCriterion(nn.Module):
 
     def get_loss(self, loss, outputs, targets, indices, num_masks):
         loss_map = {
-            'labels': self.loss_labels_ce if self.semantic_ce_loss else self.loss_labels,
+            'labels': self.loss_labels_ce if self.semantic_ce_loss else self.align_loss_labels if self.align_loss_enabled else self.loss_labels,
             'masks': self.loss_masks,
             'boxes': self.loss_boxes_panoptic if self.panoptic_on else self.loss_boxes,
         }
@@ -436,9 +439,6 @@ class SetCriterion(nn.Module):
                     output_idx = tgt_idx = torch.tensor([]).long().cuda()
                 exc_idx.append((output_idx, tgt_idx))
         indices = self.matcher(outputs_without_aux, targets)
-        # debug: 可视化正负样本匹配结果
-        # from maskdino.analysis.tool_lab import visualize_matching
-        # visualize_matching(indices, outputs, targets)
 
         # Compute the average number of target boxes accross all nodes, for normalization purposes
         num_masks = sum(len(t["labels"]) for t in targets)
