@@ -277,7 +277,8 @@ class TransformerDecoder(nn.Module):
                     attn_mask[:, idx_local] = False
 
                     # 写回 tgt_mask 的 one2one block（注意有 dn 偏移）
-                    tgt_mask[o2o_s:o2o_e, o2o_s:o2o_e] = attn_mask
+                    if tgt_mask is not None:
+                        tgt_mask[o2o_s:o2o_e, o2o_s:o2o_e] = attn_mask
 
                 else:
                     raise ValueError(f"Batch size {keep_mask.size(0)} != 1")
@@ -379,7 +380,7 @@ class DeformableTransformerDecoderLayer(nn.Module):
         query = key = tgt + tgt_query_pos
         value = tgt
         '''
-        if self.o2m_matching_enabled:
+        if self.training and self.o2m_matching_enabled:
             o2o_tgt = tgt[:-self.num_queries_o2m]
             o2o_tgt_query_pos = tgt_query_pos[:-self.num_queries_o2m]
             o2o_self_attn_mask = self_attn_mask[:-self.num_queries_o2m, :-self.num_queries_o2m]
@@ -426,5 +427,144 @@ class DeformableTransformerDecoderLayer(nn.Module):
         tgt = self.forward_ffn(tgt)
 
         return tgt, None
+
+
+# class MrDeformableTransformerDecoderLayer(nn.Module):
+#
+#     def __init__(self, d_model=256, d_ffn=1024,
+#                  dropout=0.1, activation="relu",
+#                  n_levels=4, n_heads=8, n_points=4,
+#                  use_deformable_box_attn=False,
+#                  key_aware_type=None,
+#                  o2m_matching_enabled=False,
+#                  num_queries_o2m=1350,
+#                  ):
+#         super().__init__()
+#
+#         self.o2m_matching_enabled = o2m_matching_enabled
+#         self.num_queries_o2m = num_queries_o2m
+#
+#         # cross attention
+#         if use_deformable_box_attn:
+#             raise NotImplementedError
+#         else:
+#             self.cross_attn = MSDeformAttn(d_model, n_levels, n_heads, n_points)
+#         self.dropout1 = nn.Dropout(dropout)
+#         self.norm1 = nn.LayerNorm(d_model)
+#
+#         # self attention
+#         self.self_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout)
+#         self.dropout2 = nn.Dropout(dropout)
+#         self.norm2 = nn.LayerNorm(d_model)
+#
+#         # ffn
+#         self.linear1 = nn.Linear(d_model, d_ffn)
+#         self.activation = _get_activation_fn(activation)
+#         self.dropout3 = nn.Dropout(dropout)
+#         self.linear2 = nn.Linear(d_ffn, d_model)
+#         self.dropout4 = nn.Dropout(dropout)
+#         self.norm3 = nn.LayerNorm(d_model)
+#
+#         self.key_aware_type = key_aware_type
+#         self.key_aware_proj = None
+#
+#         # attn score
+#         self.d_model = d_model
+#         self.query_embed = nn.Linear(self.d_model, self.d_model * 2)
+#
+#     def rm_self_attn_modules(self):
+#         self.self_attn = None
+#         self.dropout2 = None
+#         self.norm2 = None
+#
+#     @staticmethod
+#     def with_pos_embed(tensor, pos):
+#         return tensor if pos is None else tensor + pos
+#
+#     def forward_ffn(self, tgt):
+#         tgt2 = self.linear2(self.dropout3(self.activation(self.linear1(tgt))))
+#         tgt = tgt + self.dropout4(tgt2)
+#         tgt = self.norm3(tgt)
+#         return tgt
+#
+#     @autocast(enabled=False)
+#     def forward(self,
+#                 # for tgt
+#                 tgt: Optional[Tensor],  # nq, bs, d_model
+#                 tgt_query_pos: Optional[Tensor] = None,  # pos for query. MLP(Sine(pos))
+#                 tgt_query_sine_embed: Optional[Tensor] = None,  # pos for query. Sine(pos)
+#                 tgt_key_padding_mask: Optional[Tensor] = None,
+#                 tgt_reference_points: Optional[Tensor] = None,  # nq, bs, 4
+#
+#                 # for memory
+#                 memory: Optional[Tensor] = None,  # hw, bs, d_model
+#                 memory_key_padding_mask: Optional[Tensor] = None,
+#                 memory_level_start_index: Optional[Tensor] = None,  # num_levels
+#                 memory_spatial_shapes: Optional[Tensor] = None,  # bs, num_levels, 2
+#                 memory_pos: Optional[Tensor] = None,  # pos for memory
+#
+#                 # sa
+#                 self_attn_mask: Optional[Tensor] = None,  # mask used for self-attention
+#                 cross_attn_mask: Optional[Tensor] = None,  # mask used for cross-attention
+#                 ):
+#         '''
+#         tgt: nq, bs, d_model
+#         tgt_query_pos: nq, bs, d_model
+#         tgt_query_sine_embed: nq, bs, d_model
+#         memory: hw, bs, d_model
+#         需要注意，tgt_query_pos 和 tgt_query_sine_embed 虽然都表示位置 embedding，但是不一样的，前者是 MLP(Sine(pos))，后者是 Sine(pos)
+#         '''
+#         '''
+#         self attention
+#         query = key = tgt + tgt_query_pos
+#         value = tgt
+#         '''
+#         if self.o2m_matching_enabled:
+#             o2o_tgt = tgt[:-self.num_queries_o2m]
+#             o2o_tgt_query_pos = tgt_query_pos[:-self.num_queries_o2m]
+#             o2o_self_attn_mask = self_attn_mask[:-self.num_queries_o2m, :-self.num_queries_o2m]
+#             o2m_tgt = tgt[-self.num_queries_o2m:]
+#             if self.self_attn is not None:
+#                 q = k = self.with_pos_embed(o2o_tgt, o2o_tgt_query_pos)
+#                 o2o_tgt2 = self.self_attn(q, k, o2o_tgt, attn_mask=o2o_self_attn_mask)[0]
+#                 o2o_tgt = o2o_tgt + self.dropout2(o2o_tgt2)
+#                 o2o_tgt = self.norm2(o2o_tgt)
+#             tgt = torch.cat([o2o_tgt, o2m_tgt], dim=0)
+#         else:
+#             if self.self_attn is not None:
+#                 q = k = self.with_pos_embed(tgt, tgt_query_pos)
+#                 tgt2 = self.self_attn(q, k, tgt, attn_mask=self_attn_mask)[0]
+#                 tgt = tgt + self.dropout2(tgt2)
+#                 tgt = self.norm2(tgt)
+#
+#         # cross attention
+#         if self.key_aware_type is not None:
+#             if self.key_aware_type == 'mean':
+#                 tgt = tgt + memory.mean(0, keepdim=True)
+#             elif self.key_aware_type == 'proj_mean':
+#                 tgt = tgt + self.key_aware_proj(memory).mean(0, keepdim=True)
+#             else:
+#                 raise NotImplementedError("Unknown key_aware_type: {}".format(self.key_aware_type))
+#         '''
+#         # cross attention
+#         query = tgt + tgt_query_pos
+#         reference_points = tgt_reference_points
+#
+#         value = input_flatten = memory
+#         input_spatial_shapes = memory_spatial_shapes
+#         input_level_start_index = memory_level_start_index
+#         input_padding_mask = memory_key_padding_mask # 全是 False，意思是没有 padding 区域
+#         '''
+#         tgt2 = self.cross_attn(self.with_pos_embed(tgt, tgt_query_pos).transpose(0, 1),
+#                                tgt_reference_points.transpose(0, 1).contiguous(),
+#                                memory.transpose(0, 1), memory_spatial_shapes, memory_level_start_index,
+#                                memory_key_padding_mask).transpose(0, 1)
+#         tgt = tgt + self.dropout1(tgt2)
+#         tgt = self.norm1(tgt)
+#
+#         # ffn
+#         tgt = self.forward_ffn(tgt)
+#
+#         return tgt, None
 
 

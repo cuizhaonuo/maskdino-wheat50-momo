@@ -11,6 +11,9 @@ SOLVER:
   IMS_PER_BATCH: 1         # 先不动，避免引入新变量
   BASE_LR: 0.0001          # 先不动；如果你只训head或冻结backbone，再调整
 
+#TEST:
+#  EVAL_PERIOD: 1
+
 MODEL:
   MaskDINO:
     LEARN_TGT: false
@@ -29,7 +32,7 @@ MODEL:
     GIOU_WEIGHT: 2.0
     MASK_WEIGHT: 5.0
 
-    O2M_MATCHING_ENABLED: false
+    O2M_MATCHING_ENABLED: true
     NUM_OBJECT_QUERIES_O2M: 1350
     NUM_TARGETS_K: 6
     DDQ_ENABLED: true

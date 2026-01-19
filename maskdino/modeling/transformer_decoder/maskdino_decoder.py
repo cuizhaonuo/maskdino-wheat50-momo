@@ -449,9 +449,6 @@ class MaskDINODecoder(nn.Module):
         predictions_mask = []
         predictions_iou = []
         if self.two_stage:
-            # --------------------------------------------------------
-            # 1) encoder outputs
-            # --------------------------------------------------------
             output_memory, output_proposals = gen_encoder_output_proposals(
                 src_flatten, mask_flatten, spatial_shapes
             )
@@ -460,24 +457,16 @@ class MaskDINODecoder(nn.Module):
             bs = output_memory.shape[0]
             topk_o2o = self.num_queries
 
-            # --------------------------------------------------------
-            # 2) o2o logits (always)
-            # --------------------------------------------------------
+            # 初始化
             enc_outputs_class_o2o = self.class_embed(output_memory)
             enc_outputs_coord_o2o = self._bbox_embed(output_memory) + output_proposals  # (bs, sum(hw), 4) unsigmoid
 
-            # --------------------------------------------------------
-            # 3) o2m logits (ONLY training & enabled)
-            # --------------------------------------------------------
             use_o2m = bool(self.training and self.o2m_matching_enabled)
             if use_o2m:
                 topk_o2m = self.num_queries_o2m
                 enc_outputs_class_o2m = self.one2many_class_embed(output_memory)
                 enc_outputs_coord_o2m = self._one2many_bbox_embed(output_memory) + output_proposals  # unsigmoid
 
-            # --------------------------------------------------------
-            # helpers
-            # --------------------------------------------------------
             def padding_to(x, max_len):
                 if x is None:
                     return None
@@ -493,9 +482,6 @@ class MaskDINODecoder(nn.Module):
             def align_tensor(list_of_tensors, max_len):
                 return torch.stack([padding_to(t, max_len) for t in list_of_tensors], dim=0)
 
-            # --------------------------------------------------------
-            # 4) query selection
-            # --------------------------------------------------------
             if self.ddq_enabled:
                 # ddq ONLY for o2o
                 iou_thr = self.ddq_iou_threshold
@@ -557,9 +543,6 @@ class MaskDINODecoder(nn.Module):
                     proposals_tensor = o2o_proposals_tensor
                     queries_tensor = o2o_queries_tensor
 
-            # --------------------------------------------------------
-            # 5) finalize (detach)
-            # --------------------------------------------------------
             refpoint_embed_undetach = proposals_tensor  # unsigmoid
             refpoint_embed = refpoint_embed_undetach.detach()
 
@@ -598,7 +581,8 @@ class MaskDINODecoder(nn.Module):
             tgt = self.query_feat.weight[None].repeat(bs, 1, 1)
             refpoint_embed = self.query_embed.weight[None].repeat(bs, 1, 1)
 
-        tgt_mask = None
+        tgt_mask = torch.zeros((self.num_queries, self.num_queries), device=tgt.device).bool()
+        # tgt_mask = None
         mask_dict = None
         if self.dn != "no" and self.training:
             assert targets is not None
@@ -614,7 +598,7 @@ class MaskDINODecoder(nn.Module):
             tgt_len = tgt.shape[1]
             tgt_mask_new = torch.ones((tgt_len, tgt_len), device=tgt.device).bool()
             tgt_mask_new[-self.num_queries_o2m:, -self.num_queries_o2m:] = False
-            tgt_mask_new[:-self.num_queries_o2m, :-self.num_queries_o2m] = tgt_mask if tgt_mask is not None else False
+            tgt_mask_new[:-self.num_queries_o2m, :-self.num_queries_o2m] = tgt_mask
             tgt_mask = tgt_mask_new
 
         # direct prediction from the matching and denoising part in the begining
@@ -644,7 +628,7 @@ class MaskDINODecoder(nn.Module):
                 ddq_boxes = refpoint_embed[:, dn_query_len:dn_query_len + self.num_queries, :]
                 ddq_classes = outputs_class[:, dn_query_len:dn_query_len + self.num_queries, :]
                 keep_mask = get_initial_keep_mask(ddq_boxes, ddq_classes, one2one_len=self.num_queries, one2many_len=self.num_queries_o2m)
-                initial_keep_mask = keep_mask
+                initial_keep_mask = keep_mask if self.training else tgt_mask
 
             predictions_class.append(outputs_class)
             predictions_mask.append(outputs_mask)
@@ -663,8 +647,27 @@ class MaskDINODecoder(nn.Module):
             valid_ratios=valid_ratios,
             tgt_mask=tgt_mask,
             pred_head=self,
-
         )
+
+        # sep_branch_enabled = True
+        # if sep_branch_enabled:
+        #     if self.training:
+        #         num_queries_dn = mask_dict['pad_size'] if mask_dict is not None else 0
+        #         o2o_tgt = tgt[:, num_queries_dn:num_queries_dn + self.num_queries, :]
+        #         o2o_refpoint_embed = refpoint_embed[:, num_queries_dn:num_queries_dn + self.num_queries, :]
+        #         sep_hs, sep_references, _ = self.decoder(
+        #             tgt=o2o_tgt.transpose(0, 1),
+        #             memory=src_flatten.transpose(0, 1),
+        #             memory_key_padding_mask=mask_flatten,
+        #             pos=None,
+        #             refpoints_unsigmoid=o2o_refpoint_embed.transpose(0, 1),
+        #             level_start_index=level_start_index,
+        #             spatial_shapes=spatial_shapes,
+        #             valid_ratios=valid_ratios,
+        #             tgt_mask=tgt_mask,
+        #             pred_head=self,
+        #         )
+
         if mask_dict is not None:
             num_dn_queries = mask_dict['pad_size']
             distinct_masks = [mask[:, num_dn_queries:] for mask in distinct_masks]
