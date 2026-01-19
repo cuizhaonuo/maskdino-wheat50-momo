@@ -296,8 +296,13 @@ class DeformableTransformerDecoderLayer(nn.Module):
                  n_levels=4, n_heads=8, n_points=4,
                  use_deformable_box_attn=False,
                  key_aware_type=None,
+                 o2m_matching_enabled=False,
+                 num_queries_o2m=1350,
                  ):
         super().__init__()
+
+        self.o2m_matching_enabled = o2m_matching_enabled
+        self.num_queries_o2m = num_queries_o2m
 
         # cross attention
         if use_deformable_box_attn:
@@ -374,19 +379,23 @@ class DeformableTransformerDecoderLayer(nn.Module):
         query = key = tgt + tgt_query_pos
         value = tgt
         '''
-        num_queries = 900
-        o2o_tgt = tgt[:num_queries]
-        o2o_tgt_query_pos = tgt_query_pos[:num_queries]
-        o2o_self_attn_mask = self_attn_mask[:num_queries, :num_queries]
-
-        o2m_tgt = tgt[num_queries:]
-
-        if self.self_attn is not None:
-            q = k = self.with_pos_embed(o2o_tgt, o2o_tgt_query_pos)
-            o2o_tgt2 = self.self_attn(q, k, o2o_tgt, attn_mask=o2o_self_attn_mask)[0]
-            o2o_tgt = o2o_tgt + self.dropout2(o2o_tgt2)
-            o2o_tgt = self.norm2(o2o_tgt)
-        tgt = torch.cat([o2o_tgt, o2m_tgt], dim=0)
+        if self.o2m_matching_enabled:
+            o2o_tgt = tgt[:-self.num_queries_o2m]
+            o2o_tgt_query_pos = tgt_query_pos[:-self.num_queries_o2m]
+            o2o_self_attn_mask = self_attn_mask[:-self.num_queries_o2m, :-self.num_queries_o2m]
+            o2m_tgt = tgt[-self.num_queries_o2m:]
+            if self.self_attn is not None:
+                q = k = self.with_pos_embed(o2o_tgt, o2o_tgt_query_pos)
+                o2o_tgt2 = self.self_attn(q, k, o2o_tgt, attn_mask=o2o_self_attn_mask)[0]
+                o2o_tgt = o2o_tgt + self.dropout2(o2o_tgt2)
+                o2o_tgt = self.norm2(o2o_tgt)
+            tgt = torch.cat([o2o_tgt, o2m_tgt], dim=0)
+        else:
+            if self.self_attn is not None:
+                q = k = self.with_pos_embed(tgt, tgt_query_pos)
+                tgt2 = self.self_attn(q, k, tgt, attn_mask=self_attn_mask)[0]
+                tgt = tgt + self.dropout2(tgt2)
+                tgt = self.norm2(tgt)
 
         # cross attention
         if self.key_aware_type is not None:

@@ -5,21 +5,21 @@ from matplotlib import pyplot as plt
 
 output_base_dir = "/public/home/zncui/pycharm_project/MaskDINO/output"
 output_dirs = [
-    # "maskdino_swinl-time-10-19-20-00-v1-patch-2000-no-dn-learn-tgt-one-to-one-300",
+    "maskdino_swinl-time-10-19-20-00-v1-patch-2000-no-dn-learn-tgt-one-to-one-300",
     # "maskdino_swinl-time-10-19-20-00-v1-patch-2000-no-dn-learn-tgt-all-layer-iou-cls-1.0-iou-5.0-ddq-initial-layer-wise"
     # "maskdino_swinl-time-10-19-20-00-v1-patch-2000-no-dn-learn-tgt-all-layer-iou-cls-1.0-iou-5.0-matching-prob-iou-cls-bias",
     # "maskdino_swinl-time-10-19-20-00-v1-patch-2000-no-dn-learn-tgt-all-layer-iou-cls-1.0-iou-5.0-matching-prob-iou-cls-bias-v2"
     # "maskdino_swinl-time-10-19-20-00-v1-patch-2000-no-dn-two-stage-all-layer-iou-cls-1.0-iou-5.0-no-gated-attn-ddq-one2many",
     # "maskdino_swinl-time-10-19-20-00-v1-patch-2000-no-dn-two-stage-all-layer-iou-cls-1.0-iou-5.0-no-gated-attn-ddq-one2many-k6",
     # "maskdino_swinl-time-10-19-20-00-v1-patch-2000-no-dn-two-stage-all-layer-iou-cls-1.0-iou-5.0-no-gated-attn-ddq-one2many-v2-dac",
-    "maskdino_swinl-time-10-19-20-00-v1-patch-2000-dn-two-stage-q300/",
+    # "maskdino_swinl-time-10-19-20-00-v1-patch-2000-dn-two-stage-q300/",
     "maskdino_swinl-time-10-19-20-00-v1-patch-2000-dn-two-stage-q900/",
     "maskdino_swinl-time-10-19-20-00-v1-patch-2000-no-dn-two-stage-all-layer-iou-cls-1.0-iou-5.0-no-gated-attn-ddq-one2many-v2-dac-align-no-rank-weight-dn/"
 
 ]
 labels = [
-    "base-q300",
-    "base-q900",
+    "base",
+    "base-dn-two-stage",
     "v1",
 ]
 bbox_segm_metrics = []
@@ -45,7 +45,7 @@ def smooth(y, k=5):
 
 rows = 1
 cols = 3
-fig, ax = plt.subplots(rows, cols)
+fig, ax = plt.subplots(rows, cols, figsize=(10, 10))
 # eval_period = 267
 # eval_steps = list(range(eval_period, 2000, eval_period)) + [2000]
 # train_steps = list(range(20, 2000, 20)) + [2000]
