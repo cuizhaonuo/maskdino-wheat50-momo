@@ -170,7 +170,9 @@ class MaskDINODecoder(nn.Module):
         self.decoder_norm = decoder_norm = nn.LayerNorm(hidden_dim)
         decoder_layer = DeformableTransformerDecoderLayer(hidden_dim, dim_feedforward,
                                                           dropout, activation,
-                                                          self.num_feature_levels, nhead, dec_n_points)
+                                                          self.num_feature_levels, nhead, dec_n_points,
+                                                          o2m_matching_enabled=self.o2m_matching_enabled,
+                                                          num_queries_o2m=self.num_queries_o2m,)
         self.decoder = TransformerDecoder(decoder_layer, self.num_layers, decoder_norm,
                                           return_intermediate=return_intermediate_dec,
                                           d_model=hidden_dim, query_dim=query_dim,
