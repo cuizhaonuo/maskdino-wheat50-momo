@@ -158,7 +158,9 @@ class HungarianMatcher(nn.Module):
             out_prob = outputs["pred_logits"][b].sigmoid()  # [num_queries, num_classes]
             if 'pred_logits_iou' in outputs:
                 out_iou = outputs['pred_logits_iou'][b].sigmoid()
-                out_prob = out_prob * out_iou
+                # out_prob = out_prob * out_iou
+                alpha = 0.25
+                out_prob = out_prob.pow(alpha) * out_iou.pow(1-alpha)
 
             tgt_ids = targets[b]["labels"]
             # focal loss

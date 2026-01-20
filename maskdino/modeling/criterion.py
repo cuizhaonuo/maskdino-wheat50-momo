@@ -278,16 +278,6 @@ class SetCriterion(nn.Module):
 
         if 'pred_logits_iou' in outputs and self.layer_wise_iou_enabled:
             src_iou = outputs['pred_logits_iou'][idx].squeeze(-1).sigmoid()
-
-            # unmatched_pred_iou = outputs['pred_logits_iou'].squeeze().sigmoid()
-            # unmatched_pred_iou = unmatched_pred_iou.detach().cpu()
-            # nq = unmatched_pred_iou.shape[0]
-            # nq_x_axis = torch.arange(nq, dtype=torch.int64, device=unmatched_pred_iou.device)
-            # from matplotlib import pyplot as plt
-            # plt.figure()
-            # plt.plot(nq_x_axis, unmatched_pred_iou)
-            # plt.show()
-
             iou, _ = box_ops.box_iou(
                 box_ops.box_cxcywh_to_xyxy(src_boxes),
                 box_ops.box_cxcywh_to_xyxy(target_boxes),
@@ -295,11 +285,6 @@ class SetCriterion(nn.Module):
             target_iou = torch.diag(iou).detach()
 
             loss_iou = F.smooth_l1_loss(src_iou, target_iou, reduction='none')
-
-            # for i, (pred_iou, tgt_iou) in enumerate(zip(src_iou, target_iou)):
-            #     pred_iou = pred_iou
-            #     tgt_iou = tgt_iou
-            #     print(f'query id: {i} --> pred_iou[{pred_iou}] tgt_iou[{tgt_iou}]')
 
             losses['loss_iou'] = loss_iou.sum() / num_boxes * 5
 

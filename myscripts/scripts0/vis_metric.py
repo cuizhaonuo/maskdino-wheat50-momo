@@ -3,7 +3,7 @@ import json
 import pandas as pd
 from matplotlib import pyplot as plt
 
-mode = "experiment" # "experiment" or "ablation"
+mode = "ablation" # "experiment" or "ablation"
 
 if mode == "ablation":
     output_base_dir = "/public/home/zncui/pycharm_project/MaskDINO/output"
@@ -18,14 +18,15 @@ if mode == "ablation":
         # "maskdino_swinl-time-10-19-20-00-v1-patch-2000-dn-two-stage-q300/",
         "maskdino_swinl-time-10-19-20-00-v1-patch-2000-dn-two-stage-q900/",
         "maskdino_swinl-time-10-19-20-00-v1-patch-2000-no-dn-two-stage-all-layer-iou-cls-1.0-iou-5.0-no-gated-attn-ddq-one2many-v2-dac-align-no-rank-weight-dn/",
-        "maskdino_swinl-time-10-19-20-00-v1-patch-2000-no-dn-two-stage-all-layer-iou-cls-1.0-iou-5.0-no-gated-attn-ddq-one2many-v2-dac-align-no-rank-weight-dn-x4/"
-
+        "maskdino_swinl-time-10-19-20-00-v1-patch-2000-no-dn-two-stage-all-layer-iou-cls-1.0-iou-5.0-no-gated-attn-ddq-one2many-v2-dac-align-no-rank-weight-dn-x4/",
+        "experiment0/two-stage-cls-1.0-ddq-0.8-align-layer-wise-iou-25.0-matcher-nms-no-sep-branch-dn-100-o2m-1350-k-6-q300",
     ]
     labels = [
         "base",
         "base-dn-two-stage",
         "v1",
-        "v1-sep"
+        "v1-sep",
+        "v1-align-matcher"
     ]
 
 if mode == "experiment":
