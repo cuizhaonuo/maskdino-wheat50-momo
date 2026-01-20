@@ -57,6 +57,7 @@ class MaskDINO(nn.Module):
         o2m_matching_enabled = False,
         num_targets_k = 6,
         layer_wise_iou_enabled = False,
+        sep_branch_enabled = False,
     ):
         """
         Args:
@@ -88,6 +89,7 @@ class MaskDINO(nn.Module):
 
         self.o2m_matching_enabled = o2m_matching_enabled
         self.num_targets_k = num_targets_k
+        self.sep_branch_enabled = sep_branch_enabled
 
         self.backbone = backbone
         self.pano_temp = pano_temp
@@ -128,6 +130,7 @@ class MaskDINO(nn.Module):
         num_targets_k = cfg.MODEL.MaskDINO.NUM_TARGETS_K
         layer_wise_iou_enabled = cfg.MODEL.MaskDINO.LAYER_WISE_IOU_ENABLED
         align_loss_enabled = cfg.MODEL.MaskDINO.ALIGN_LOSS_ENABLED
+        sep_branch_enabled = cfg.MODEL.MaskDINO.SEP_BRANCH_ENABLED
 
         backbone = build_backbone(cfg)
         sem_seg_head = build_sem_seg_head(cfg, backbone.output_shape())
@@ -212,6 +215,7 @@ class MaskDINO(nn.Module):
             "o2m_matching_enabled": o2m_matching_enabled,
             "num_targets_k": num_targets_k,
             "layer_wise_iou_enabled": layer_wise_iou_enabled,
+            "sep_branch_enabled": sep_branch_enabled,
             "backbone": backbone,
             "sem_seg_head": sem_seg_head,
             "criterion": criterion,
@@ -289,23 +293,22 @@ class MaskDINO(nn.Module):
                 targets = None
 
             # 预处理时已经 pad 好了，不需要在这里 pad 了，因此不传入 mask，即 mask=None
-            outputs, outputs_one2many, mask_dict = self.sem_seg_head(features, targets=targets)
+            outputs, outputs_one2many, out_sep, mask_dict = self.sem_seg_head(features, targets=targets)
 
             # one-to-one loss, one-to-one query and denoising query
             # bipartite matching-based loss
             losses, _ = self.criterion(outputs, targets, mask_dict)
 
+            def duplicate_targets(src_targets, k_one2many):
+                for t in src_targets:
+                    t['labels'] = t['labels'].repeat(k_one2many)
+                    t['masks'] = t['masks'].repeat(k_one2many, 1, 1)
+                    t['boxes'] = t['boxes'].repeat(k_one2many, 1)
+                return src_targets
+
             # one-to-many loss, one-to-many query
             if self.o2m_matching_enabled:
                 multi_targets = copy.deepcopy(targets)
-
-                def duplicate_targets(src_targets, k_one2many):
-                    for t in src_targets:
-                        t['labels'] = t['labels'].repeat(k_one2many)
-                        t['masks'] = t['masks'].repeat(k_one2many, 1, 1)
-                        t['boxes'] = t['boxes'].repeat(k_one2many, 1)
-                    return src_targets
-
                 multi_targets = duplicate_targets(multi_targets, k_one2many=self.num_targets_k)
                 # mask_dict = None # 表示关闭 dn-query
                 losses_one2many, _ = self.criterion(outputs_one2many, multi_targets, None)
@@ -314,6 +317,17 @@ class MaskDINO(nn.Module):
                     losses[key + '_one2many'] = value * lambda_one2many
                     weight = self.criterion.weight_dict[key]
                     self.criterion.weight_dict[key + '_one2many'] = weight
+
+            if self.sep_branch_enabled:
+                multi_targets = copy.deepcopy(targets)
+                multi_targets = duplicate_targets(multi_targets, k_one2many=self.num_targets_k)
+                losses_sep, _ = self.criterion(out_sep, multi_targets, None)
+                lambda_sep = 1.0
+                for key, value in losses_sep.items():
+                    losses[key + '_sep'] = value * lambda_sep
+                    weight = self.criterion.weight_dict[key]
+                    self.criterion.weight_dict[key + '_sep'] = weight
+
 
             for k in list(losses.keys()):
                 if k in self.criterion.weight_dict:
@@ -326,14 +340,8 @@ class MaskDINO(nn.Module):
                     losses.pop(k)
             return losses
         else:
+            outputs, _, _, _ = self.sem_seg_head(features)
 
-            # 在推理过程中 aux_outputs.pred_masks 是 None，但是在训练的过程中是 (bs, num_queries, H/4, W/4)
-            outputs, _, _ = self.sem_seg_head(features)
-            # test the outputs of interm_outputs and aux_outputs
-            # ...
-            # outputs = outputs['interm_outputs']
-            # outputs = outputs['aux_outputs'][0]
-            # ...
             mask_cls_results = outputs["pred_logits"]
             mask_pred_results = outputs["pred_masks"]
             mask_box_results = outputs["pred_boxes"]

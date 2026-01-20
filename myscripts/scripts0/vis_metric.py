@@ -14,13 +14,15 @@ output_dirs = [
     # "maskdino_swinl-time-10-19-20-00-v1-patch-2000-no-dn-two-stage-all-layer-iou-cls-1.0-iou-5.0-no-gated-attn-ddq-one2many-v2-dac",
     # "maskdino_swinl-time-10-19-20-00-v1-patch-2000-dn-two-stage-q300/",
     "maskdino_swinl-time-10-19-20-00-v1-patch-2000-dn-two-stage-q900/",
-    "maskdino_swinl-time-10-19-20-00-v1-patch-2000-no-dn-two-stage-all-layer-iou-cls-1.0-iou-5.0-no-gated-attn-ddq-one2many-v2-dac-align-no-rank-weight-dn/"
+    "maskdino_swinl-time-10-19-20-00-v1-patch-2000-no-dn-two-stage-all-layer-iou-cls-1.0-iou-5.0-no-gated-attn-ddq-one2many-v2-dac-align-no-rank-weight-dn/",
+    "maskdino_swinl-time-10-19-20-00-v1-patch-2000-no-dn-two-stage-all-layer-iou-cls-1.0-iou-5.0-no-gated-attn-ddq-one2many-v2-dac-align-no-rank-weight-dn-x4/"
 
 ]
 labels = [
     "base",
     "base-dn-two-stage",
     "v1",
+    "v1-sep"
 ]
 bbox_segm_metrics = []
 total_losses_list = []

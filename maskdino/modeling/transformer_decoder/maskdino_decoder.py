@@ -69,13 +69,14 @@ class MaskDINODecoder(nn.Module):
             dec_layer_share: bool = False,
             semantic_ce_loss: bool = False,
 
-            num_queries_o2m,
-            o2m_matching_enabled,
-            num_targets_k,
-            ddq_enabled,
-            ddq_iou_threshold,
-            layer_wise_iou_enabled,
-            align_loss_enabled,
+            num_queries_o2m: int = 1350,
+            o2m_matching_enabled: bool = True,
+            num_targets_k: int = 6,
+            ddq_enabled: bool = True,
+            ddq_iou_threshold: float = 0.8,
+            layer_wise_iou_enabled: bool = False,
+            align_loss_enabled: bool = False,
+            sep_branch_enabled: bool = False,
     ):
         """
         NOTE: this interface is experimental.
@@ -113,6 +114,7 @@ class MaskDINODecoder(nn.Module):
         self.ddq_iou_threshold = ddq_iou_threshold
         self.layer_wise_iou_enabled = layer_wise_iou_enabled
         self.align_loss_enabled = align_loss_enabled
+        self.sep_branch_enabled = sep_branch_enabled
 
         self.mask_classification = mask_classification
         self.num_feature_levels = total_num_feature_levels
@@ -182,6 +184,7 @@ class MaskDINODecoder(nn.Module):
                                           o2m_matching_enabled = self.o2m_matching_enabled,
                                           num_queries = self.num_queries,
                                           num_queries_o2m = self.num_queries_o2m,
+                                          sep_branch_enabled = self.sep_branch_enabled,
                                           )
 
         self.hidden_dim = hidden_dim
@@ -226,7 +229,7 @@ class MaskDINODecoder(nn.Module):
         ret["ddq_iou_threshold"] = cfg.MODEL.MaskDINO.DDQ_IOU_THRESHOLD
         ret["layer_wise_iou_enabled"] = cfg.MODEL.MaskDINO.LAYER_WISE_IOU_ENABLED
         ret["align_loss_enabled"] = cfg.MODEL.MaskDINO.ALIGN_LOSS_ENABLED
-
+        ret["sep_branch_enabled"] = cfg.MODEL.MaskDINO.SEP_BRANCH_ENABLED
         return ret
 
     def prepare_for_dn(self, targets, tgt, refpoint_emb, batch_size):
@@ -596,7 +599,13 @@ class MaskDINODecoder(nn.Module):
 
         if self.training and self.o2m_matching_enabled:
             tgt_len = tgt.shape[1]
-            tgt_mask_new = torch.ones((tgt_len, tgt_len), device=tgt.device).bool()
+
+            # tgt_mask 不能是 None
+            if tgt_mask is None:
+                base_len = tgt_len - self.num_queries_o2m
+                tgt_mask = torch.zeros((base_len, base_len), device=tgt.device, dtype=torch.bool)
+
+            tgt_mask_new = torch.ones((tgt_len, tgt_len), device=tgt.device, dtype=torch.bool)
             tgt_mask_new[-self.num_queries_o2m:, -self.num_queries_o2m:] = False
             tgt_mask_new[:-self.num_queries_o2m, :-self.num_queries_o2m] = tgt_mask
             tgt_mask = tgt_mask_new
@@ -605,6 +614,7 @@ class MaskDINODecoder(nn.Module):
         if self.initial_pred:
             outputs_class, outputs_mask = self.forward_prediction_heads(tgt.transpose(0, 1), mask_features, True)
 
+            # 注意 ddq 可以在 train/inference 同时使用
             if self.ddq_enabled:
                 def get_initial_keep_mask(out_boxes, out_classes, one2one_len=900, one2many_len=1350):
                     boxes_b = out_boxes.sigmoid()
@@ -628,7 +638,7 @@ class MaskDINODecoder(nn.Module):
                 ddq_boxes = refpoint_embed[:, dn_query_len:dn_query_len + self.num_queries, :]
                 ddq_classes = outputs_class[:, dn_query_len:dn_query_len + self.num_queries, :]
                 keep_mask = get_initial_keep_mask(ddq_boxes, ddq_classes, one2one_len=self.num_queries, one2many_len=self.num_queries_o2m)
-                initial_keep_mask = keep_mask if self.training else tgt_mask
+                initial_keep_mask = keep_mask if self.training else keep_mask[:, :self.num_queries]
 
             predictions_class.append(outputs_class)
             predictions_mask.append(outputs_mask)
@@ -647,26 +657,61 @@ class MaskDINODecoder(nn.Module):
             valid_ratios=valid_ratios,
             tgt_mask=tgt_mask,
             pred_head=self,
+            mode='main_branch'
         )
 
-        # sep_branch_enabled = True
-        # if sep_branch_enabled:
-        #     if self.training:
-        #         num_queries_dn = mask_dict['pad_size'] if mask_dict is not None else 0
-        #         o2o_tgt = tgt[:, num_queries_dn:num_queries_dn + self.num_queries, :]
-        #         o2o_refpoint_embed = refpoint_embed[:, num_queries_dn:num_queries_dn + self.num_queries, :]
-        #         sep_hs, sep_references, _ = self.decoder(
-        #             tgt=o2o_tgt.transpose(0, 1),
-        #             memory=src_flatten.transpose(0, 1),
-        #             memory_key_padding_mask=mask_flatten,
-        #             pos=None,
-        #             refpoints_unsigmoid=o2o_refpoint_embed.transpose(0, 1),
-        #             level_start_index=level_start_index,
-        #             spatial_shapes=spatial_shapes,
-        #             valid_ratios=valid_ratios,
-        #             tgt_mask=tgt_mask,
-        #             pred_head=self,
-        #         )
+
+        out_sep = None
+        if self.training and self.sep_branch_enabled:
+            num_queries_dn = mask_dict['pad_size'] if mask_dict is not None else 0
+            o2o_tgt = tgt[:, num_queries_dn:num_queries_dn + self.num_queries, :]
+            o2o_refpoint_embed = refpoint_embed[:, num_queries_dn:num_queries_dn + self.num_queries, :]
+            o2o_tgt_mask = torch.zeros((self.num_queries, self.num_queries), device=tgt.device).bool()
+            sep_hs, sep_references, _ = self.decoder(
+                tgt=o2o_tgt.transpose(0, 1),
+                memory=src_flatten.transpose(0, 1),
+                memory_key_padding_mask=mask_flatten,
+                pos=None,
+                refpoints_unsigmoid=o2o_refpoint_embed.transpose(0, 1),
+                level_start_index=level_start_index,
+                spatial_shapes=spatial_shapes,
+                valid_ratios=valid_ratios,
+                tgt_mask=o2o_tgt_mask,
+                pred_head=self,
+                mode='sep_branch',
+            )
+
+            predictions_class_sep = []
+            predictions_mask_sep = []
+            predictions_iou_sep = []
+            for i, sep_output in enumerate(sep_hs):
+                outputs_class_sep, outputs_mask_sep = self.forward_prediction_heads(
+                    sep_output.transpose(0, 1), mask_features, True)
+
+                predictions_class_sep.append(outputs_class_sep)
+                predictions_mask_sep.append(outputs_mask_sep)
+
+                if self.layer_wise_iou_enabled:
+                    outputs_iou_sep = self.iou_head(self.iou_head_before_norm(sep_output))
+                    predictions_iou_sep.append(outputs_iou_sep)
+            predictions_class_sep = torch.stack(predictions_class_sep, dim=0)
+            predictions_mask_sep = torch.stack(predictions_mask_sep, dim=0)
+            if self.layer_wise_iou_enabled:
+                predictions_iou_sep = torch.stack(predictions_iou_sep, dim=0)
+            out_boxes_sep = self.pred_box(sep_references, sep_hs)
+            out_sep = {
+                'pred_logits': predictions_class_sep[-1],
+                'pred_masks': predictions_mask_sep[-1],
+                'pred_boxes': out_boxes_sep[-1],
+                'aux_outputs': self._set_aux_loss(
+                    predictions_class_sep if self.mask_classification else None,
+                    predictions_mask_sep,
+                    predictions_iou_sep,
+                    out_boxes_sep
+                )
+            }
+            if self.layer_wise_iou_enabled:
+                out_sep['pred_logits_iou'] = predictions_iou_sep[-1]
 
         if mask_dict is not None:
             num_dn_queries = mask_dict['pad_size']
@@ -798,7 +843,7 @@ class MaskDINODecoder(nn.Module):
         else:
             raise ValueError(f"Batch size {bs} != 1")
 
-        return out, out_one_to_many, mask_dict
+        return out, out_one_to_many, out_sep, mask_dict
 
     def forward_prediction_heads(self, output, mask_features, pred_mask=True):
         decoder_output = self.decoder_norm(output)

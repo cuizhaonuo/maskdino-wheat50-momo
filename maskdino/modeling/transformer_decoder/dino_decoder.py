@@ -30,16 +30,18 @@ class TransformerDecoder(nn.Module):
                  rm_dec_query_scale=True,
                  dec_layer_share=False,
                  dec_layer_dropout_prob=None,
-                 ddq_enabled=True,
-                 o2m_matching_enabled=True,
+                 ddq_enabled=False,
+                 o2m_matching_enabled=False,
                  num_queries=900,
                  num_queries_o2m=1350,
+                 sep_branch_enabled=False
                  ):
         super().__init__()
         self.ddq_enabled = ddq_enabled
         self.o2m_matching_enabled = o2m_matching_enabled
         self.num_queries = num_queries
         self.num_queries_o2m = num_queries_o2m
+        self.sep_branch_enabled = sep_branch_enabled
 
         if num_layers > 0:
             self.layers = _get_clones(decoder_layer, num_layers, layer_share=dec_layer_share)
@@ -127,6 +129,7 @@ class TransformerDecoder(nn.Module):
         device = tgt.device
 
         pred_head = kwargs.get('pred_head', None)
+        mode = kwargs.get('mode', None)
 
         intermediate = []
         # refpoints_unsigmoid (reference_points_unsigmoid) --> reference_points
@@ -177,7 +180,8 @@ class TransformerDecoder(nn.Module):
                 memory_pos=pos, # None
 
                 self_attn_mask=tgt_mask,
-                cross_attn_mask=memory_mask # None
+                cross_attn_mask=memory_mask, # None
+                mode=mode,
             )
             attn_output_weights_list.append(attn_output_weights)
             # refinement of reference points
@@ -204,7 +208,8 @@ class TransformerDecoder(nn.Module):
             outputs_class = outputs_class.transpose(0, 1)  # (nq, bs, num_classes)
             layer_classes = outputs_class
 
-            if self.ddq_enabled and (layer_boxes is not None):
+
+            if mode == 'main_branch' and self.ddq_enabled and (layer_boxes is not None):
                 scores = layer_classes.sigmoid().max(-1)[0]  # (nq, bs)
                 boxes = layer_boxes  # (nq, bs, 4)
                 scores_b = scores.transpose(0, 1).contiguous()  # (bs, nq)
@@ -326,6 +331,14 @@ class DeformableTransformerDecoderLayer(nn.Module):
         self.dropout4 = nn.Dropout(dropout)
         self.norm3 = nn.LayerNorm(d_model)
 
+        # ffn sep
+        self.sep_linear1 = nn.Linear(d_model, d_ffn)
+        self.sep_activation = _get_activation_fn(activation)
+        self.sep_dropout3 = nn.Dropout(dropout)
+        self.sep_linear2 = nn.Linear(d_ffn, d_model)
+        self.sep_dropout4 = nn.Dropout(dropout)
+        self.sep_norm3 = nn.LayerNorm(d_model)
+
         self.key_aware_type = key_aware_type
         self.key_aware_proj = None
 
@@ -348,223 +361,126 @@ class DeformableTransformerDecoderLayer(nn.Module):
         tgt = self.norm3(tgt)
         return tgt
 
+    def forward_ffn_sep(self, tgt):
+        tgt2 = self.sep_linear2(self.sep_dropout3(self.sep_activation(self.sep_linear1(tgt))))
+        tgt = tgt + self.sep_dropout4(tgt2)
+        tgt = self.sep_norm3(tgt)
+        return tgt
+
     @autocast(enabled=False)
     def forward(self,
                 # for tgt
-                tgt: Optional[Tensor],  # nq, bs, d_model
-                tgt_query_pos: Optional[Tensor] = None,  # pos for query. MLP(Sine(pos))
-                tgt_query_sine_embed: Optional[Tensor] = None,  # pos for query. Sine(pos)
-                tgt_key_padding_mask: Optional[Tensor] = None,
-                tgt_reference_points: Optional[Tensor] = None,  # nq, bs, 4
+                tgt: Tensor,  # nq, bs, d_model
+                tgt_query_pos: Tensor,  # nq, bs, d_model
+                tgt_query_sine_embed: Tensor,  # nq, bs, d_model (unused)
+                tgt_key_padding_mask: Tensor,  # (unused)
+                tgt_reference_points: Tensor,  # nq, bs, 4
 
                 # for memory
-                memory: Optional[Tensor] = None,  # hw, bs, d_model
-                memory_key_padding_mask: Optional[Tensor] = None,
-                memory_level_start_index: Optional[Tensor] = None,  # num_levels
-                memory_spatial_shapes: Optional[Tensor] = None,  # bs, num_levels, 2
-                memory_pos: Optional[Tensor] = None,  # pos for memory
+                memory: Tensor,  # hw, bs, d_model
+                memory_key_padding_mask: Tensor,
+                memory_level_start_index: Tensor,  # num_levels
+                memory_spatial_shapes: Tensor,  # bs, num_levels, 2
+                memory_pos: Tensor,  # (unused)
 
                 # sa
-                self_attn_mask: Optional[Tensor] = None,  # mask used for self-attention
-                cross_attn_mask: Optional[Tensor] = None,  # mask used for cross-attention
+                self_attn_mask: Tensor,  # or None
+                cross_attn_mask: Tensor,  # (unused)
+                **kwargs
                 ):
-        '''
+        """
         tgt: nq, bs, d_model
         tgt_query_pos: nq, bs, d_model
         tgt_query_sine_embed: nq, bs, d_model
-        memory: hw, bs, d_model
-        需要注意，tgt_query_pos 和 tgt_query_sine_embed 虽然都表示位置 embedding，但是不一样的，前者是 MLP(Sine(pos))，后者是 Sine(pos)
-        '''
-        '''
-        self attention
-        query = key = tgt + tgt_query_pos
-        value = tgt
-        '''
-        if self.training and self.o2m_matching_enabled:
-            o2o_tgt = tgt[:-self.num_queries_o2m]
-            o2o_tgt_query_pos = tgt_query_pos[:-self.num_queries_o2m]
-            o2o_self_attn_mask = self_attn_mask[:-self.num_queries_o2m, :-self.num_queries_o2m]
-            o2m_tgt = tgt[-self.num_queries_o2m:]
-            if self.self_attn is not None:
-                q = k = self.with_pos_embed(o2o_tgt, o2o_tgt_query_pos)
-                o2o_tgt2 = self.self_attn(q, k, o2o_tgt, attn_mask=o2o_self_attn_mask)[0]
-                o2o_tgt = o2o_tgt + self.dropout2(o2o_tgt2)
-                o2o_tgt = self.norm2(o2o_tgt)
-            tgt = torch.cat([o2o_tgt, o2m_tgt], dim=0)
-        else:
-            if self.self_attn is not None:
-                q = k = self.with_pos_embed(tgt, tgt_query_pos)
-                tgt2 = self.self_attn(q, k, tgt, attn_mask=self_attn_mask)[0]
-                tgt = tgt + self.dropout2(tgt2)
-                tgt = self.norm2(tgt)
 
-        # cross attention
-        if self.key_aware_type is not None:
-            if self.key_aware_type == 'mean':
-                tgt = tgt + memory.mean(0, keepdim=True)
-            elif self.key_aware_type == 'proj_mean':
-                tgt = tgt + self.key_aware_proj(memory).mean(0, keepdim=True)
+        注意：
+        - tgt_query_pos = MLP(Sine(pos))
+        - tgt_query_sine_embed = Sine(pos)
+        """
+
+        # ---------------- helpers ----------------
+        def _sa_block(x: Tensor, pos: Tensor, attn_mask: Tensor) -> Tensor:
+            if self.self_attn is None:
+                return x
+            q = k = self.with_pos_embed(x, pos)
+            x2 = self.self_attn(q, k, x, attn_mask=attn_mask)[0]
+            x = x + self.dropout2(x2)
+            x = self.norm2(x)
+            return x
+
+        def _apply_key_aware(x: Tensor, mem: Tensor) -> Tensor:
+            if self.key_aware_type is None:
+                return x
+            if self.key_aware_type == "mean":
+                return x + mem.mean(0, keepdim=True)
+            if self.key_aware_type == "proj_mean":
+                return x + self.key_aware_proj(mem).mean(0, keepdim=True)
+            raise NotImplementedError(f"Unknown key_aware_type: {self.key_aware_type}")
+
+        def _ca_block(x: Tensor,
+                      pos: Tensor,
+                      ref_pts: Tensor,
+                      mem: Tensor,
+                      spatial_shapes: Tensor,
+                      level_start_index: Tensor,
+                      mem_pad_mask: Tensor) -> Tensor:
+            q = self.with_pos_embed(x, pos).transpose(0, 1)  # bs, nq, d
+            rp = ref_pts.transpose(0, 1).contiguous()  # bs, nq, 4
+            v = mem.transpose(0, 1)  # bs, hw, d
+
+            x2 = self.cross_attn(
+                q, rp, v,
+                spatial_shapes,
+                level_start_index,
+                mem_pad_mask
+            ).transpose(0, 1)  # nq, bs, d
+
+            x = x + self.dropout1(x2)
+            x = self.norm1(x)
+            return x
+
+        mode = kwargs.get('mode', None)
+
+        if self.training and mode == 'sep_branch':
+            tgt = _sa_block(tgt, tgt_query_pos, self_attn_mask)
+            tgt = _apply_key_aware(tgt, memory)
+            tgt = _ca_block(
+                tgt, tgt_query_pos, tgt_reference_points,
+                memory, memory_spatial_shapes, memory_level_start_index,
+                memory_key_padding_mask
+            )
+            tgt = self.forward_ffn_sep(tgt)
+            return tgt, None
+
+        if self.training and self.o2m_matching_enabled and mode == 'main_branch':
+            n_o2m = self.num_queries_o2m
+
+            o2o_tgt = tgt[:-n_o2m]
+            o2m_tgt = tgt[-n_o2m:]
+            o2o_pos = tgt_query_pos[:-n_o2m]
+
+            if self_attn_mask is None:
+                o2o_mask = None
             else:
-                raise NotImplementedError("Unknown key_aware_type: {}".format(self.key_aware_type))
-        '''
-        # cross attention
-        query = tgt + tgt_query_pos 
-        reference_points = tgt_reference_points
-        
-        value = input_flatten = memory
-        input_spatial_shapes = memory_spatial_shapes
-        input_level_start_index = memory_level_start_index 
-        input_padding_mask = memory_key_padding_mask # 全是 False，意思是没有 padding 区域
-        '''
-        tgt2 = self.cross_attn(self.with_pos_embed(tgt, tgt_query_pos).transpose(0, 1),
-                               tgt_reference_points.transpose(0, 1).contiguous(),
-                               memory.transpose(0, 1), memory_spatial_shapes, memory_level_start_index,
-                               memory_key_padding_mask).transpose(0, 1)
-        tgt = tgt + self.dropout1(tgt2)
-        tgt = self.norm1(tgt)
+                o2o_mask = self_attn_mask[:-n_o2m, :-n_o2m]
 
-        # ffn
+            o2o_tgt = _sa_block(o2o_tgt, o2o_pos, o2o_mask)
+            tgt = torch.cat([o2o_tgt, o2m_tgt], dim=0)
+
+        else:
+            tgt = _sa_block(tgt, tgt_query_pos, self_attn_mask)
+
+        # -------- main cross-attn + ffn --------
+        tgt = _apply_key_aware(tgt, memory)
+        tgt = _ca_block(
+            tgt, tgt_query_pos, tgt_reference_points,
+            memory, memory_spatial_shapes, memory_level_start_index,
+            memory_key_padding_mask
+        )
         tgt = self.forward_ffn(tgt)
 
         return tgt, None
 
 
-# class MrDeformableTransformerDecoderLayer(nn.Module):
-#
-#     def __init__(self, d_model=256, d_ffn=1024,
-#                  dropout=0.1, activation="relu",
-#                  n_levels=4, n_heads=8, n_points=4,
-#                  use_deformable_box_attn=False,
-#                  key_aware_type=None,
-#                  o2m_matching_enabled=False,
-#                  num_queries_o2m=1350,
-#                  ):
-#         super().__init__()
-#
-#         self.o2m_matching_enabled = o2m_matching_enabled
-#         self.num_queries_o2m = num_queries_o2m
-#
-#         # cross attention
-#         if use_deformable_box_attn:
-#             raise NotImplementedError
-#         else:
-#             self.cross_attn = MSDeformAttn(d_model, n_levels, n_heads, n_points)
-#         self.dropout1 = nn.Dropout(dropout)
-#         self.norm1 = nn.LayerNorm(d_model)
-#
-#         # self attention
-#         self.self_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout)
-#         self.dropout2 = nn.Dropout(dropout)
-#         self.norm2 = nn.LayerNorm(d_model)
-#
-#         # ffn
-#         self.linear1 = nn.Linear(d_model, d_ffn)
-#         self.activation = _get_activation_fn(activation)
-#         self.dropout3 = nn.Dropout(dropout)
-#         self.linear2 = nn.Linear(d_ffn, d_model)
-#         self.dropout4 = nn.Dropout(dropout)
-#         self.norm3 = nn.LayerNorm(d_model)
-#
-#         self.key_aware_type = key_aware_type
-#         self.key_aware_proj = None
-#
-#         # attn score
-#         self.d_model = d_model
-#         self.query_embed = nn.Linear(self.d_model, self.d_model * 2)
-#
-#     def rm_self_attn_modules(self):
-#         self.self_attn = None
-#         self.dropout2 = None
-#         self.norm2 = None
-#
-#     @staticmethod
-#     def with_pos_embed(tensor, pos):
-#         return tensor if pos is None else tensor + pos
-#
-#     def forward_ffn(self, tgt):
-#         tgt2 = self.linear2(self.dropout3(self.activation(self.linear1(tgt))))
-#         tgt = tgt + self.dropout4(tgt2)
-#         tgt = self.norm3(tgt)
-#         return tgt
-#
-#     @autocast(enabled=False)
-#     def forward(self,
-#                 # for tgt
-#                 tgt: Optional[Tensor],  # nq, bs, d_model
-#                 tgt_query_pos: Optional[Tensor] = None,  # pos for query. MLP(Sine(pos))
-#                 tgt_query_sine_embed: Optional[Tensor] = None,  # pos for query. Sine(pos)
-#                 tgt_key_padding_mask: Optional[Tensor] = None,
-#                 tgt_reference_points: Optional[Tensor] = None,  # nq, bs, 4
-#
-#                 # for memory
-#                 memory: Optional[Tensor] = None,  # hw, bs, d_model
-#                 memory_key_padding_mask: Optional[Tensor] = None,
-#                 memory_level_start_index: Optional[Tensor] = None,  # num_levels
-#                 memory_spatial_shapes: Optional[Tensor] = None,  # bs, num_levels, 2
-#                 memory_pos: Optional[Tensor] = None,  # pos for memory
-#
-#                 # sa
-#                 self_attn_mask: Optional[Tensor] = None,  # mask used for self-attention
-#                 cross_attn_mask: Optional[Tensor] = None,  # mask used for cross-attention
-#                 ):
-#         '''
-#         tgt: nq, bs, d_model
-#         tgt_query_pos: nq, bs, d_model
-#         tgt_query_sine_embed: nq, bs, d_model
-#         memory: hw, bs, d_model
-#         需要注意，tgt_query_pos 和 tgt_query_sine_embed 虽然都表示位置 embedding，但是不一样的，前者是 MLP(Sine(pos))，后者是 Sine(pos)
-#         '''
-#         '''
-#         self attention
-#         query = key = tgt + tgt_query_pos
-#         value = tgt
-#         '''
-#         if self.o2m_matching_enabled:
-#             o2o_tgt = tgt[:-self.num_queries_o2m]
-#             o2o_tgt_query_pos = tgt_query_pos[:-self.num_queries_o2m]
-#             o2o_self_attn_mask = self_attn_mask[:-self.num_queries_o2m, :-self.num_queries_o2m]
-#             o2m_tgt = tgt[-self.num_queries_o2m:]
-#             if self.self_attn is not None:
-#                 q = k = self.with_pos_embed(o2o_tgt, o2o_tgt_query_pos)
-#                 o2o_tgt2 = self.self_attn(q, k, o2o_tgt, attn_mask=o2o_self_attn_mask)[0]
-#                 o2o_tgt = o2o_tgt + self.dropout2(o2o_tgt2)
-#                 o2o_tgt = self.norm2(o2o_tgt)
-#             tgt = torch.cat([o2o_tgt, o2m_tgt], dim=0)
-#         else:
-#             if self.self_attn is not None:
-#                 q = k = self.with_pos_embed(tgt, tgt_query_pos)
-#                 tgt2 = self.self_attn(q, k, tgt, attn_mask=self_attn_mask)[0]
-#                 tgt = tgt + self.dropout2(tgt2)
-#                 tgt = self.norm2(tgt)
-#
-#         # cross attention
-#         if self.key_aware_type is not None:
-#             if self.key_aware_type == 'mean':
-#                 tgt = tgt + memory.mean(0, keepdim=True)
-#             elif self.key_aware_type == 'proj_mean':
-#                 tgt = tgt + self.key_aware_proj(memory).mean(0, keepdim=True)
-#             else:
-#                 raise NotImplementedError("Unknown key_aware_type: {}".format(self.key_aware_type))
-#         '''
-#         # cross attention
-#         query = tgt + tgt_query_pos
-#         reference_points = tgt_reference_points
-#
-#         value = input_flatten = memory
-#         input_spatial_shapes = memory_spatial_shapes
-#         input_level_start_index = memory_level_start_index
-#         input_padding_mask = memory_key_padding_mask # 全是 False，意思是没有 padding 区域
-#         '''
-#         tgt2 = self.cross_attn(self.with_pos_embed(tgt, tgt_query_pos).transpose(0, 1),
-#                                tgt_reference_points.transpose(0, 1).contiguous(),
-#                                memory.transpose(0, 1), memory_spatial_shapes, memory_level_start_index,
-#                                memory_key_padding_mask).transpose(0, 1)
-#         tgt = tgt + self.dropout1(tgt2)
-#         tgt = self.norm1(tgt)
-#
-#         # ffn
-#         tgt = self.forward_ffn(tgt)
-#
-#         return tgt, None
 
 

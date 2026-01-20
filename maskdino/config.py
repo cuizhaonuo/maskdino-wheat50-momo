@@ -177,3 +177,4 @@ def add_maskdino_config(cfg):
     # 4
     cfg.MODEL.MaskDINO.ALIGN_LOSS_ENABLED = False
 
+    cfg.MODEL.MaskDINO.SEP_BRANCH_ENABLED = False

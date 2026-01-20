@@ -1,5 +1,7 @@
 _BASE_: ./config_v1.yaml
 
+SEED: 42
+
 OUTPUT_DIR: output/maskdino_swinl-time-10-19-20-00-v1-patch
 
 SOLVER:
@@ -11,10 +13,11 @@ SOLVER:
   IMS_PER_BATCH: 1         # 先不动，避免引入新变量
   BASE_LR: 0.0001          # 先不动；如果你只训head或冻结backbone，再调整
 
-#TEST:
-#  EVAL_PERIOD: 1
+TEST:
+  EVAL_PERIOD: 267
 
 MODEL:
+#  WEIGHTS: None
   MaskDINO:
     LEARN_TGT: false
     DN: seg
@@ -40,6 +43,7 @@ MODEL:
     LAYER_WISE_IOU_ENABLED: true
     ALIGN_LOSS_ENABLED: true
     MATCHDER_NMS_ENABLED: true
+    SEP_BRANCH_ENABLED: true
 
 # 默认
 #Model:
