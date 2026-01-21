@@ -71,7 +71,7 @@ if mode == "ablation":
     plt.show()
 
 if mode == "experiment":
-    fig, ax = plt.subplots(1, 3, figsize=(16, 12))
+    fig, ax = plt.subplots(1, 3, figsize=(10, 10))
 
     for (bbox_AP, segm_AP, label), total_losses in zip(bbox_segm_metrics, total_losses_list):
         ax[0].plot(bbox_AP, label=label)

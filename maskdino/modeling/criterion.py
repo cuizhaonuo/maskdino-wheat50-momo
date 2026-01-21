@@ -163,6 +163,8 @@ class SetCriterion(nn.Module):
         self.panoptic_on = panoptic_on
         self.semantic_ce_loss = semantic_ce_loss
 
+        self.rank_weight = 1
+
     def loss_labels_ce(self, outputs, targets, indices, num_masks):
         """Classification loss (NLL)
         targets dicts must contain the key "labels" containing a tensor of dim [nb_target_boxes]
@@ -204,6 +206,39 @@ class SetCriterion(nn.Module):
 
         return losses
 
+    def get_local_rank_o2m(self, quality, indices):
+        #quality: one-dimension tensor
+        #indices: matching result
+        bs = len(indices)
+        device = quality.device
+        tgt_size = [len(tgt_ind) for _,tgt_ind in indices]
+        ind_start = 0
+        rank_list = []
+        for i in range(bs):
+            if  tgt_size[i] == 0:
+                rank_list.append(torch.zeros(0,dtype=torch.long,device=device))
+                continue
+            num_tgt = max(indices[i][1]) + 1
+            # split quality of one item
+            quality_per_img = quality[ind_start:ind_start+tgt_size[i]]
+            ind_start += tgt_size[i]
+
+            rank_per_img = torch.zeros(len(indices[i][1]),dtype=torch.long,).cuda()
+
+            int_unique, int_unique_count = indices[i][1].unique(return_counts=True)
+            for j, id in enumerate(int_unique):
+                if int_unique_count[j] == 1:
+                    k_indices = torch.where(indices[i][1] == id)[0]
+                    rank_per_img[k_indices] = 0
+                if int_unique_count[j] > 1:
+                    # ForkedPdb().set_trace()
+                    k_indices = torch.where(indices[i][1] == id)[0]
+                    k_indices = k_indices[torch.sort(quality_per_img[k_indices], descending=True)[1]]
+                    keep_k = torch.arange(int_unique_count[j])
+                    rank_per_img[k_indices] = keep_k.cuda()
+            rank_list.append(rank_per_img.flatten())
+        return torch.cat(rank_list, 0)
+
     def align_loss_labels(self, outputs, targets, indices, num_boxes, **kwargs):
         assert "pred_logits" in outputs
         src_logits = outputs["pred_logits"].float()
@@ -243,7 +278,11 @@ class SetCriterion(nn.Module):
         # else:
         #     rank_weight = 1
 
-        rank_weight = 1
+        tau = 1.5
+        rank = self.get_local_rank_o2m(t, indices)
+        rank_weight = torch.exp(-rank / tau).cuda()
+
+        # rank_weight = 1
 
         t = t * rank_weight
         pos_weights[pos_ind] = t
@@ -253,7 +292,7 @@ class SetCriterion(nn.Module):
         loss_ce = - pos_weights * pred_score.log() - neg_weights * (1 - pred_score).log()
         loss_ce = loss_ce.sum().float() / num_boxes
         losses = {"loss_ce": loss_ce}
-        # self.rank_weight = rank_weight
+        self.rank_weight = rank_weight
 
         return losses
 
@@ -274,7 +313,7 @@ class SetCriterion(nn.Module):
         loss_giou = 1 - torch.diag(box_ops.generalized_box_iou(
             box_ops.box_cxcywh_to_xyxy(src_boxes),
             box_ops.box_cxcywh_to_xyxy(target_boxes)))
-        losses['loss_giou'] = loss_giou.sum() / num_boxes
+        losses['loss_giou'] = (loss_giou * self.rank_weight).sum() / num_boxes
 
         if 'pred_logits_iou' in outputs and self.layer_wise_iou_enabled:
             src_iou = outputs['pred_logits_iou'][idx].squeeze(-1).sigmoid()
