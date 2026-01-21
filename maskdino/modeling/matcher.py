@@ -18,7 +18,7 @@ from torch.cuda.amp import autocast
 from detectron2.projects.point_rend.point_features import point_sample
 
 from maskdino.utils.box_ops import generalized_box_iou,box_cxcywh_to_xyxy, box_iou
-from maskdino.utils.mask_ops import compute_mask_iou
+from maskdino.utils.mask_ops import pairwise_mask_overlap_roi
 
 from torch.utils.tensorboard import SummaryWriter
 
@@ -182,8 +182,9 @@ class HungarianMatcher(nn.Module):
                 out_mask = out_mask[:, None]
                 tgt_mask = tgt_mask[:, None]
 
-                mask_iou = compute_mask_iou(out_mask, tgt_mask)
-                mask_iou = mask_iou > 0.5
+                mask_iou = pairwise_mask_overlap_roi(out_mask, tgt_mask, box_cxcywh_to_xyxy(out_bbox)[None], box_cxcywh_to_xyxy(tgt_bbox)[None])
+                mask_iou = mask_iou > 0.4
+                mask_iou = mask_iou.squeeze()
 
                 # all masks share the same set of points for efficient matching!
                 point_coords = torch.rand(1, self.num_points, 2, device=out_mask.device)
