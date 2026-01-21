@@ -29,7 +29,7 @@ if mode == "ablation":
     ]
 
 if mode == "experiment":
-    output_base_dir = "/public/home/zncui/pycharm_project/MaskDINO/output/experiment1"
+    output_base_dir = "/public/home/zncui/pycharm_project/MaskDINO/output/experiment0"
     output_dirs = os.listdir(output_base_dir)
     labels = output_dirs
 
@@ -77,6 +77,8 @@ if mode == "experiment":
         ax[0].plot(bbox_AP, label=label)
         ax[1].plot(segm_AP, label=label)
         ax[2].plot(total_losses, label=label)
+        ax[2].set_xlim(0, 125)
+        ax[2].set_ylim(0, 800)
 
     ax[0].set_ylabel("BBox AP")
     ax[1].set_ylabel("Segm AP")
@@ -88,7 +90,7 @@ if mode == "experiment":
         handles,
         labels,
         loc="upper center",
-        ncol=2,  # 根据 label 数量调整
+        ncol=1,  # 根据 label 数量调整
         fontsize=9,
         frameon=False
     )
