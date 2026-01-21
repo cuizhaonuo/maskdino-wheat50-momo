@@ -297,7 +297,7 @@ class MaskDINO(nn.Module):
 
             # one-to-one loss, one-to-one query and denoising query
             # bipartite matching-based loss
-            losses, _ = self.criterion(outputs, targets, mask_dict)
+            losses, _ = self.criterion(outputs, targets, mask_dict, mode='o2o')
 
             def duplicate_targets(src_targets, k_one2many):
                 for t in src_targets:
@@ -311,7 +311,7 @@ class MaskDINO(nn.Module):
                 multi_targets = copy.deepcopy(targets)
                 multi_targets = duplicate_targets(multi_targets, k_one2many=self.num_targets_k)
                 # mask_dict = None # 表示关闭 dn-query
-                losses_one2many, _ = self.criterion(outputs_one2many, multi_targets, None)
+                losses_one2many, _ = self.criterion(outputs_one2many, multi_targets, None, mode='o2m')
                 lambda_one2many = 1.0
                 for key, value in losses_one2many.items():
                     losses[key + '_one2many'] = value * lambda_one2many
@@ -321,7 +321,7 @@ class MaskDINO(nn.Module):
             if self.sep_branch_enabled:
                 multi_targets = copy.deepcopy(targets)
                 multi_targets = duplicate_targets(multi_targets, k_one2many=self.num_targets_k)
-                losses_sep, _ = self.criterion(out_sep, multi_targets, None)
+                losses_sep, _ = self.criterion(out_sep, multi_targets, None, mode='sep')
                 lambda_sep = 1.0
                 for key, value in losses_sep.items():
                     losses[key + '_sep'] = value * lambda_sep

@@ -182,10 +182,6 @@ class HungarianMatcher(nn.Module):
                 out_mask = out_mask[:, None]
                 tgt_mask = tgt_mask[:, None]
 
-                mask_iou = pairwise_mask_overlap_roi(out_mask, tgt_mask, box_cxcywh_to_xyxy(out_bbox)[None], box_cxcywh_to_xyxy(tgt_bbox)[None])
-                mask_iou = mask_iou > 0.4
-                mask_iou = mask_iou.squeeze()
-
                 # all masks share the same set of points for efficient matching!
                 point_coords = torch.rand(1, self.num_points, 2, device=out_mask.device)
                 # get gt labels
@@ -239,15 +235,32 @@ class HungarianMatcher(nn.Module):
             C = C.reshape(num_queries, -1).cpu()
             C_list.append(C)
 
-            if mask_iou is not None and self.matcher_nms_enabled:
-                index = linear_sum_assignment(C)
-                rows = []
-                cols = []
+            mode = kwargs.get('mode', 'o2o')
+
+            def get_keep_indices(index, out_boxes, tgt_boxes, iou_threshold=0.5):
+                keep_rows = []
+                keep_cols = []
                 for row_id, col_id in zip(index[0], index[1]):
-                    if mask_iou[row_id, col_id]:
-                        rows.append(row_id)
-                        cols.append(col_id)
-                indices.append((rows, cols))
+                    out_box = out_boxes[row_id]
+                    tgt_box = tgt_boxes[col_id]
+                    out_box_xyxy = box_cxcywh_to_xyxy(out_box)
+                    tgt_box_xyxy = box_cxcywh_to_xyxy(tgt_box)
+                    iou, _ = box_iou(out_box_xyxy[None], tgt_box_xyxy[None])
+                    if iou.item() >= iou_threshold:
+                        keep_rows.append(row_id)
+                        keep_cols.append(col_id)
+                return keep_rows, keep_cols
+
+            if mode in ['o2m', 'sep'] and mask_iou is not None and self.matcher_nms_enabled:
+                index = linear_sum_assignment(C)
+                # rows = []
+                # cols = []
+                # for row_id, col_id in zip(index[0], index[1]):
+                #     if mask_iou[row_id, col_id]:
+                #         rows.append(row_id)
+                #         cols.append(col_id)
+                # indices.append((rows, cols))
+                indices.append(get_keep_indices(index, out_bbox, tgt_bbox))
             else:
                 indices.append(linear_sum_assignment(C))
 
@@ -257,7 +270,7 @@ class HungarianMatcher(nn.Module):
         ]
 
     @torch.no_grad()
-    def forward(self, outputs, targets, cost=["cls", "box", "mask"]):
+    def forward(self, outputs, targets, cost=["cls", "box", "mask"], **kwargs):
         """Performs the matching
 
         Params:
@@ -277,7 +290,7 @@ class HungarianMatcher(nn.Module):
             For each batch element, it holds:
                 len(index_i) = len(index_j) = min(num_queries, num_target_boxes)
         """
-        return self.memory_efficient_forward(outputs, targets, cost)
+        return self.memory_efficient_forward(outputs, targets, cost, **kwargs)
 
     def __repr__(self, _repr_indent=4):
         head = "Matcher " + self.__class__.__name__

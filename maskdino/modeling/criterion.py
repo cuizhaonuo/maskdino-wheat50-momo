@@ -414,7 +414,7 @@ class SetCriterion(nn.Module):
         assert loss in loss_map, f"do you really want to compute {loss} loss?"
         return loss_map[loss](outputs, targets, indices, num_masks)
 
-    def forward(self, outputs, targets, mask_dict=None):
+    def forward(self, outputs, targets, mask_dict=None, **kwargs):
         """This performs the loss computation.
         Parameters:
              outputs: dict of tensors, see the output specification of the model for the format
@@ -438,7 +438,8 @@ class SetCriterion(nn.Module):
                 else:
                     output_idx = tgt_idx = torch.tensor([]).long().cuda()
                 exc_idx.append((output_idx, tgt_idx))
-        indices = self.matcher(outputs_without_aux, targets)
+        mode = kwargs.get('mode', 'o2o')
+        indices = self.matcher(outputs_without_aux, targets, mode=mode)
 
         # Compute the average number of target boxes accross all nodes, for normalization purposes
         num_masks = sum(len(t["labels"]) for t in targets)
