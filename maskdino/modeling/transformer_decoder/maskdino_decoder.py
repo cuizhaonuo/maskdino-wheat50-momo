@@ -159,9 +159,13 @@ class MaskDINODecoder(nn.Module):
             if self.semantic_ce_loss:
                 self.class_embed = nn.Linear(hidden_dim, num_classes+1)
                 self.one2many_class_embed = nn.Linear(hidden_dim, num_classes+1)
+                self.class_embed_list = nn.ModuleList([nn.Linear(hidden_dim, num_classes+1) for _ in range(self.num_layers)])
+                self.one2many_class_embed_list = nn.ModuleList([nn.Linear(hidden_dim, num_classes+1) for _ in range(self.num_layers)])
             else:
                 self.class_embed = nn.Linear(hidden_dim, num_classes)
                 self.one2many_class_embed = nn.Linear(hidden_dim, num_classes)
+                self.class_embed_list = nn.ModuleList([nn.Linear(hidden_dim, num_classes) for _ in range(self.num_layers)])
+                self.one2many_class_embed_list = nn.ModuleList([nn.Linear(hidden_dim, num_classes) for _ in range(self.num_layers)])
         self.label_enc=nn.Embedding(num_classes,hidden_dim)
         self.mask_embed = MLP(hidden_dim, hidden_dim, mask_dim, 3)
 
@@ -170,6 +174,8 @@ class MaskDINODecoder(nn.Module):
 
         # init decoder
         self.decoder_norm = decoder_norm = nn.LayerNorm(hidden_dim)
+        self.decoder_norm_list = nn.ModuleList([nn.LayerNorm(hidden_dim) for _ in range(self.num_layers)])
+
         decoder_layer = DeformableTransformerDecoderLayer(hidden_dim, dim_feedforward,
                                                           dropout, activation,
                                                           self.num_feature_levels, nhead, dec_n_points,
@@ -686,7 +692,7 @@ class MaskDINODecoder(nn.Module):
             predictions_iou_sep = []
             for i, sep_output in enumerate(sep_hs):
                 outputs_class_sep, outputs_mask_sep = self.forward_prediction_heads(
-                    sep_output.transpose(0, 1), mask_features, True)
+                    sep_output.transpose(0, 1), mask_features, True, layer_id=i)
 
                 predictions_class_sep.append(outputs_class_sep)
                 predictions_mask_sep.append(outputs_mask_sep)
@@ -718,7 +724,7 @@ class MaskDINODecoder(nn.Module):
             distinct_masks = [mask[:, num_dn_queries:] for mask in distinct_masks]
 
         for i, output in enumerate(hs):
-            outputs_class, outputs_mask = self.forward_prediction_heads(output.transpose(0, 1), mask_features, True)
+            outputs_class, outputs_mask = self.forward_prediction_heads(output.transpose(0, 1), mask_features, True, layer_id=i)
 
             predictions_class.append(outputs_class)
             predictions_mask.append(outputs_mask)
@@ -845,14 +851,24 @@ class MaskDINODecoder(nn.Module):
 
         return out, out_one_to_many, out_sep, mask_dict
 
-    def forward_prediction_heads(self, output, mask_features, pred_mask=True):
-        decoder_output = self.decoder_norm(output)
-        decoder_output = decoder_output.transpose(0, 1)
-        outputs_class = self.class_embed(decoder_output)
-        outputs_mask = None
-        if pred_mask:
-            mask_embed = self.mask_embed(decoder_output)
-            outputs_mask = torch.einsum("bqc,bchw->bqhw", mask_embed, mask_features)
+    def forward_prediction_heads(self, output, mask_features, pred_mask=True, **kwargs):
+        layer_id = kwargs.get('layer_id', None)
+        if layer_id is not None:
+            decoder_output = self.decoder_norm_list[layer_id](output)
+            decoder_output = decoder_output.transpose(0, 1)
+            outputs_class = self.class_embed_list[layer_id](decoder_output)
+            outputs_mask = None
+            if pred_mask:
+                mask_embed = self.mask_embed(decoder_output)
+                outputs_mask = torch.einsum("bqc,bchw->bqhw", mask_embed, mask_features)
+        else:
+            decoder_output = self.decoder_norm(output)
+            decoder_output = decoder_output.transpose(0, 1)
+            outputs_class = self.class_embed(decoder_output)
+            outputs_mask = None
+            if pred_mask:
+                mask_embed = self.mask_embed(decoder_output)
+                outputs_mask = torch.einsum("bqc,bchw->bqhw", mask_embed, mask_features)
 
         return outputs_class, outputs_mask
 
