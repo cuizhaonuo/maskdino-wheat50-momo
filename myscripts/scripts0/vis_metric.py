@@ -82,6 +82,9 @@ if mode == "experiment":
     ax[1].set_ylabel("Segm AP")
     ax[2].set_ylabel("Total Loss")
 
+    ax[2].set_xlim(0, 125)
+    ax[2].set_ylim(0, 400)
+
     # ⭐ 关键：统一 legend
     handles, labels = ax[0].get_legend_handles_labels()
     fig.legend(
