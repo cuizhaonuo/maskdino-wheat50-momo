@@ -12,11 +12,9 @@ NEW (Resume + streaming CSV):
 - 重新运行时自动读取已存在的 CSV，跳过已处理图片（resume）
 - 为避免不同参数组合互相污染输出，按参数组合创建独立 run_dir（含 CSV/散点图/可视化）
 
-Notes
------
-1) 支持 Detectron2 Model Zoo 别名（如 COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml）。
-2) 若 cfg/模型依赖第三方项目（如 MaskDINO），请通过 --imports maskdino 等先导入模块。
-3) ROI_HEADS.SCORE_THRESH_TEST 会被设置为 base_keep_score（默认 0.01）仅粗筛；真正阈值与 NMS 由网格搜索/固定参数控制。
+NEW (Resize input for inference, map back to original):
+- 可选参数 --resize_hw H W：推理时把输入整图缩放到指定(H,W)再做滑窗推理
+- 输出/保存仍使用原图尺寸；推理得到的 bbox/mask 会按比例映射回原图坐标系
 """
 
 import os
@@ -70,17 +68,16 @@ class SlidingWindowConfig:
     tile: int = 800
     overlap: int = 256
     pad_value: Tuple[int, int, int] = (114, 114, 114)  # BGR
+    # NEW: resize whole image to (H, W) for inference if not None
+    resize_hw: Optional[Tuple[int, int]] = None
 
 @dataclass
 class SearchSpace:
     iou_types: Tuple[str, ...] = ("IOU", "IOU_Min")
     score_thr_range: Tuple[float, float, int] = (0.1, 0.8, 30)
     nms_iou_thr_range: Tuple[float, float, int] = (0.1, 0.8, 30)
-
-    # NEW: include NMS method in search
     nms_modes: Tuple[str, ...] = ("plain", "merge")          # plain=mask_nms, merge=mask_nms_with_merge
     merge_score_modes: Tuple[str, ...] = ("keep_max",)       # or ("keep_max","area_weighted")
-
     base_keep_score: float = 0.01
 
 @dataclass
@@ -133,12 +130,8 @@ def linspace_inclusive(start: float, end: float, num: int) -> List[float]:
     step = (end - start) / (num - 1)
     return [start + i * step for i in range(num)]
 
-# NEW: resume helpers
+# resume helpers
 def read_done_set(csv_path: str) -> set:
-    """
-    读取已存在的 csv，返回已完成的 filename 集合。
-    兼容第一行是表头或不是表头。
-    """
     done = set()
     if not os.path.exists(csv_path):
         return done
@@ -155,10 +148,6 @@ def read_done_set(csv_path: str) -> set:
     return done
 
 def append_csv_row(csv_path: str, filename: str, gt: int, pred: int, write_header_if_new: bool = True):
-    """
-    追加一行到 csv。若文件不存在且 write_header_if_new=True，则先写表头。
-    每次写完 flush + fsync，利于断点续跑。
-    """
     is_new = not os.path.exists(csv_path)
     ensure_dir(os.path.dirname(csv_path))
     with open(csv_path, "a", encoding="utf-8") as f:
@@ -322,7 +311,6 @@ class SegInferenceTemplate:
     def infer_tile(self, tile_img: np.ndarray) -> List[Dict[str, Any]]: raise NotImplementedError
 
     def run_search(self):
-        """Grid-search on val, then test with best params."""
         ensure_dir(self.outputs.out_dir)
         random.seed(0); np.random.seed(0)
         print("==> Loading model ..."); self.load_model()
@@ -361,7 +349,6 @@ class SegInferenceTemplate:
 
     def run_infer_only(self, split: str, iou_type: IOUType, score_thr: float, nms_iou_thr: float,
                        nms_mode: str, merge_score_mode: str):
-        """Direct inference with fixed params on a chosen split (test/val/train)."""
         ensure_dir(self.outputs.out_dir)
         random.seed(0); np.random.seed(0)
         print("==> Loading model ..."); self.load_model()
@@ -373,24 +360,24 @@ class SegInferenceTemplate:
     # ====== shared helpers ======
     def _make_run_tag(self, split: str, iou_type: IOUType, score_thr: float, nms_iou_thr: float,
                       nms_mode: str, merge_score_mode: str) -> str:
-        # 目录名尽量短但唯一，避免小数点太长
-        return (f"{split}_iou-{iou_type.value}"
-                f"_s-{score_thr:.4f}_n-{nms_iou_thr:.4f}"
-                f"_m-{nms_mode}_ms-{merge_score_mode}")
+        tag = (f"{split}_iou-{iou_type.value}"
+               f"_s-{score_thr:.4f}_n-{nms_iou_thr:.4f}"
+               f"_m-{nms_mode}_ms-{merge_score_mode}")
+        if self.sw.resize_hw is not None:
+            tag += f"_resize-{self.sw.resize_hw[0]}x{self.sw.resize_hw[1]}"
+        return tag
 
     def _run_on_split(self, split: str, iou_type: IOUType, score_thr: float, nms_iou_thr: float,
                       nms_mode: str, merge_score_mode: str):
         imgs_dir, _ = yolo_split_paths(self.dataset.yolo_root, split)
         images = list_images_in_dir(imgs_dir)
 
-        # NEW: 每个参数组合一个独立 run_dir，避免输出互相污染
         run_tag = self._make_run_tag(split, iou_type, score_thr, nms_iou_thr, nms_mode, merge_score_mode)
         run_dir = os.path.join(self.outputs.out_dir, run_tag)
         ensure_dir(run_dir)
         vis_dir = os.path.join(run_dir, "vis")
         ensure_dir(vis_dir)
 
-        # CSV：边跑边写 + resume
         csv_path = os.path.join(run_dir, f"{split}_pred_vs_gt.csv")
         done = read_done_set(csv_path)
 
@@ -403,7 +390,7 @@ class SegInferenceTemplate:
                 skipped += 1
                 continue
 
-            proposals = self._proposals_for_image(img_path)
+            proposals = self._proposals_for_image(img_path)  # NOTE: returns proposals already mapped to ORIGINAL coords
             final_dets = self._apply_thresh_nms(
                 proposals, score_thr, nms_iou_thr, iou_type,
                 nms_mode=nms_mode,
@@ -412,23 +399,21 @@ class SegInferenceTemplate:
             pred_count = len(final_dets)
             gt_count = yolo_count_instances(yolo_label_path_for_image(img_path, self.dataset.yolo_root))
 
-            # 推理完一张就写一行（append + flush + fsync）
             if self.outputs.excel:
                 append_csv_row(csv_path, fname, gt_count, pred_count, write_header_if_new=True)
 
             newly_processed += 1
 
-            # 可视化：同样每张写一次；resume 时如果图已存在则跳过（避免重复）
             if self.outputs.vis:
                 out_img_path = os.path.join(vis_dir, fname)
                 if not os.path.exists(out_img_path):
+                    # visualize on original image, dets are in original coords
                     self._visualize_and_save(img_path, final_dets, vis_dir, draw_contour=True)
 
         print(f"[Resume] skipped={skipped}, newly_processed={newly_processed}")
         if self.outputs.excel:
             print(f"[Saved] CSV (append) -> {csv_path}")
 
-        # Scatter：从 csv 回读全量点，保证 resume 后仍是完整散点图
         if self.outputs.draw_scatter and self.outputs.excel and os.path.exists(csv_path):
             xs, ys = [], []
             with open(csv_path, "r", encoding="utf-8") as f:
@@ -450,28 +435,98 @@ class SegInferenceTemplate:
 
         print(f"{split.upper()} finished. Outputs in: {run_dir}")
 
+    # --------- NEW: scale a proposal from resized-coords back to original image coords ----------
+    def _proposal_to_original(self, p: DetProposal, sx: float, sy: float,
+                              orig_W: int, orig_H: int) -> Optional[DetProposal]:
+        """
+        p is in resized image coordinate system.
+        Convert bbox/mask/top/left to original image coordinate system.
+
+        We treat p.mask as a crop aligned with [p.left, p.top, p.left+w, p.top+h] in resized coords.
+        Then resize that crop with nearest interpolation to match scaled size in original coords.
+        """
+        if p.mask is None or p.mask.size == 0:
+            return None
+
+        h_r, w_r = p.mask.shape[:2]
+        # scaled sizes in original coords
+        w_o = int(max(1, round(w_r * sx)))
+        h_o = int(max(1, round(h_r * sy)))
+
+        # scale top-left
+        left_o = int(round(p.left * sx))
+        top_o = int(round(p.top * sy))
+
+        # clamp ROI into original image bounds
+        left_o = max(0, min(orig_W, left_o))
+        top_o = max(0, min(orig_H, top_o))
+        right_o = max(0, min(orig_W, left_o + w_o))
+        bottom_o = max(0, min(orig_H, top_o + h_o))
+
+        if right_o <= left_o or bottom_o <= top_o:
+            return None
+
+        # resize mask crop (nearest) then crop if clamped by image borders
+        mask_u8 = (p.mask.astype(np.uint8) * 255)
+        mask_resized = cv2.resize(mask_u8, (w_o, h_o), interpolation=cv2.INTER_NEAREST)
+        mask_resized = (mask_resized > 127)
+
+        # If clamped, we need to crop the resized mask accordingly
+        crop_w = right_o - left_o
+        crop_h = bottom_o - top_o
+        mask_resized = mask_resized[:crop_h, :crop_w]
+
+        area = int(mask_resized.sum())
+        if area <= 0:
+            return None
+
+        bbox = np.array([left_o, top_o, right_o, bottom_o], dtype=float)
+        return DetProposal(
+            bbox=bbox,
+            score=float(p.score),
+            label=int(p.label),
+            mask=mask_resized.astype(bool),
+            top=int(top_o),
+            left=int(left_o),
+            area=area
+        )
+
     def _proposals_for_image(self, img_path: str) -> List[DetProposal]:
-        img = cv2.imread(img_path)
-        if img is None:
+        img0 = cv2.imread(img_path)
+        if img0 is None:
             raise FileNotFoundError(img_path)
-        H, W = img.shape[:2]
+        orig_H, orig_W = img0.shape[:2]
+
+        # NEW: optional resize for inference
+        if self.sw.resize_hw is not None:
+            target_H, target_W = self.sw.resize_hw
+            # cv2.resize uses (W,H)
+            img = cv2.resize(img0, (int(target_W), int(target_H)), interpolation=cv2.INTER_LINEAR)
+            inf_H, inf_W = img.shape[:2]
+            sx = orig_W / float(inf_W)  # map resized->orig in X
+            sy = orig_H / float(inf_H)  # map resized->orig in Y
+        else:
+            img = img0
+            inf_H, inf_W = orig_H, orig_W
+            sx = sy = 1.0
+
         tile, overlap = self.sw.tile, self.sw.overlap
         stride = max(1, tile - overlap)
         padv = self.sw.pad_value
 
-        proposals: List[DetProposal] = []
+        proposals_resized: List[DetProposal] = []
 
-        y_list = list(range(0, max(1, H - tile + 1), stride))
-        if y_list[-1] != max(0, H - tile):
-            y_list.append(max(0, H - tile))
-        x_list = list(range(0, max(1, W - tile + 1), stride))
-        if x_list[-1] != max(0, W - tile):
-            x_list.append(max(0, W - tile))
+        y_list = list(range(0, max(1, inf_H - tile + 1), stride))
+        if y_list[-1] != max(0, inf_H - tile):
+            y_list.append(max(0, inf_H - tile))
+        x_list = list(range(0, max(1, inf_W - tile + 1), stride))
+        if x_list[-1] != max(0, inf_W - tile):
+            x_list.append(max(0, inf_W - tile))
 
         for y0 in y_list:
             for x0 in x_list:
                 tile_img = np.full((tile, tile, 3), padv, dtype=np.uint8)
-                y1, x1 = min(y0 + tile, H), min(x0 + tile, W)
+                y1, x1 = min(y0 + tile, inf_H), min(x0 + tile, inf_W)
                 h, w = y1 - y0, x1 - x0
                 tile_img[:h, :w] = img[y0:y1, x0:x1]
                 valid_mask = np.zeros((tile, tile), dtype=bool)
@@ -483,8 +538,8 @@ class SegInferenceTemplate:
                     if score < self.search.base_keep_score:
                         continue
 
-                    bbox = np.array(ins["bbox"], dtype=float)
-                    mask = np.logical_and(ins["mask"].astype(bool), valid_mask)
+                    bbox = np.array(ins["bbox"], dtype=float)  # in tile coords
+                    mask = np.logical_and(ins["mask"].astype(bool), valid_mask)  # tile-sized bool
 
                     x1t = max(0, min(tile, int(math.floor(bbox[0]))))
                     y1t = max(0, min(tile, int(math.floor(bbox[1]))))
@@ -500,12 +555,14 @@ class SegInferenceTemplate:
 
                     gx1, gy1 = x0 + x1t, y0 + y1t
                     gx2, gy2 = x0 + x2t, y0 + y2t
-                    gx1 = max(0, min(W, gx1)); gx2 = max(0, min(W, gx2))
-                    gy1 = max(0, min(H, gy1)); gy2 = max(0, min(H, gy2))
+
+                    # clamp to inference image bounds
+                    gx1 = max(0, min(inf_W, gx1)); gx2 = max(0, min(inf_W, gx2))
+                    gy1 = max(0, min(inf_H, gy1)); gy2 = max(0, min(inf_H, gy2))
                     if gx2 <= gx1 or gy2 <= gy1:
                         continue
 
-                    proposals.append(DetProposal(
+                    proposals_resized.append(DetProposal(
                         bbox=np.array([gx1, gy1, gx2, gy2], dtype=float),
                         score=score,
                         label=int(ins.get("label", 0)),
@@ -514,7 +571,17 @@ class SegInferenceTemplate:
                         left=int(gx1),
                         area=area
                     ))
-        return proposals
+
+        # NEW: map proposals to original coordinates if resized
+        if self.sw.resize_hw is None:
+            return proposals_resized
+
+        proposals_orig: List[DetProposal] = []
+        for p in proposals_resized:
+            po = self._proposal_to_original(p, sx=sx, sy=sy, orig_W=orig_W, orig_H=orig_H)
+            if po is not None:
+                proposals_orig.append(po)
+        return proposals_orig
 
     def _grid_search(self, val_cache: Dict[str, List[DetProposal]],
                      val_gt_counts: Dict[str, int]) -> Tuple[Dict[str, Any], int]:
@@ -530,11 +597,9 @@ class SegInferenceTemplate:
         pbar = tqdm(total=total, desc="Grid search")
 
         results = []
-
         for iout in iou_types:
             for nms_mode in nms_modes:
                 for merge_score_mode in merge_score_modes:
-                    # plain NMS doesn't need multiple merge_score_mode values; skip redundant combos
                     if nms_mode == "plain" and merge_score_mode != merge_score_modes[0]:
                         continue
 
@@ -568,7 +633,6 @@ class SegInferenceTemplate:
                                     "merge_score_mode": merge_score_mode
                                 }
                             pbar.update(1)
-
         pbar.close()
 
         csv_path = os.path.join(self.outputs.out_dir, "grid_search_results.csv")
@@ -588,7 +652,6 @@ class SegInferenceTemplate:
         fil = [p for p in proposals if p.score >= score_thr]
         if not fil:
             return []
-
         if nms_mode == "plain":
             return mask_nms(fil, nms_thr, iou_type)
         elif nms_mode == "merge":
@@ -608,7 +671,7 @@ class SegInferenceTemplate:
         rng = np.random.default_rng(12345)
 
         for d in dets:
-            color = rng.integers(64, 256, size=3, dtype=np.uint8).tolist()  # [B, G, R]
+            color = rng.integers(64, 256, size=3, dtype=np.uint8).tolist()
 
             H, W = img.shape[:2]
             y1o, x1o = int(d.top), int(d.left)
@@ -672,12 +735,6 @@ class SegInferenceTemplate:
 def _resolve_cfg_and_ckpt(project_root: str,
                           config_rel: str,
                           checkpoint_rel: Optional[str]) -> Tuple[str, Optional[str], bool]:
-    """
-    Return (cfg_path_or_alias, weights_path_or_url, use_model_zoo_cfg)
-    - If local cfg exists: use it; else treat config_rel as model_zoo alias.
-    - If weights local path exists: use it; elif startswith http/detectron2:// : pass through;
-      elif None: try model_zoo checkpoint for the alias (if alias valid).
-    """
     local_cfg = os.path.join(project_root, config_rel)
     use_mz = False
     if os.path.isfile(local_cfg):
@@ -726,7 +783,6 @@ class Detectron2SegInference(SegInferenceTemplate):
 
         cfg = get_cfg()
 
-        # Some configs depend on deeplab
         from detectron2.projects.deeplab import add_deeplab_config
         add_deeplab_config(cfg)
 
@@ -778,7 +834,7 @@ class Detectron2SegInference(SegInferenceTemplate):
 # CLI
 # -----------------------------
 def build_argparser():
-    p = argparse.ArgumentParser(description="Wheat Segmentation on Detectron2 with search/infer + resume CSV")
+    p = argparse.ArgumentParser(description="Wheat Segmentation on Detectron2 with search/infer + resume + optional resize")
 
     # Modes
     p.add_argument("--mode", choices=["search", "infer"], default="search",
@@ -802,17 +858,22 @@ def build_argparser():
     p.add_argument("--tile", type=int, default=800)
     p.add_argument("--overlap", type=int, default=256)
 
-    # Search space (used only in --mode search)
+    # NEW: resize for inference (H W). If not provided, no resize.
+    # Example: --resize_hw 1024 1536
+    p.add_argument("--resize_hw", type=int, nargs=2, default=None, metavar=("H", "W"),
+                   help="If set, resize whole image to (H,W) for inference, then map results back to original size.")
+
+    # Search space
     p.add_argument("--score_start", type=float, default=0.1)
     p.add_argument("--score_end", type=float, default=0.6)
-    p.add_argument("--score_num", type=int, default=1)
+    p.add_argument("--score_num", type=int, default=6)
     p.add_argument("--nms_start", type=float, default=0.1)
     p.add_argument("--nms_end", type=float, default=0.6)
-    p.add_argument("--nms_num", type=int, default=1)
+    p.add_argument("--nms_num", type=int, default=12)
     p.add_argument("--iou_types", type=str, nargs="+", default=["IOU", "IOU_Min"])
     p.add_argument("--base_keep_score", type=float, default=0.01)
 
-    # NEW: search over NMS method and merge score mode
+    # NMS choices
     p.add_argument("--nms_modes", type=str, nargs="+", default=["plain", "merge"],
                    choices=["plain", "merge"])
     p.add_argument("--merge_score_modes", type=str, nargs="+", default=["keep_max"],
@@ -823,8 +884,6 @@ def build_argparser():
     p.add_argument("--fix_iou_type", choices=["IOU", "IOU_Min"], default="IOU_Min")
     p.add_argument("--fix_score_thr", type=float, default=0.4)
     p.add_argument("--fix_nms_iou_thr", type=float, default=0.372)
-
-    # NEW: infer-only NMS choices
     p.add_argument("--fix_nms_mode", choices=["plain", "merge"], default="merge")
     p.add_argument("--fix_merge_score_mode", choices=["keep_max", "area_weighted"], default="keep_max")
 
@@ -848,7 +907,12 @@ def main():
         device=args.device,
         imports=tuple(args.imports)
     )
-    sw = SlidingWindowConfig(tile=args.tile, overlap=args.overlap, pad_value=(114, 114, 114))
+    sw = SlidingWindowConfig(
+        tile=args.tile,
+        overlap=args.overlap,
+        pad_value=(114, 114, 114),
+        resize_hw=tuple(args.resize_hw) if args.resize_hw is not None else None
+    )
     search = SearchSpace(
         iou_types=tuple(args.iou_types),
         score_thr_range=(args.score_start, args.score_end, args.score_num),
