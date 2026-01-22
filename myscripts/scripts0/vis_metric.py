@@ -1,9 +1,10 @@
 import os
 import json
 import pandas as pd
+import numpy as np
 from matplotlib import pyplot as plt
 
-mode = "experiment" # "experiment" or "ablation"
+mode = "ablation" # "experiment" or "ablation"
 
 if mode == "ablation":
     output_base_dir = "/public/home/zncui/pycharm_project/MaskDINO/output"
@@ -18,14 +19,17 @@ if mode == "ablation":
         # "maskdino_swinl-time-10-19-20-00-v1-patch-2000-dn-two-stage-q300/",
         "maskdino_swinl-time-10-19-20-00-v1-patch-2000-dn-two-stage-q900/",
         "maskdino_swinl-time-10-19-20-00-v1-patch-2000-no-dn-two-stage-all-layer-iou-cls-1.0-iou-5.0-no-gated-attn-ddq-one2many-v2-dac-align-no-rank-weight-dn/",
-        "maskdino_swinl-time-10-19-20-00-v1-patch-2000-no-dn-two-stage-all-layer-iou-cls-1.0-iou-5.0-no-gated-attn-ddq-one2many-v2-dac-align-no-rank-weight-dn-x4/"
-
+        "maskdino_swinl-time-10-19-20-00-v1-patch-2000-no-dn-two-stage-all-layer-iou-cls-1.0-iou-5.0-no-gated-attn-ddq-one2many-v2-dac-align-no-rank-weight-dn-x4/",
+        "experiment1/dn100_o2o600_o2m450_k3_iou0.8",
+        "experiment1/dn100_o2o900_o2m1350_k3_iou0.8",
     ]
     labels = [
         "base",
         "base-dn-two-stage",
         "v1",
-        "v1-sep"
+        "v1-sep",
+        "e1",
+        "e2",
     ]
 
 if mode == "experiment":
@@ -50,6 +54,28 @@ for output_dir, label in zip(output_dirs, labels):
         segm_AP = [m["segm/AP"] for m in metrics]
         bbox_segm_metrics.append((bbox_AP, segm_AP, label))
         total_losses_list.append(total_losses)
+
+max_bbox_AP = -np.inf
+max_bbox_label = ''
+max_segm_AP = -np.inf
+max_segm_label = ''
+TOPK = 4
+for (bbox_AP, segm_AP, label), total_losses in zip(bbox_segm_metrics, total_losses_list):
+    bbox_AP = np.asarray(bbox_AP)
+    segm_AP = np.asarray(segm_AP)
+    k_bbox_AP_index = np.argsort(bbox_AP)[-TOPK:]
+    k_bbox_AP = bbox_AP[k_bbox_AP_index].sum()
+    if k_bbox_AP > max_bbox_AP:
+        max_bbox_AP = k_bbox_AP
+        max_bbox_label = label
+    k_segm_AP_index = np.argsort(segm_AP)[-TOPK:]
+    k_segm_AP = segm_AP[k_segm_AP_index].sum()
+    if k_segm_AP > max_segm_AP:
+        max_segm_AP = k_segm_AP
+        max_segm_label = label
+
+print(f"Max BBox AP(sum top{TOPK}): {max_bbox_AP} by {max_bbox_label}")
+print(f"Max Segm AP(sum top{TOPK}): {max_segm_AP} by {max_segm_label}")
 
 def smooth(y, k=5):
     return pd.Series(y).rolling(k, center=False).mean()
