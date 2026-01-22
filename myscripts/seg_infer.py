@@ -4,23 +4,22 @@
 """
 Wheat instance segmentation on Detectron2 with sliding-window + global Mask-NMS.
 Modes:
-- search: grid search (iou_type x score_thr x nms_iou_thr) on val then test with best
-- infer : skip search, directly use (iou_type, score_thr, nms_iou_thr) on a split (default: test)
+- search: grid search (iou_type x score_thr x nms_iou_thr x nms_mode x merge_score_mode) on val then test with best
+- infer : skip search, directly use fixed params (including nms_mode) on a split (default: test)
 
-Template Method pattern:
-- SegInferenceTemplate: defines the workflow skeleton (run_search / run_infer_only)
-- Detectron2SegInference: concrete implementation using Detectron2
+NEW (Resume + streaming CSV):
+- 推理每张图片后立刻把结果追加写入 CSV（append + flush + fsync）
+- 重新运行时自动读取已存在的 CSV，跳过已处理图片（resume）
+- 为避免不同参数组合互相污染输出，按参数组合创建独立 run_dir（含 CSV/散点图/可视化）
 
 Notes
 -----
 1) 支持 Detectron2 Model Zoo 别名（如 COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml）。
-   若 --model_config_rel 指向本地 yaml，也可直接使用；权重同理（本地/URL/detectron2://）。
-2) 若你的 cfg/模型依赖第三方项目（如 MaskDINO），请通过 --imports maskdino 等先导入模块，以便注册 MetaArch/Heads 等。
-3) ROI_HEADS.SCORE_THRESH_TEST 会被设置为 base_keep_score（默认 0.01），仅作为粗筛；真正阈值与 NMS 仍由网格搜索/固定参数控制。
+2) 若 cfg/模型依赖第三方项目（如 MaskDINO），请通过 --imports maskdino 等先导入模块。
+3) ROI_HEADS.SCORE_THRESH_TEST 会被设置为 base_keep_score（默认 0.01）仅粗筛；真正阈值与 NMS 由网格搜索/固定参数控制。
 """
 
 import os
-import sys
 import math
 import glob
 import argparse
@@ -42,7 +41,7 @@ try:
     warnings.filterwarnings("ignore", category=FutureWarning)
     warnings.filterwarnings("ignore", category=UserWarning)
     warnings.filterwarnings('ignore', category=DeprecationWarning)
-except:
+except Exception:
     pass
 
 # ====== Detectron2 ======
@@ -77,6 +76,11 @@ class SearchSpace:
     iou_types: Tuple[str, ...] = ("IOU", "IOU_Min")
     score_thr_range: Tuple[float, float, int] = (0.1, 0.8, 30)
     nms_iou_thr_range: Tuple[float, float, int] = (0.1, 0.8, 30)
+
+    # NEW: include NMS method in search
+    nms_modes: Tuple[str, ...] = ("plain", "merge")          # plain=mask_nms, merge=mask_nms_with_merge
+    merge_score_modes: Tuple[str, ...] = ("keep_max",)       # or ("keep_max","area_weighted")
+
     base_keep_score: float = 0.01
 
 @dataclass
@@ -94,7 +98,8 @@ def ensure_dir(p: str):
     os.makedirs(p, exist_ok=True)
 
 def list_images_in_dir(d: str) -> List[str]:
-    exts = ("*.jpg", "*.jpeg", "*.png", "*.bmp", "*.tif", "*.tiff", "*.JPG", "*.JPEG", "*.PNG", "*.BMP", "*.TIF", "*.TIFF")
+    exts = ("*.jpg", "*.jpeg", "*.png", "*.bmp", "*.tif", "*.tiff",
+            "*.JPG", "*.JPEG", "*.PNG", "*.BMP", "*.TIF", "*.TIFF")
     files = []
     for e in exts:
         files.extend(glob.glob(os.path.join(d, e)))
@@ -128,6 +133,41 @@ def linspace_inclusive(start: float, end: float, num: int) -> List[float]:
     step = (end - start) / (num - 1)
     return [start + i * step for i in range(num)]
 
+# NEW: resume helpers
+def read_done_set(csv_path: str) -> set:
+    """
+    读取已存在的 csv，返回已完成的 filename 集合。
+    兼容第一行是表头或不是表头。
+    """
+    done = set()
+    if not os.path.exists(csv_path):
+        return done
+    with open(csv_path, "r", encoding="utf-8") as f:
+        for line in f:
+            s = line.strip()
+            if not s:
+                continue
+            if s.lower().startswith("filename"):
+                continue
+            parts = s.split(",")
+            if len(parts) >= 1:
+                done.add(parts[0].strip())
+    return done
+
+def append_csv_row(csv_path: str, filename: str, gt: int, pred: int, write_header_if_new: bool = True):
+    """
+    追加一行到 csv。若文件不存在且 write_header_if_new=True，则先写表头。
+    每次写完 flush + fsync，利于断点续跑。
+    """
+    is_new = not os.path.exists(csv_path)
+    ensure_dir(os.path.dirname(csv_path))
+    with open(csv_path, "a", encoding="utf-8") as f:
+        if is_new and write_header_if_new:
+            f.write("filename,ins_counts,pred_counts\n")
+        f.write(f"{filename},{gt},{pred}\n")
+        f.flush()
+        os.fsync(f.fileno())
+
 
 # -----------------------------
 # Proposal & IoU / NMS
@@ -147,7 +187,6 @@ class IOUType(Enum):
     IOU_Min = "IOU_Min"
 
 def mask_iou_between(a: DetProposal, b: DetProposal, iou_type: IOUType) -> float:
-    # compute intersection region in global coords using cropped masks
     xA = max(a.left, b.left)
     yA = max(a.top, b.top)
     xB = min(int(round(a.left + a.mask.shape[1])), int(round(b.left + b.mask.shape[1])))
@@ -163,7 +202,8 @@ def mask_iou_between(a: DetProposal, b: DetProposal, iou_type: IOUType) -> float
         union = a.area + b.area - inter
         return inter / union if union > 0 else 0.0
     else:
-        return inter / min(a.area, b.area) if min(a.area, b.area) > 0 else 0.0
+        mn = min(a.area, b.area)
+        return inter / mn if mn > 0 else 0.0
 
 def mask_nms(proposals: List[DetProposal], iou_thr: float, iou_type: IOUType) -> List[DetProposal]:
     if not proposals:
@@ -183,15 +223,6 @@ def mask_nms(proposals: List[DetProposal], iou_thr: float, iou_type: IOUType) ->
     return [proposals[i] for i in keep]
 
 def _merge_two_proposals(a: DetProposal, b: DetProposal, score_mode: str = "keep_max") -> DetProposal:
-    """
-    将 proposal b 合并进 proposal a，返回新的 proposal
-    - 掩码：做布尔并集（OR）
-    - 位置：在全局坐标构建并集包围框，拼接两者 mask，再裁剪到 mask 的紧致外接框
-    - bbox/top/left/area：按合并后掩码重算
-    - score：'keep_max' 保留较大分数；'area_weighted' 用面积加权平均
-    - label：沿用 a 的 label（若需要也可改为面积/分数多数表决）
-    """
-    # 1) 计算全局并集包围框
     ax1, ay1 = a.left, a.top
     ax2, ay2 = a.left + a.mask.shape[1], a.top + a.mask.shape[0]
     bx1, by1 = b.left, b.top
@@ -201,68 +232,50 @@ def _merge_two_proposals(a: DetProposal, b: DetProposal, score_mode: str = "keep
     ux2, uy2 = max(ax2, bx2), max(ay2, by2)
     U_w, U_h = int(ux2 - ux1), int(uy2 - uy1)
 
-    # 2) 将两个局部 mask 放到并集坐标的大画布上
     canvas = np.zeros((U_h, U_w), dtype=bool)
-    # a 的偏移
+
     ay_off, ax_off = a.top - uy1, a.left - ux1
     canvas[ay_off:ay_off + a.mask.shape[0], ax_off:ax_off + a.mask.shape[1]] |= a.mask
-    # b 的偏移
+
     by_off, bx_off = b.top - uy1, b.left - ux1
     canvas[by_off:by_off + b.mask.shape[0], bx_off:bx_off + b.mask.shape[1]] |= b.mask
 
-    # 3) 对合成后的 mask 做紧致裁剪（去掉全零边框）
     if not canvas.any():
-        # 理论上不会发生（因为 a、b 至少一个有像素）
         new_mask = canvas
         tight_x1 = tight_y1 = 0
-    else        :
+    else:
         ys, xs = np.where(canvas)
         tight_x1, tight_x2 = xs.min(), xs.max() + 1
         tight_y1, tight_y2 = ys.min(), ys.max() + 1
         new_mask = canvas[tight_y1:tight_y2, tight_x1:tight_x2]
 
-    # 4) 组合后的全局左上角、bbox、面积
     new_left = int(ux1 + tight_x1)
-    new_top  = int(uy1 + tight_y1)
+    new_top = int(uy1 + tight_y1)
     new_h, new_w = new_mask.shape[0], new_mask.shape[1]
     new_bbox = np.array([new_left, new_top, new_left + new_w, new_top + new_h], dtype=float)
     new_area = int(new_mask.sum())
 
-    # 5) 分数策略
     if score_mode == "area_weighted":
-        # 面积加权（更平滑）：注意避免除零
         denom = max(1, a.area + b.area)
         new_score = float((a.score * a.area + b.score * b.area) / denom)
     else:
-        # 默认：保留较大分数（保持“以高分实例为主”的语义）
         new_score = float(max(a.score, b.score))
 
     return DetProposal(
         bbox=new_bbox,
         score=new_score,
-        label=a.label,          # 如需也可做多数表决
+        label=a.label,
         mask=new_mask.astype(bool),
         top=int(new_top),
         left=int(new_left),
         area=int(new_area),
     )
 
-
-def mask_nms_with_merge(proposals: List[DetProposal],
-                        iou_thr: float,
-                        iou_type: IOUType,
+def mask_nms_with_merge(proposals: List[DetProposal], iou_thr: float, iou_type: IOUType,
                         score_mode: str = "keep_max") -> List[DetProposal]:
-    """
-    合并版 Mask-NMS：
-    - 先按 score 从高到低排序
-    - 取当前最高分为“基准实例”，将与其 IOU/IOU_Min ≥ 阈值的其他实例合并到它上面（mask 取并，重算 bbox/area/score）
-    - 合并完成后，得到新的“基准实例”，继续扫描余下实例是否还与它重叠，直到无可合并为止
-    - 进入下一高分实例重复上述过程
-    """
     if not proposals:
         return []
 
-    # 按分数从大到小
     order = sorted(range(len(proposals)), key=lambda i: proposals[i].score, reverse=True)
     used = np.zeros(len(proposals), dtype=bool)
     merged_results: List[DetProposal] = []
@@ -271,12 +284,10 @@ def mask_nms_with_merge(proposals: List[DetProposal],
         if used[idx]:
             continue
 
-        # 以当前最高分为“基准实例”，逐步把可合并的并进来
         base = proposals[idx]
         used[idx] = True
 
         changed = True
-        # 因为 base 在合并过程中会变化，这里迭代扫描直到不再发生合并
         while changed:
             changed = False
             for j in order:
@@ -286,11 +297,12 @@ def mask_nms_with_merge(proposals: List[DetProposal],
                 if iou >= iou_thr:
                     base = _merge_two_proposals(base, proposals[j], score_mode=score_mode)
                     used[j] = True
-                    changed = True  # 发生了合并，需要再扫一遍（新的 base 可能与更多实例相交）
+                    changed = True
 
         merged_results.append(base)
 
     return merged_results
+
 
 # -----------------------------
 # Template base
@@ -309,7 +321,6 @@ class SegInferenceTemplate:
     def load_model(self): raise NotImplementedError
     def infer_tile(self, tile_img: np.ndarray) -> List[Dict[str, Any]]: raise NotImplementedError
 
-    # ====== Modes ======
     def run_search(self):
         """Grid-search on val, then test with best params."""
         ensure_dir(self.outputs.out_dir)
@@ -326,91 +337,136 @@ class SegInferenceTemplate:
 
         print("==> Grid searching best parameters on VAL ...")
         best_cfg, best_sum_diff = self._grid_search(val_cache, val_gt_counts)
+
         print(f"[Best on VAL] iou_type={best_cfg['iou_type'].value}, "
               f"score_thr={best_cfg['score_thr']:.4f}, nms_iou_thr={best_cfg['nms_iou_thr']:.4f}, "
+              f"nms_mode={best_cfg['nms_mode']}, merge_score_mode={best_cfg['merge_score_mode']}, "
               f"sum|GT-Pred|={best_sum_diff}")
 
-        # 将 print 输出保存到文件
         with open(os.path.join(self.outputs.out_dir, "best_params_on_val.txt"), "w", encoding="utf-8") as f:
             f.write(f"[Best on VAL] iou_type={best_cfg['iou_type'].value}, "
                     f"score_thr={best_cfg['score_thr']:.4f}, nms_iou_thr={best_cfg['nms_iou_thr']:.4f}, "
+                    f"nms_mode={best_cfg['nms_mode']}, merge_score_mode={best_cfg['merge_score_mode']}, "
                     f"sum|GT-Pred|={best_sum_diff}\n")
 
-        print("==> Running TEST with best parameters ...")
-        self._run_on_split("test", best_cfg['iou_type'], best_cfg['score_thr'], best_cfg['nms_iou_thr'])
+        print("==> Running TEST with best parameters (resume enabled) ...")
+        self._run_on_split(
+            "test",
+            best_cfg["iou_type"],
+            best_cfg["score_thr"],
+            best_cfg["nms_iou_thr"],
+            best_cfg["nms_mode"],
+            best_cfg["merge_score_mode"],
+        )
 
-    def run_infer_only(self, split: str, iou_type: IOUType, score_thr: float, nms_iou_thr: float):
+    def run_infer_only(self, split: str, iou_type: IOUType, score_thr: float, nms_iou_thr: float,
+                       nms_mode: str, merge_score_mode: str):
         """Direct inference with fixed params on a chosen split (test/val/train)."""
         ensure_dir(self.outputs.out_dir)
         random.seed(0); np.random.seed(0)
         print("==> Loading model ..."); self.load_model()
-        print(f"==> Running {split.upper()} with fixed params: "
-              f"iou_type={iou_type.value}, score_thr={score_thr}, nms_iou_thr={nms_iou_thr}")
-        self._run_on_split(split, iou_type, score_thr, nms_iou_thr)
+        print(f"==> Running {split.upper()} with fixed params (resume enabled): "
+              f"iou_type={iou_type.value}, score_thr={score_thr}, nms_iou_thr={nms_iou_thr}, "
+              f"nms_mode={nms_mode}, merge_score_mode={merge_score_mode}")
+        self._run_on_split(split, iou_type, score_thr, nms_iou_thr, nms_mode, merge_score_mode)
 
     # ====== shared helpers ======
-    def _run_on_split(self, split: str, iou_type: IOUType, score_thr: float, nms_iou_thr: float):
+    def _make_run_tag(self, split: str, iou_type: IOUType, score_thr: float, nms_iou_thr: float,
+                      nms_mode: str, merge_score_mode: str) -> str:
+        # 目录名尽量短但唯一，避免小数点太长
+        return (f"{split}_iou-{iou_type.value}"
+                f"_s-{score_thr:.4f}_n-{nms_iou_thr:.4f}"
+                f"_m-{nms_mode}_ms-{merge_score_mode}")
+
+    def _run_on_split(self, split: str, iou_type: IOUType, score_thr: float, nms_iou_thr: float,
+                      nms_mode: str, merge_score_mode: str):
         imgs_dir, _ = yolo_split_paths(self.dataset.yolo_root, split)
         images = list_images_in_dir(imgs_dir)
 
-        rows = [("filename", "ins_counts", "pred_counts")]
-        xs, ys = [], []
-        for idx, img_path in enumerate(tqdm(images, desc=f"{split.upper()} images", total=len(images)), 1):
+        # NEW: 每个参数组合一个独立 run_dir，避免输出互相污染
+        run_tag = self._make_run_tag(split, iou_type, score_thr, nms_iou_thr, nms_mode, merge_score_mode)
+        run_dir = os.path.join(self.outputs.out_dir, run_tag)
+        ensure_dir(run_dir)
+        vis_dir = os.path.join(run_dir, "vis")
+        ensure_dir(vis_dir)
+
+        # CSV：边跑边写 + resume
+        csv_path = os.path.join(run_dir, f"{split}_pred_vs_gt.csv")
+        done = read_done_set(csv_path)
+
+        skipped = 0
+        newly_processed = 0
+
+        for img_path in tqdm(images, desc=f"{split.upper()} images", total=len(images)):
+            fname = os.path.basename(img_path)
+            if fname in done:
+                skipped += 1
+                continue
+
             proposals = self._proposals_for_image(img_path)
-            final_dets = self._apply_thresh_nms(proposals, score_thr, nms_iou_thr, iou_type)
+            final_dets = self._apply_thresh_nms(
+                proposals, score_thr, nms_iou_thr, iou_type,
+                nms_mode=nms_mode,
+                merge_score_mode=merge_score_mode
+            )
             pred_count = len(final_dets)
             gt_count = yolo_count_instances(yolo_label_path_for_image(img_path, self.dataset.yolo_root))
-            rows.append((os.path.basename(img_path), gt_count, pred_count))
-            xs.append(gt_count); ys.append(pred_count)
-            save_coco = False
-            if save_coco:
-                img_id = idx * 100000
-                start_ins_id = img_id
-                self._save_coco_annotation(img_id, start_ins_id, img_path, final_dets, self.outputs.out_dir)
+
+            # 推理完一张就写一行（append + flush + fsync）
+            if self.outputs.excel:
+                append_csv_row(csv_path, fname, gt_count, pred_count, write_header_if_new=True)
+
+            newly_processed += 1
+
+            # 可视化：同样每张写一次；resume 时如果图已存在则跳过（避免重复）
             if self.outputs.vis:
-                self._visualize_and_save(img_path, final_dets, self.outputs.out_dir, draw_contour=True)
+                out_img_path = os.path.join(vis_dir, fname)
+                if not os.path.exists(out_img_path):
+                    self._visualize_and_save(img_path, final_dets, vis_dir, draw_contour=True)
 
+        print(f"[Resume] skipped={skipped}, newly_processed={newly_processed}")
         if self.outputs.excel:
-            csv_path = os.path.join(self.outputs.out_dir, f"{split}_pred_vs_gt.csv")
-            with open(csv_path, "w", encoding="utf-8") as f:
-                for r in rows: f.write(f"{r[0]},{r[1]},{r[2]}\n")
-            print(f"[Saved] CSV -> {csv_path}")
-            # def diff_count(csv_path, out_dir):
-            #     import pandas as pd
-            #     df = pd.read_csv(csv_path)
-            #     df["abs_diff"] = (df["ins_counts"] - df["pred_counts"]).abs()
-            #     total_abs_diff = df["abs_diff"].sum()
-            #     total_ins = df["ins_counts"].sum()
-            #     percentage = (total_abs_diff / total_ins) * 100
-            #     print("总绝对差值:", total_abs_diff)
-            #     print("ins_counts 总数:", total_ins)
-            #     print(f"百分比: {percentage:.2f}%")
-            #     # 将 print 输出保存到文件
-            #     with open(os.path.join(out_dir, f"{split}_diff_count.txt"), "w", encoding="utf-8") as f:
-            #         f.write(f"总绝对差值: {total_abs_diff}\n")
-            #         f.write(f"ins_counts 总数: {total_ins}\n")
-            #         f.write(f"百分比: {percentage:.2f}%\n")
-            # diff_count(csv_path, self.outputs.out_dir)
+            print(f"[Saved] CSV (append) -> {csv_path}")
 
-        if self.outputs.draw_scatter and xs:
-            self._draw_scatter(xs, ys, os.path.join(self.outputs.out_dir, f"scatter_{split}.png"))
-            print(f"[Saved] Scatter -> {os.path.join(self.outputs.out_dir, f'scatter_{split}.png')}")
+        # Scatter：从 csv 回读全量点，保证 resume 后仍是完整散点图
+        if self.outputs.draw_scatter and self.outputs.excel and os.path.exists(csv_path):
+            xs, ys = [], []
+            with open(csv_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    s = line.strip()
+                    if not s or s.lower().startswith("filename"):
+                        continue
+                    parts = s.split(",")
+                    if len(parts) >= 3:
+                        try:
+                            xs.append(int(parts[1]))
+                            ys.append(int(parts[2]))
+                        except Exception:
+                            pass
+            if xs:
+                scatter_path = os.path.join(run_dir, f"scatter_{split}.png")
+                self._draw_scatter(xs, ys, scatter_path)
+                print(f"[Saved] Scatter -> {scatter_path}")
 
-        print(f"{split.upper()} finished.")
+        print(f"{split.upper()} finished. Outputs in: {run_dir}")
 
     def _proposals_for_image(self, img_path: str) -> List[DetProposal]:
         img = cv2.imread(img_path)
-        if img is None: raise FileNotFoundError(img_path)
+        if img is None:
+            raise FileNotFoundError(img_path)
         H, W = img.shape[:2]
         tile, overlap = self.sw.tile, self.sw.overlap
-        stride = max(1, tile - overlap); padv = self.sw.pad_value
+        stride = max(1, tile - overlap)
+        padv = self.sw.pad_value
 
         proposals: List[DetProposal] = []
 
         y_list = list(range(0, max(1, H - tile + 1), stride))
-        if y_list[-1] != max(0, H - tile): y_list.append(max(0, H - tile))
+        if y_list[-1] != max(0, H - tile):
+            y_list.append(max(0, H - tile))
         x_list = list(range(0, max(1, W - tile + 1), stride))
-        if x_list[-1] != max(0, W - tile): x_list.append(max(0, W - tile))
+        if x_list[-1] != max(0, W - tile):
+            x_list.append(max(0, W - tile))
 
         for y0 in y_list:
             for x0 in x_list:
@@ -418,13 +474,15 @@ class SegInferenceTemplate:
                 y1, x1 = min(y0 + tile, H), min(x0 + tile, W)
                 h, w = y1 - y0, x1 - x0
                 tile_img[:h, :w] = img[y0:y1, x0:x1]
-                valid_mask = np.zeros((tile, tile), dtype=bool); valid_mask[:h, :w] = True
+                valid_mask = np.zeros((tile, tile), dtype=bool)
+                valid_mask[:h, :w] = True
 
                 insts = self.infer_tile(tile_img)
                 for ins in insts:
                     score = float(ins["score"])
                     if score < self.search.base_keep_score:
                         continue
+
                     bbox = np.array(ins["bbox"], dtype=float)
                     mask = np.logical_and(ins["mask"].astype(bool), valid_mask)
 
@@ -433,13 +491,11 @@ class SegInferenceTemplate:
                     x2t = max(0, min(tile, int(math.ceil(bbox[2]))))
                     y2t = max(0, min(tile, int(math.ceil(bbox[3]))))
                     if x2t <= x1t or y2t <= y1t:
-                        # print(1)
                         continue
 
                     mask_crop = mask[y1t:y2t, x1t:x2t]
                     area = int(mask_crop.sum())
                     if area <= 0:
-                        # print(2)
                         continue
 
                     gx1, gy1 = x0 + x1t, y0 + y1t
@@ -447,7 +503,6 @@ class SegInferenceTemplate:
                     gx1 = max(0, min(W, gx1)); gx2 = max(0, min(W, gx2))
                     gy1 = max(0, min(H, gy1)); gy2 = max(0, min(H, gy2))
                     if gx2 <= gx1 or gy2 <= gy1:
-                        # print(3)
                         continue
 
                     proposals.append(DetProposal(
@@ -462,136 +517,84 @@ class SegInferenceTemplate:
         return proposals
 
     def _grid_search(self, val_cache: Dict[str, List[DetProposal]],
-                         val_gt_counts: Dict[str, int]) -> Tuple[Dict[str, Any], int]:
-            score_list = linspace_inclusive(*self.search.score_thr_range)
-            nms_list = linspace_inclusive(*self.search.nms_iou_thr_range)
-            iou_types = [IOUType(t) for t in self.search.iou_types]
-            best_cfg, best_sum = None, 1 << 62
-            total = len(score_list) * len(nms_list) * len(iou_types)
-            pbar = tqdm(total=total, desc="Grid search")
+                     val_gt_counts: Dict[str, int]) -> Tuple[Dict[str, Any], int]:
+        score_list = linspace_inclusive(*self.search.score_thr_range)
+        nms_list = linspace_inclusive(*self.search.nms_iou_thr_range)
+        iou_types = [IOUType(t) for t in self.search.iou_types]
+        nms_modes = list(self.search.nms_modes)
+        merge_score_modes = list(self.search.merge_score_modes)
 
-            # 保存所有搜索结果
-            results = []
+        best_cfg, best_sum = None, 1 << 62
 
-            for iout in iou_types:
-                for s_thr in score_list:
-                    for n_thr in nms_list:
-                        sum_diff = 0
-                        for img_path, props in val_cache.items():
-                            pred = len(self._apply_thresh_nms(props, s_thr, n_thr, iout))
-                            sum_diff += abs(val_gt_counts[img_path] - pred)
+        total = len(score_list) * len(nms_list) * len(iou_types) * len(nms_modes) * len(merge_score_modes)
+        pbar = tqdm(total=total, desc="Grid search")
 
-                        results.append({
-                            "iou_type": iout.value,
-                            "score_thr": s_thr,
-                            "nms_thr": n_thr,
-                            "sum_diff": sum_diff
-                        })
+        results = []
 
-                        if sum_diff < best_sum:
-                            best_sum = sum_diff
-                            best_cfg = {"iou_type": iout, "score_thr": s_thr, "nms_iou_thr": n_thr}
-                        pbar.update(1)
-            pbar.close()
+        for iout in iou_types:
+            for nms_mode in nms_modes:
+                for merge_score_mode in merge_score_modes:
+                    # plain NMS doesn't need multiple merge_score_mode values; skip redundant combos
+                    if nms_mode == "plain" and merge_score_mode != merge_score_modes[0]:
+                        continue
 
-            # 保存到 CSV
-            csv_path = os.path.join(self.outputs.out_dir, "grid_search_results.csv")
-            with open(csv_path, "w", encoding="utf-8") as f:
-                f.write("iou_type,score_thr,nms_thr,sum_diff\n")
-                for r in results:
-                    f.write(f"{r['iou_type']},{r['score_thr']:.4f},{r['nms_thr']:.4f},{r['sum_diff']}\n")
-            print(f"[Saved] Grid search results -> {csv_path}")
+                    for s_thr in score_list:
+                        for n_thr in nms_list:
+                            sum_diff = 0
+                            for img_path, props in val_cache.items():
+                                pred = len(self._apply_thresh_nms(
+                                    props, s_thr, n_thr, iout,
+                                    nms_mode=nms_mode,
+                                    merge_score_mode=merge_score_mode
+                                ))
+                                sum_diff += abs(val_gt_counts[img_path] - pred)
 
-            return best_cfg, best_sum
+                            results.append({
+                                "iou_type": iout.value,
+                                "score_thr": s_thr,
+                                "nms_thr": n_thr,
+                                "nms_mode": nms_mode,
+                                "merge_score_mode": merge_score_mode,
+                                "sum_diff": sum_diff
+                            })
+
+                            if sum_diff < best_sum:
+                                best_sum = sum_diff
+                                best_cfg = {
+                                    "iou_type": iout,
+                                    "score_thr": s_thr,
+                                    "nms_iou_thr": n_thr,
+                                    "nms_mode": nms_mode,
+                                    "merge_score_mode": merge_score_mode
+                                }
+                            pbar.update(1)
+
+        pbar.close()
+
+        csv_path = os.path.join(self.outputs.out_dir, "grid_search_results.csv")
+        with open(csv_path, "w", encoding="utf-8") as f:
+            f.write("iou_type,score_thr,nms_thr,nms_mode,merge_score_mode,sum_diff\n")
+            for r in results:
+                f.write(f"{r['iou_type']},{r['score_thr']:.4f},{r['nms_thr']:.4f},"
+                        f"{r['nms_mode']},{r['merge_score_mode']},{r['sum_diff']}\n")
+        print(f"[Saved] Grid search results -> {csv_path}")
+
+        return best_cfg, best_sum
 
     def _apply_thresh_nms(self, proposals: List[DetProposal],
-                          score_thr: float, nms_thr: float, iou_type: IOUType) -> List[DetProposal]:
+                          score_thr: float, nms_thr: float, iou_type: IOUType,
+                          nms_mode: str = "merge",
+                          merge_score_mode: str = "keep_max") -> List[DetProposal]:
         fil = [p for p in proposals if p.score >= score_thr]
-        # return mask_nms(fil, nms_thr, iou_type) if fil else []
-        # 'keep_max'：合并后保留较大 score；想更平滑可改 'area_weighted'
-        return mask_nms_with_merge(fil, nms_thr, iou_type, score_mode="keep_max") if fil else []
+        if not fil:
+            return []
 
-    def _save_coco_annotation(self, img_id, start_ins_id, img_path: str, dets: List[DetProposal], out_dir: str):
-            """
-            将检测结果保存为 COCO 格式的标注文件
-            segmentation 使用 polygon 形式
-            """
-            import json
-
-            img = cv2.imread(img_path)
-            if img is None:
-                return
-
-            H, W = img.shape[:2]
-            img_name = os.path.basename(img_path)
-
-            # COCO 格式结构
-            coco_output = {
-                "info": {},
-                "licenses": [],
-                "images": [{
-                    "id": img_id,
-                    "file_name": img_name,
-                    "width": W,
-                    "height": H
-                }],
-                "annotations": [],
-                "categories": [{"id": 1, "name": "wheat"}]
-            }
-
-            ins_id = start_ins_id
-            for idx, d in enumerate(dets, start=1):
-                # 获取 mask 的轮廓
-                mask_uint8 = (d.mask.astype(np.uint8) * 255)
-                contours, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-                if not contours:
-                    continue
-
-                # 转换为 COCO polygon 格式 (全局坐标)
-                segmentation = []
-                for contour in contours:
-                    if len(contour) < 3:  # 至少需要3个点
-                        continue
-                    polygon = []
-                    for point in contour:
-                        x = float(d.left + point[0][0])
-                        y = float(d.top + point[0][1])
-                        polygon.extend([x, y])
-
-                    if len(polygon) >= 6:  # 至少3个点(6个坐标值)
-                        segmentation.append(polygon)
-
-                if not segmentation:
-                    continue
-
-                # 计算 bbox (COCO 格式: [x, y, width, height])
-                x1, y1, x2, y2 = d.bbox
-                bbox = [float(x1), float(y1), float(x2 - x1), float(y2 - y1)]
-
-                annotation = {
-                    "id": ins_id + idx,
-                    "image_id": img_id,
-                    "category_id": 1,
-                    "segmentation": segmentation,
-                    "area": float(d.area),
-                    "bbox": bbox,
-                    "iscrowd": 0,
-                }
-                coco_output["annotations"].append(annotation)
-
-            # 保存 JSON 文件
-            ensure_dir(out_dir)
-            json_name = os.path.splitext(img_name)[0] + ".json"
-            json_path = os.path.join(out_dir, json_name)
-
-            with open(json_path, "w", encoding="utf-8") as f:
-                json.dump(coco_output, f, indent=2, ensure_ascii=False)
-
-    import os
-    import cv2
-    import numpy as np
-    from typing import List
+        if nms_mode == "plain":
+            return mask_nms(fil, nms_thr, iou_type)
+        elif nms_mode == "merge":
+            return mask_nms_with_merge(fil, nms_thr, iou_type, score_mode=merge_score_mode)
+        else:
+            raise ValueError(f"Unknown nms_mode: {nms_mode}")
 
     def _visualize_and_save(self, img_path: str, dets: List[DetProposal],
                             out_dir: str, alpha: float = 0.8, draw_contour: bool = False,
@@ -599,29 +602,19 @@ class SegInferenceTemplate:
         img = cv2.imread(img_path)
         if img is None:
             return
-
         ensure_dir(out_dir)
 
-        # 用 overlay 叠加颜色
         overlay = img.copy()
-
-        # 固定随机种子，保证每次可复现（想要每次都不一样可以删掉 seed）
         rng = np.random.default_rng(12345)
 
         for d in dets:
-            # --- 1. 随机生成一个“较深”的 BGR 颜色 ---
-            # 让每个通道都在 64~255 之间，避免太浅
             color = rng.integers(64, 256, size=3, dtype=np.uint8).tolist()  # [B, G, R]
 
-            # --- 2. 取对应 ROI（严格对齐 mask 与 roi）---
             H, W = img.shape[:2]
-
-            # det 的原始全局框（对应 d.mask 的坐标系）
             y1o, x1o = int(d.top), int(d.left)
             y2o = int(d.top + d.mask.shape[0])
             x2o = int(d.left + d.mask.shape[1])
 
-            # clamp 到图像内，得到实际 roi
             y1 = max(0, min(H, y1o))
             y2 = max(0, min(H, y2o))
             x1 = max(0, min(W, x1o))
@@ -631,54 +624,31 @@ class SegInferenceTemplate:
 
             roi = overlay[y1:y2, x1:x2]
 
-            # 计算 roi 相对 det-mask 的偏移，并裁剪 mask 使其与 roi 尺寸一致
             my1 = y1 - y1o
             my2 = my1 + (y2 - y1)
             mx1 = x1 - x1o
             mx2 = mx1 + (x2 - x1)
 
             m = d.mask[my1:my2, mx1:mx2].astype(bool)
-
-            # 双保险：确保尺寸完全一致
             if m.shape[0] != roi.shape[0] or m.shape[1] != roi.shape[1]:
                 m = m[:roi.shape[0], :roi.shape[1]]
 
-            # --- 3. 叠加颜色 ---
             roi[m] = (alpha * np.array(color, dtype=np.float32) +
                       (1 - alpha) * roi[m].astype(np.float32)).astype(np.uint8)
 
-            # --- 4. 画轮廓（用同一个颜色）---
             if draw_contour:
                 m8 = (m.astype(np.uint8) * 255)
                 contours, _ = cv2.findContours(m8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                 cv2.drawContours(overlay[y1:y2, x1:x2], contours, -1, color, 2)
 
-            # --- 5. 按 score 画中心点（颜色可以根据 score 改，也可以直接用实例颜色）---
             if draw_center:
-                score = d.score
                 ys, xs = np.where(m > 0)
                 if len(xs) > 0 and len(ys) > 0:
                     cx = int(x1 + np.mean(xs))
                     cy = int(y1 + np.mean(ys))
+                    cv2.circle(overlay, (cx, cy), radius=6, color=tuple(color), thickness=-1)
 
-                    # 如果你想用 score 决定颜色，就用下面这段
-                    # if score > 0.5:
-                    #     point_color = (0, 0, 255)      # 红色
-                    # elif score > 0.2:
-                    #     point_color = (0, 255, 255)    # 黄色
-                    # else:
-                    #     point_color = (0, 255, 0)      # 绿色
-
-                    # 或者直接用这个实例自身的颜色：
-                    point_color = tuple(color)
-
-                    cv2.circle(overlay, (cx, cy), radius=6,
-                               color=point_color, thickness=-1)
-
-        # --- 6. 最终可视化图像：img 和 overlay 做一次整体的加权 ---
-        # 如果你已经在 roi 那一步做了 alpha 混合，也可以直接 vis = overlay
         vis = cv2.addWeighted(overlay, 1.0, img, 0.0, 0)
-
         out_path = os.path.join(out_dir, os.path.basename(img_path))
         cv2.imwrite(out_path, vis)
 
@@ -687,9 +657,13 @@ class SegInferenceTemplate:
         plt.scatter(xs, ys, s=10)
         mn, mx = min(xs + ys), max(xs + ys)
         plt.plot([mn, mx], [mn, mx], linestyle="--")
-        plt.xlabel("Ground Truth Count"); plt.ylabel("Predicted Count")
+        plt.xlabel("Ground Truth Count")
+        plt.ylabel("Predicted Count")
         plt.title("GT vs Pred")
-        plt.tight_layout(); plt.savefig(out_path, dpi=160); plt.close()
+        plt.tight_layout()
+        ensure_dir(os.path.dirname(out_path))
+        plt.savefig(out_path, dpi=160)
+        plt.close()
 
 
 # -----------------------------
@@ -709,7 +683,6 @@ def _resolve_cfg_and_ckpt(project_root: str,
     if os.path.isfile(local_cfg):
         cfg_path = local_cfg
     else:
-        # assume a model zoo alias like "COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml"
         cfg_path = model_zoo.get_config_file(config_rel)
         use_mz = True
 
@@ -721,13 +694,11 @@ def _resolve_cfg_and_ckpt(project_root: str,
         elif checkpoint_rel.startswith("http") or checkpoint_rel.startswith("detectron2://"):
             weights = checkpoint_rel
         else:
-            # fallback: try model zoo url from alias if possible
             try:
                 weights = model_zoo.get_checkpoint_url(config_rel)
             except Exception:
                 weights = None
     else:
-        # no checkpoint specified -> try model zoo default for alias
         if use_mz:
             try:
                 weights = model_zoo.get_checkpoint_url(config_rel)
@@ -738,7 +709,6 @@ def _resolve_cfg_and_ckpt(project_root: str,
 
 class Detectron2SegInference(SegInferenceTemplate):
     def load_model(self):
-        # 0) optional imports for custom projects (e.g., maskdino)
         for m in self.model_cfg.imports:
             try:
                 __import__(m)
@@ -746,7 +716,6 @@ class Detectron2SegInference(SegInferenceTemplate):
             except Exception as e:
                 print(f"[imports] WARNING: failed to import '{m}': {e}")
 
-        # 1) resolve cfg & weights
         cfg_path, weights, used_mz = _resolve_cfg_and_ckpt(
             self.model_cfg.project_root,
             self.model_cfg.config_rel,
@@ -755,29 +724,27 @@ class Detectron2SegInference(SegInferenceTemplate):
         print(f"[cfg]     -> {cfg_path} ({'model_zoo' if used_mz else 'local'})")
         print(f"[weights] -> {weights}")
 
-        # 2) build cfg
         cfg = get_cfg()
+
+        # Some configs depend on deeplab
         from detectron2.projects.deeplab import add_deeplab_config
-        add_deeplab_config(cfg)  # 有些 MaskDINO 配置依赖它
+        add_deeplab_config(cfg)
+
+        # If you use MaskDINO configs, keep this. Otherwise wrap with try/except.
         from maskdino import add_maskdino_config
-        add_maskdino_config(cfg)  # MaskDINO 自己的配置键
+        add_maskdino_config(cfg)
+
         cfg.merge_from_file(cfg_path)
         if weights is not None:
             cfg.MODEL.WEIGHTS = weights
 
-        # device & score threshold
         cfg.MODEL.DEVICE = self.model_cfg.device
-        # keep low thresh to collect more raw proposals; we filter again later
         cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = float(max(0.0, min(self.search.base_keep_score, 0.9)))
 
-        # 3) predictor
         self.model = DefaultPredictor(cfg)
 
     @torch.no_grad()
     def infer_tile(self, tile_img: np.ndarray) -> List[Dict[str, Any]]:
-        """
-        Return List[{'bbox': [x1,y1,x2,y2], 'score': float, 'label': int, 'mask': HxW bool}]
-        """
         outputs = self.model(tile_img)
         if "instances" not in outputs:
             return []
@@ -785,16 +752,13 @@ class Detectron2SegInference(SegInferenceTemplate):
         if len(inst) == 0:
             return []
 
-        # to cpu numpy
         bboxes = inst.pred_boxes.tensor.detach().cpu().numpy() if inst.has("pred_boxes") else None
         scores = inst.scores.detach().cpu().numpy() if inst.has("scores") else None
         labels = inst.pred_classes.detach().cpu().numpy() if inst.has("pred_classes") else np.zeros((len(inst),), dtype=np.int32)
 
         if inst.has("pred_masks"):
-            # pred_masks: (N, H, W) bool tensor
             masks = inst.pred_masks.detach().cpu().numpy().astype(bool)
         else:
-            # 没有分割掩码的模型无法用于本脚本
             return []
 
         out = []
@@ -814,7 +778,7 @@ class Detectron2SegInference(SegInferenceTemplate):
 # CLI
 # -----------------------------
 def build_argparser():
-    p = argparse.ArgumentParser(description="Wheat Segmentation (Template Method) on Detectron2 with search/infer modes")
+    p = argparse.ArgumentParser(description="Wheat Segmentation on Detectron2 with search/infer + resume CSV")
 
     # Modes
     p.add_argument("--mode", choices=["search", "infer"], default="search",
@@ -824,13 +788,12 @@ def build_argparser():
     p.add_argument("--yolo_root", type=str,
                    default="/public/home/zncui/datasets/wheat-guo-dataset/yolo_wheat_big_image")
 
-    # Model (兼容：本地相对路径 / 模型动物园别名 / detectron2:// / http URL)
-    p.add_argument("--project_root", type=str,
-                   default=".")
+    # Model
+    p.add_argument("--project_root", type=str, default=".")
     p.add_argument("--model_config_rel", type=str,
                    default="/public/home/zncui/pycharm_project/MaskDINO/output/maskdino_swinl-time-10-12-10-30/config.yaml")
     p.add_argument("--checkpoint_rel", type=str,
-                   default="/public/home/zncui/pycharm_project/MaskDINO/output/maskdino_swinl-time-10-12-10-30/model_final.pth", help="local path / detectron2://... / http... (empty -> use model zoo default if alias)")
+                   default="/public/home/zncui/pycharm_project/MaskDINO/output/maskdino_swinl-time-10-12-10-30/model_final.pth")
     p.add_argument("--device", type=str, default="cuda:0")
     p.add_argument("--imports", type=str, nargs="*", default=['maskdino'],
                    help="Optional modules to import before building cfg (e.g., maskdino)")
@@ -842,18 +805,28 @@ def build_argparser():
     # Search space (used only in --mode search)
     p.add_argument("--score_start", type=float, default=0.1)
     p.add_argument("--score_end", type=float, default=0.6)
-    p.add_argument("--score_num", type=int, default=6)
+    p.add_argument("--score_num", type=int, default=1)
     p.add_argument("--nms_start", type=float, default=0.1)
     p.add_argument("--nms_end", type=float, default=0.6)
-    p.add_argument("--nms_num", type=int, default=12)
+    p.add_argument("--nms_num", type=int, default=1)
     p.add_argument("--iou_types", type=str, nargs="+", default=["IOU", "IOU_Min"])
     p.add_argument("--base_keep_score", type=float, default=0.01)
+
+    # NEW: search over NMS method and merge score mode
+    p.add_argument("--nms_modes", type=str, nargs="+", default=["plain", "merge"],
+                   choices=["plain", "merge"])
+    p.add_argument("--merge_score_modes", type=str, nargs="+", default=["keep_max"],
+                   choices=["keep_max", "area_weighted"])
 
     # Infer-only fixed params
     p.add_argument("--infer_split", choices=["test", "val", "train"], default="test")
     p.add_argument("--fix_iou_type", choices=["IOU", "IOU_Min"], default="IOU_Min")
     p.add_argument("--fix_score_thr", type=float, default=0.4)
     p.add_argument("--fix_nms_iou_thr", type=float, default=0.372)
+
+    # NEW: infer-only NMS choices
+    p.add_argument("--fix_nms_mode", choices=["plain", "merge"], default="merge")
+    p.add_argument("--fix_merge_score_mode", choices=["keep_max", "area_weighted"], default="keep_max")
 
     # Outputs
     p.add_argument("--out_dir", type=str, default="./swinl_guo_big_images")
@@ -880,6 +853,8 @@ def main():
         iou_types=tuple(args.iou_types),
         score_thr_range=(args.score_start, args.score_end, args.score_num),
         nms_iou_thr_range=(args.nms_start, args.nms_end, args.nms_num),
+        nms_modes=tuple(args.nms_modes),
+        merge_score_modes=tuple(args.merge_score_modes),
         base_keep_score=args.base_keep_score
     )
     outputs = OutputOptions(
@@ -898,12 +873,11 @@ def main():
             split=args.infer_split,
             iou_type=IOUType(args.fix_iou_type),
             score_thr=args.fix_score_thr,
-            nms_iou_thr=args.fix_nms_iou_thr
+            nms_iou_thr=args.fix_nms_iou_thr,
+            nms_mode=args.fix_nms_mode,
+            merge_score_mode=args.fix_merge_score_mode
         )
 
 
-
 if __name__ == "__main__":
-    # 延迟导入 torch（仅在需要时），避免无 GPU 环境卡顿
-
     main()
