@@ -174,6 +174,32 @@ def pairwise_mask_overlap_roi(
     else:
         raise ValueError("reduce must be None/'mean'/'sum'")
 
+def compute_mask_iou_one(pred_mask, gt_mask, return_type='iou'):
+    # pred_mask: (H, W)
+    # gt_mask:   (H_gt, W_gt)
+    H, W = pred_mask.shape
+    H_gt, W_gt = gt_mask.shape
+    gt_mask = F.interpolate(
+        gt_mask.unsqueeze(0).unsqueeze(0).float(),
+        size=(H, W),
+        mode="bilinear",
+        align_corners=False
+    ).squeeze(0).squeeze(0)
+    pred_mask = (pred_mask.sigmoid() > 0.5).float().reshape(1, H * W)
+    gt_mask = gt_mask.reshape(1, H * W)
+    result = None
+    if return_type == 'iou':
+        intersection = (pred_mask * gt_mask).sum(-1)
+        union = pred_mask.sum(-1) + gt_mask.sum(-1) - intersection
+        iou = (intersection + 1) / (union + 1)
+        result = iou
+    if return_type == 'dice':
+        intersection = (pred_mask * gt_mask).sum(-1)
+        union = pred_mask.sum(-1) + gt_mask.sum(-1)
+        dice = (2 * intersection + 1) / (union + 1)
+        result = dice
+    return result  # (1,)
+
 def compute_mask_iou(pred_mask, gt_mask, return_type='iou'):
     # pred_mask: (nq, bs, H, W)
     # gt_mask:   (ngt, bs, H_gt, W_gt)

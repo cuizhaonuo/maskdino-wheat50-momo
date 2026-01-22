@@ -18,7 +18,7 @@ from torch.cuda.amp import autocast
 from detectron2.projects.point_rend.point_features import point_sample
 
 from maskdino.utils.box_ops import generalized_box_iou,box_cxcywh_to_xyxy, box_iou
-from maskdino.utils.mask_ops import pairwise_mask_overlap_roi
+from maskdino.utils.mask_ops import pairwise_mask_overlap_roi, compute_mask_iou_one
 
 from torch.utils.tensorboard import SummaryWriter
 
@@ -251,7 +251,21 @@ class HungarianMatcher(nn.Module):
                         keep_cols.append(col_id)
                 return keep_rows, keep_cols
 
-            if mode in ['o2m', 'sep'] and mask_iou is not None and self.matcher_nms_enabled:
+            def get_keep_indices_mask(index, out_masks, tgt_masks, iou_threshold=0.3):
+                # out_masks: (num_queries, H, W)
+                # tgt_masks: (num_target_boxes, H, W)
+                rows = []
+                cols = []
+                for row_id, col_id in zip(index[0], index[1]):
+                    out_mask = out_masks[row_id]
+                    tgt_mask = tgt_masks[col_id]
+                    iou = compute_mask_iou_one(out_mask, tgt_mask, return_type='iou')
+                    if iou.item() >= iou_threshold:
+                        rows.append(row_id)
+                        cols.append(col_id)
+                return rows, cols
+
+            if mask_iou is not None and self.matcher_nms_enabled:
                 index = linear_sum_assignment(C)
                 # rows = []
                 # cols = []
@@ -260,7 +274,7 @@ class HungarianMatcher(nn.Module):
                 #         rows.append(row_id)
                 #         cols.append(col_id)
                 # indices.append((rows, cols))
-                indices.append(get_keep_indices(index, out_bbox, tgt_bbox))
+                indices.append(get_keep_indices_mask(index, outputs["pred_masks"][b], targets[b]["masks"], iou_threshold=0.3))
             else:
                 indices.append(linear_sum_assignment(C))
 
