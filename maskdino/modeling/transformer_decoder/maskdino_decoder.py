@@ -805,7 +805,10 @@ class MaskDINODecoder(nn.Module):
             if self.layer_wise_iou_enabled and ('pred_logits_iou' in out) and (out['pred_logits_iou'] is not None):
                 out_one_to_many['pred_logits_iou'] = out['pred_logits_iou'][:, num_queries_one_to_one:]
 
-        if bs == 1 and self.ddq_enabled:
+
+        assert bs == 1, "Only support batch size = 1 for ddq inference."
+
+        if self.ddq_enabled:
             distinct_masks.insert(0, initial_keep_mask)
             last_mask = distinct_masks.pop()
 
@@ -839,9 +842,6 @@ class MaskDINODecoder(nn.Module):
                 interm_outputs_['pred_logits_iou'] = interm_outputs_['pred_logits_iou'][:, :num_queries_one_to_one]
 
             out['interm_outputs'] = interm_outputs_
-
-        else:
-            raise ValueError(f"Batch size {bs} != 1")
 
         return out, out_one_to_many, out_sep, mask_dict
 

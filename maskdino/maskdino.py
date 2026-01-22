@@ -345,7 +345,8 @@ class MaskDINO(nn.Module):
             mask_cls_results = outputs["pred_logits"]
             mask_pred_results = outputs["pred_masks"]
             mask_box_results = outputs["pred_boxes"]
-            mask_iou_results = outputs["pred_logits_iou"]
+            mask_iou_results = outputs["pred_logits_iou"] if "pred_logits_iou" in outputs else \
+                torch.zeros((*mask_cls_results.shape[:-1], 1), device=mask_cls_results.device)
             # upsample masks
             mask_pred_results = F.interpolate(
                 mask_pred_results,
