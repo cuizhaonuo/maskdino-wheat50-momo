@@ -30,6 +30,8 @@ from predictor import VisualizationDemo
 # constants
 WINDOW_NAME = "mask2former demo"
 
+# 注册数据集
+from data_register import wheat_data, maize_rice_data, xinxiang_data
 
 def setup_cfg(args):
     # load config from file and command-line arguments
@@ -125,6 +127,8 @@ if __name__ == "__main__":
                     time.time() - start_time,
                 )
             )
+            # from maskdino.analysis.demo_lab import compute_mask_bbox_iou
+            # compute_mask_bbox_iou(predictions)
 
             if args.output:
                 if os.path.isdir(args.output):

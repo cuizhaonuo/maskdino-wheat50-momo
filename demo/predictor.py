@@ -37,32 +37,32 @@ class VisualizationDemo(object):
             self.predictor = DefaultPredictor(cfg)
 
     def run_on_image(self, image):
-        """
-        Args:
-            image (np.ndarray): an image of shape (H, W, C) (in BGR order).
-                This is the format used by OpenCV.
-        Returns:
-            predictions (dict): the output of the model.
-            vis_output (VisImage): the visualized image output.
-        """
         vis_output = None
         predictions = self.predictor(image)
-        # Convert image from OpenCV BGR format to Matplotlib RGB format.
+
         image = image[:, :, ::-1]
         visualizer = Visualizer(image, self.metadata, instance_mode=self.instance_mode)
+
         if "panoptic_seg" in predictions:
             panoptic_seg, segments_info = predictions["panoptic_seg"]
             vis_output = visualizer.draw_panoptic_seg_predictions(
                 panoptic_seg.to(self.cpu_device), segments_info
             )
-        else:
-            if "sem_seg" in predictions:
-                vis_output = visualizer.draw_sem_seg(
-                    predictions["sem_seg"].argmax(dim=0).to(self.cpu_device)
-                )
-            if "instances" in predictions:
-                instances = predictions["instances"].to(self.cpu_device)
-                vis_output = visualizer.draw_instance_predictions(predictions=instances)
+
+        elif "inst_panoptic" in predictions:
+            inst_seg, segments_info = predictions["inst_panoptic"]
+            vis_output = visualizer.draw_panoptic_seg_predictions(
+                inst_seg.to(self.cpu_device), segments_info
+            )
+
+        elif "instances" in predictions:
+            instances = predictions["instances"].to(self.cpu_device)
+            vis_output = visualizer.draw_instance_predictions(predictions=instances)
+
+        elif "sem_seg" in predictions:
+            vis_output = visualizer.draw_sem_seg(
+                predictions["sem_seg"].argmax(dim=0).to(self.cpu_device)
+            )
 
         return predictions, vis_output
 

@@ -394,8 +394,13 @@ class MaskDINO(nn.Module):
                     width = new_size[1]/image_size[1]*width
                     mask_box_result = self.box_postprocess(mask_box_result, height, width)
 
-                    instance_r = retry_if_cuda_oom(self.instance_inference)(mask_cls_result, mask_pred_result, mask_box_result, mask_iou_result)
+                    # instance_r = retry_if_cuda_oom(self.instance_inference)(mask_cls_result, mask_pred_result, mask_box_result, mask_iou_result)
+                    # processed_results[-1]["instances"] = instance_r
+                    instance_r, inst_panoptic = retry_if_cuda_oom(self.instance_inference_like_panoptic)(
+                        mask_cls_result, mask_pred_result, mask_box_result, mask_iou_result
+                    )
                     processed_results[-1]["instances"] = instance_r
+                    processed_results[-1]["inst_panoptic"] = inst_panoptic
 
             return processed_results
 
@@ -526,7 +531,8 @@ class MaskDINO(nn.Module):
         image_size = mask_pred.shape[-2:]
         scores = mask_cls.sigmoid()  # [100, 80]
         # ious = mask_iou_result.sigmoid()
-        # scores = (scores + 1) * ious  # multiply mask iou score
+        # # scores = (scores + 1) * ious  # multiply mask iou score
+        # scores = scores + ious  # multiply mask iou score
         labels = torch.arange(self.sem_seg_head.num_classes, device=self.device).unsqueeze(0).repeat(self.num_queries, 1).flatten(0, 1)
         # labels = torch.ones_like(self.sem_seg_head.num_classes, device=self.device).unsqueeze(0).repeat(self.num_queries, 1).flatten(0, 1)
         # scores_per_image, topk_indices = scores.flatten(0, 1).topk(self.test_topk_per_image, sorted=False)  # select 100
@@ -559,9 +565,154 @@ class MaskDINO(nn.Module):
         mask_scores_per_image = (mask_pred.sigmoid().flatten(1) * result.pred_masks.flatten(1)).sum(1) / (result.pred_masks.flatten(1).sum(1) + 1e-6)
         if self.focus_on_box:
             mask_scores_per_image = 1.0
-        result.scores = scores_per_image * mask_scores_per_image
+
+        # mask_scores_per_image = 1.0
+
+        pred_iou = mask_iou_result[topk_indices].sigmoid().squeeze(-1)
+
+        # from matplotlib import pyplot as plt
+        # fig, ax = plt.subplots(1,1)
+        # ax.plot(scores_per_image.cpu().numpy(), label='cls score')
+        # ax.plot(mask_scores_per_image.cpu().numpy(), label='mask iou score')
+        # ax.plot((scores_per_image * mask_scores_per_image).cpu().numpy(), label='final score')
+        # ax.plot(pred_iou.cpu().numpy(), label='pred iou score')
+        # ax.legend()
+        # plt.show()
+
+        # result.scores = scores_per_image * mask_scores_per_image
+        result.scores = scores_per_image * 1.0
         result.pred_classes = labels_per_image
+        result.pred_iou = pred_iou
+        result.mask_scores = mask_scores_per_image
         return result
+
+    import torch
+    from detectron2.structures import Boxes, Instances
+
+    def instance_inference_like_panoptic(self, mask_cls, mask_pred, mask_box_result, mask_iou_result):
+        """
+        Return:
+            result: Instances (normal instance outputs)
+            inst_panoptic: (panoptic_like_seg, segments_info)
+                - panoptic_like_seg: IntTensor(H,W), 0=void, 1..K=instance id
+                - segments_info: list of dicts with keys: id, isthing, category_id, score
+        """
+
+        # -----------------------
+        # 0) Basic prep
+        # -----------------------
+        image_size = mask_pred.shape[-2:]  # (H, W)
+        H, W = image_size
+        device = mask_pred.device
+
+        # -----------------------
+        # 1) Classification scores & top-k (same as your code)
+        # -----------------------
+        scores = mask_cls.sigmoid()  # [num_queries, num_classes]
+
+        labels = (
+            torch.arange(self.sem_seg_head.num_classes, device=device)
+            .unsqueeze(0)
+            .repeat(self.num_queries, 1)
+            .flatten(0, 1)
+        )
+
+        flat_scores = scores.flatten(0, 1)
+        k = min(self.test_topk_per_image, flat_scores.numel())
+        scores_per_image, topk_indices = flat_scores.topk(k, sorted=False)
+
+        labels_per_image = labels[topk_indices]
+        topk_query_indices = topk_indices // self.sem_seg_head.num_classes
+
+        mask_pred_topk = mask_pred[topk_query_indices]  # [N,H,W] logit
+        box_topk = mask_box_result[topk_query_indices]  # [N,4]
+
+        # -----------------------
+        # 2) (Optional) keep only thing classes when panoptic_on
+        # -----------------------
+        if self.panoptic_on:
+            thing_ids = set(self.metadata.thing_dataset_id_to_contiguous_id.values())
+            keep = torch.tensor(
+                [int(l.item()) in thing_ids for l in labels_per_image],
+                device=device,
+                dtype=torch.bool,
+            )
+
+            scores_per_image = scores_per_image[keep]
+            labels_per_image = labels_per_image[keep]
+            mask_pred_topk = mask_pred_topk[keep]
+            box_topk = box_topk[keep]
+            topk_query_indices = topk_query_indices[keep]  # for iou indexing
+
+        # -----------------------
+        # 3) Build Instances output (standard)
+        # -----------------------
+        result = Instances(image_size)
+
+        # binarized mask for standard instance visualization / downstream
+        result.pred_masks = (mask_pred_topk > 0).float()
+        result.pred_boxes = Boxes(box_topk)
+
+        # mask score (your original)
+        mask_scores_per_image = (
+                (mask_pred_topk.sigmoid().flatten(1) * result.pred_masks.flatten(1)).sum(1)
+                / (result.pred_masks.flatten(1).sum(1) + 1e-6)
+        )
+        if getattr(self, "focus_on_box", False):
+            mask_scores_per_image = torch.ones_like(mask_scores_per_image)
+
+        # iou head
+        pred_iou = mask_iou_result[topk_query_indices].sigmoid().squeeze(-1)
+
+        # final scores (keep your current behavior; you can change to *mask_scores_per_image if you want)
+        final_scores = scores_per_image * 1.0
+
+        result.scores = final_scores
+        result.pred_classes = labels_per_image
+        result.pred_iou = pred_iou
+        result.mask_scores = mask_scores_per_image
+
+        # -----------------------
+        # 4) Panoptic-like pixel assignment (for visualization)
+        # -----------------------
+        prob = 0.5
+        overlap_threshold = getattr(self, "overlap_threshold", 0.8)
+
+        N = mask_pred_topk.shape[0]
+        panoptic_like_seg = torch.zeros((H, W), dtype=torch.int32, device=device)
+        segments_info = []
+
+        if N == 0:
+            return result, (panoptic_like_seg, segments_info)
+
+        masks_prob = mask_pred_topk.sigmoid()  # [N,H,W]
+        prob_masks = final_scores.view(-1, 1, 1) * masks_prob
+        winner_ids = prob_masks.argmax(0)  # [H,W]
+
+        current_id = 0
+        for inst_k in range(N):
+            mask_area = (winner_ids == inst_k).sum().item()
+            original_area = (masks_prob[inst_k] >= prob).sum().item()
+            final_mask = (winner_ids == inst_k) & (masks_prob[inst_k] >= prob)
+
+            if mask_area == 0 or original_area == 0 or final_mask.sum().item() == 0:
+                continue
+
+            if mask_area / (original_area + 1e-6) < overlap_threshold:
+                continue
+
+            current_id += 1
+            panoptic_like_seg[final_mask] = current_id
+            segments_info.append(
+                {
+                    "id": int(current_id),
+                    "isthing": True,
+                    "category_id": int(labels_per_image[inst_k].item()),
+                    "score": float(final_scores[inst_k].item()),
+                }
+            )
+
+        return result, (panoptic_like_seg, segments_info)
 
     def box_postprocess(self, out_bbox, img_h, img_w):
         # postprocess box height and width
