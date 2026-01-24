@@ -589,6 +589,9 @@ class MaskDINO(nn.Module):
     import torch
     from detectron2.structures import Boxes, Instances
 
+    import torch
+    from detectron2.structures import Boxes, Instances
+
     def instance_inference_like_panoptic(self, mask_cls, mask_pred, mask_box_result, mask_iou_result):
         """
         Return:
@@ -604,25 +607,17 @@ class MaskDINO(nn.Module):
         image_size = mask_pred.shape[-2:]  # (H, W)
         H, W = image_size
         device = mask_pred.device
+        num_queries = mask_cls.shape[0]
 
         # -----------------------
-        # 1) Classification scores & top-k (same as your code)
+        # 1) Classification scores & top-k (改：每个query只取max类，减少冗余)
         # -----------------------
-        scores = mask_cls.sigmoid()  # [num_queries, num_classes]
+        scores_all = mask_cls.sigmoid()  # [num_queries, num_classes]
+        scores_q, labels_q = scores_all.max(dim=1)  # [num_queries], [num_queries]
 
-        labels = (
-            torch.arange(self.sem_seg_head.num_classes, device=device)
-            .unsqueeze(0)
-            .repeat(self.num_queries, 1)
-            .flatten(0, 1)
-        )
-
-        flat_scores = scores.flatten(0, 1)
-        k = min(self.test_topk_per_image, flat_scores.numel())
-        scores_per_image, topk_indices = flat_scores.topk(k, sorted=False)
-
-        labels_per_image = labels[topk_indices]
-        topk_query_indices = topk_indices // self.sem_seg_head.num_classes
+        k = min(self.test_topk_per_image, scores_q.numel())
+        scores_per_image, topk_query_indices = scores_q.topk(k, sorted=False)
+        labels_per_image = labels_q[topk_query_indices]
 
         mask_pred_topk = mask_pred[topk_query_indices]  # [N,H,W] logit
         box_topk = mask_box_result[topk_query_indices]  # [N,4]
@@ -631,29 +626,30 @@ class MaskDINO(nn.Module):
         # 2) (Optional) keep only thing classes when panoptic_on
         # -----------------------
         if self.panoptic_on:
-            thing_ids = set(self.metadata.thing_dataset_id_to_contiguous_id.values())
-            keep = torch.tensor(
-                [int(l.item()) in thing_ids for l in labels_per_image],
-                device=device,
-                dtype=torch.bool,
-            )
+            # 这里要求 metadata 有 thing_dataset_id_to_contiguous_id
+            # 对于你的单类数据，labels_per_image通常就是0，直接保留也行
+            thing_ids = set(self.metadata.thing_dataset_id_to_contiguous_id.values()) \
+                if hasattr(self.metadata, "thing_dataset_id_to_contiguous_id") else None
 
-            scores_per_image = scores_per_image[keep]
-            labels_per_image = labels_per_image[keep]
-            mask_pred_topk = mask_pred_topk[keep]
-            box_topk = box_topk[keep]
-            topk_query_indices = topk_query_indices[keep]  # for iou indexing
+            if thing_ids is not None and len(thing_ids) > 0:
+                keep = torch.tensor(
+                    [int(l.item()) in thing_ids for l in labels_per_image],
+                    device=device,
+                    dtype=torch.bool,
+                )
+                scores_per_image = scores_per_image[keep]
+                labels_per_image = labels_per_image[keep]
+                mask_pred_topk = mask_pred_topk[keep]
+                box_topk = box_topk[keep]
+                topk_query_indices = topk_query_indices[keep]  # for iou indexing
 
         # -----------------------
         # 3) Build Instances output (standard)
         # -----------------------
         result = Instances(image_size)
-
-        # binarized mask for standard instance visualization / downstream
         result.pred_masks = (mask_pred_topk > 0).float()
         result.pred_boxes = Boxes(box_topk)
 
-        # mask score (your original)
         mask_scores_per_image = (
                 (mask_pred_topk.sigmoid().flatten(1) * result.pred_masks.flatten(1)).sum(1)
                 / (result.pred_masks.flatten(1).sum(1) + 1e-6)
@@ -661,10 +657,9 @@ class MaskDINO(nn.Module):
         if getattr(self, "focus_on_box", False):
             mask_scores_per_image = torch.ones_like(mask_scores_per_image)
 
-        # iou head
         pred_iou = mask_iou_result[topk_query_indices].sigmoid().squeeze(-1)
 
-        # final scores (keep your current behavior; you can change to *mask_scores_per_image if you want)
+        # 你原本是 cls 分数；如果想更稳可以用：scores_per_image * mask_scores_per_image * pred_iou
         final_scores = scores_per_image * 1.0
 
         result.scores = final_scores
@@ -674,9 +669,14 @@ class MaskDINO(nn.Module):
 
         # -----------------------
         # 4) Panoptic-like pixel assignment (for visualization)
+        #    改：先做 mask-NMS 去重，再 argmax 分配像素
         # -----------------------
         prob = 0.5
         overlap_threshold = getattr(self, "overlap_threshold", 0.8)
+
+        # mask-NMS 参数：越小越“狠”，去重更多，数量更接近 GT
+        mask_nms_iou_thr = getattr(self, "mask_nms_iou_thr", 0.5)
+        max_instances_for_nms = getattr(self, "mask_nms_max_candidates", 300)
 
         N = mask_pred_topk.shape[0]
         panoptic_like_seg = torch.zeros((H, W), dtype=torch.int32, device=device)
@@ -686,18 +686,59 @@ class MaskDINO(nn.Module):
             return result, (panoptic_like_seg, segments_info)
 
         masks_prob = mask_pred_topk.sigmoid()  # [N,H,W]
-        prob_masks = final_scores.view(-1, 1, 1) * masks_prob
-        winner_ids = prob_masks.argmax(0)  # [H,W]
+        bin_masks = (masks_prob >= prob)  # [N,H,W] bool
+
+        # ---- 4.1 mask-NMS（按分数排序，IoU 过阈值则抑制）----
+        # 为了不让 N 太大导致 O(N^2) 太慢，先截断候选数
+        order = torch.argsort(final_scores, descending=True)
+        if order.numel() > max_instances_for_nms:
+            order = order[:max_instances_for_nms]
+
+        keep_ids = []
+
+        def _mask_iou_bool(m1, m2):
+            inter = (m1 & m2).sum().float()
+            union = (m1 | m2).sum().float()
+            return inter / (union + 1e-6)
+
+        for idx in order.tolist():
+            m = bin_masks[idx]
+            if m.sum().item() == 0:
+                continue
+            ok = True
+            for kept in keep_ids:
+                if _mask_iou_bool(m, bin_masks[kept]) > mask_nms_iou_thr:
+                    ok = False
+                    break
+            if ok:
+                keep_ids.append(idx)
+
+        if len(keep_ids) == 0:
+            return result, (panoptic_like_seg, segments_info)
+
+        keep_ids = torch.tensor(keep_ids, device=device, dtype=torch.long)
+
+        # 过滤候选
+        final_scores_n = final_scores[keep_ids]
+        labels_n = labels_per_image[keep_ids]
+        masks_prob_n = masks_prob[keep_ids]
+        bin_masks_n = bin_masks[keep_ids]
+
+        # ---- 4.2 像素级竞争：score × mask_prob argmax ----
+        prob_masks = final_scores_n.view(-1, 1, 1) * masks_prob_n
+        winner_ids = prob_masks.argmax(0)  # [H,W], value in [0..N'-1]
 
         current_id = 0
-        for inst_k in range(N):
+        Nn = masks_prob_n.shape[0]
+        for inst_k in range(Nn):
             mask_area = (winner_ids == inst_k).sum().item()
-            original_area = (masks_prob[inst_k] >= prob).sum().item()
-            final_mask = (winner_ids == inst_k) & (masks_prob[inst_k] >= prob)
+            original_area = bin_masks_n[inst_k].sum().item()
+            final_mask = (winner_ids == inst_k) & bin_masks_n[inst_k]
 
             if mask_area == 0 or original_area == 0 or final_mask.sum().item() == 0:
                 continue
 
+            # overlap ratio 过滤：被抢走太多的实例丢掉（与你原 panoptic 逻辑一致）
             if mask_area / (original_area + 1e-6) < overlap_threshold:
                 continue
 
@@ -707,8 +748,8 @@ class MaskDINO(nn.Module):
                 {
                     "id": int(current_id),
                     "isthing": True,
-                    "category_id": int(labels_per_image[inst_k].item()),
-                    "score": float(final_scores[inst_k].item()),
+                    "category_id": int(labels_n[inst_k].item()),  # contiguous id (0..C-1)
+                    "score": float(final_scores_n[inst_k].item()),
                 }
             )
 
