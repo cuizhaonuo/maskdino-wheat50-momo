@@ -394,13 +394,13 @@ class MaskDINO(nn.Module):
                     width = new_size[1]/image_size[1]*width
                     mask_box_result = self.box_postprocess(mask_box_result, height, width)
 
-                    # instance_r = retry_if_cuda_oom(self.instance_inference)(mask_cls_result, mask_pred_result, mask_box_result, mask_iou_result)
-                    # processed_results[-1]["instances"] = instance_r
-                    instance_r, inst_panoptic = retry_if_cuda_oom(self.instance_inference_like_panoptic)(
-                        mask_cls_result, mask_pred_result, mask_box_result, mask_iou_result
-                    )
+                    instance_r = retry_if_cuda_oom(self.instance_inference)(mask_cls_result, mask_pred_result, mask_box_result, mask_iou_result)
                     processed_results[-1]["instances"] = instance_r
-                    processed_results[-1]["inst_panoptic"] = inst_panoptic
+                    # instance_r, inst_panoptic = retry_if_cuda_oom(self.instance_inference_like_panoptic)(
+                    #     mask_cls_result, mask_pred_result, mask_box_result, mask_iou_result
+                    # )
+                    # processed_results[-1]["instances"] = instance_r
+                    # processed_results[-1]["inst_panoptic"] = inst_panoptic
 
             return processed_results
 
@@ -584,6 +584,9 @@ class MaskDINO(nn.Module):
         result.pred_classes = labels_per_image
         result.pred_iou = pred_iou
         result.mask_scores = mask_scores_per_image
+
+        result.pred_masks = (mask_pred > 0)
+        result.pred_masks_prob = mask_pred.sigmoid()
         return result
 
     import torch

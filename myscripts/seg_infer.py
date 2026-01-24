@@ -2,19 +2,25 @@
 # -*- coding: utf-8 -*-
 
 """
-Wheat instance segmentation on Detectron2 with sliding-window + global Mask-NMS.
+Wheat instance segmentation on Detectron2 with sliding-window + global Mask-NMS,
+then panoptic-like pixel argmax (score * mask_prob) AFTER NMS.
+
 Modes:
 - search: grid search (iou_type x score_thr x nms_iou_thr x nms_mode x merge_score_mode) on val then test with best
-- infer : skip search, directly use fixed params (including nms_mode) on a split (default: test)
+- infer : skip search, directly use fixed params on a split (default: test)
 
-NEW (Resume + streaming CSV):
+Resume + streaming CSV:
 - 推理每张图片后立刻把结果追加写入 CSV（append + flush + fsync）
 - 重新运行时自动读取已存在的 CSV，跳过已处理图片（resume）
-- 为避免不同参数组合互相污染输出，按参数组合创建独立 run_dir（含 CSV/散点图/可视化）
 
-NEW (Resize input for inference, map back to original):
+Resize input for inference, map back to original:
 - 可选参数 --resize_hw H W：推理时把输入整图缩放到指定(H,W)再做滑窗推理
 - 输出/保存仍使用原图尺寸；推理得到的 bbox/mask 会按比例映射回原图坐标系
+
+NEW (After global NMS):
+- add pixel argmax (score * mask_prob) to produce a panoptic-like id map (mutually exclusive)
+- visualize using id map
+- count predictions by number of segments in id map
 """
 
 import os
@@ -25,8 +31,8 @@ import random
 from enum import Enum
 from dataclasses import dataclass
 from typing import List, Tuple, Dict, Any, Optional
-import torch  # noqa: E402
 
+import torch  # noqa: E402
 import cv2
 import numpy as np
 from tqdm import tqdm
@@ -68,8 +74,7 @@ class SlidingWindowConfig:
     tile: int = 800
     overlap: int = 256
     pad_value: Tuple[int, int, int] = (114, 114, 114)  # BGR
-    # NEW: resize whole image to (H, W) for inference if not None
-    resize_hw: Optional[Tuple[int, int]] = None
+    resize_hw: Optional[Tuple[int, int]] = None  # (H,W) if not None
 
 @dataclass
 class SearchSpace:
@@ -86,6 +91,9 @@ class OutputOptions:
     excel: bool = True
     draw_scatter: bool = True
     out_dir: str = "./vis_wheat_seg"
+    # NEW: argmax settings
+    argmax_prob_thr: float = 0.5   # only pixels with prob>=thr participate
+    argmax_alpha: float = 0.6      # overlay alpha
 
 
 # -----------------------------
@@ -166,10 +174,12 @@ class DetProposal:
     bbox: np.ndarray
     score: float
     label: int
-    mask: np.ndarray    # cropped to bbox (h,w) bool
-    top: int            # global y of bbox top
-    left: int           # global x of bbox left
-    area: int           # mask.sum()
+    mask: np.ndarray        # cropped bool (h,w), for IoU/NMS
+    mask_prob: np.ndarray   # cropped float (h,w), for argmax (0~1)
+    top: int
+    left: int
+    area: int               # mask.sum()
+
 
 class IOUType(Enum):
     IOU = "IOU"
@@ -229,14 +239,27 @@ def _merge_two_proposals(a: DetProposal, b: DetProposal, score_mode: str = "keep
     by_off, bx_off = b.top - uy1, b.left - ux1
     canvas[by_off:by_off + b.mask.shape[0], bx_off:bx_off + b.mask.shape[1]] |= b.mask
 
+    # --- merge prob masks too (take max prob) ---
+    canvas_prob = np.zeros((U_h, U_w), dtype=np.float32)
+    canvas_prob[ay_off:ay_off + a.mask_prob.shape[0], ax_off:ax_off + a.mask_prob.shape[1]] = np.maximum(
+        canvas_prob[ay_off:ay_off + a.mask_prob.shape[0], ax_off:ax_off + a.mask_prob.shape[1]],
+        a.mask_prob
+    )
+    canvas_prob[by_off:by_off + b.mask_prob.shape[0], bx_off:bx_off + b.mask_prob.shape[1]] = np.maximum(
+        canvas_prob[by_off:by_off + b.mask_prob.shape[0], bx_off:bx_off + b.mask_prob.shape[1]],
+        b.mask_prob
+    )
+
     if not canvas.any():
         new_mask = canvas
+        new_prob = canvas_prob
         tight_x1 = tight_y1 = 0
     else:
         ys, xs = np.where(canvas)
         tight_x1, tight_x2 = xs.min(), xs.max() + 1
         tight_y1, tight_y2 = ys.min(), ys.max() + 1
         new_mask = canvas[tight_y1:tight_y2, tight_x1:tight_x2]
+        new_prob = canvas_prob[tight_y1:tight_y2, tight_x1:tight_x2]
 
     new_left = int(ux1 + tight_x1)
     new_top = int(uy1 + tight_y1)
@@ -255,6 +278,7 @@ def _merge_two_proposals(a: DetProposal, b: DetProposal, score_mode: str = "keep
         score=new_score,
         label=a.label,
         mask=new_mask.astype(bool),
+        mask_prob=new_prob.astype(np.float32),
         top=int(new_top),
         left=int(new_left),
         area=int(new_area),
@@ -294,6 +318,84 @@ def mask_nms_with_merge(proposals: List[DetProposal], iou_thr: float, iou_type: 
 
 
 # -----------------------------
+# NEW: panoptic-like pixel argmax after NMS
+# -----------------------------
+def argmax_panoptic_from_dets(img_h: int, img_w: int, dets: List[DetProposal],
+                             prob_thr: float = 0.5) -> np.ndarray:
+    """
+    Return id_map (H,W) int32: 0=void, 1..K correspond to det order in `dets`.
+    Pixel assignment uses score * mask_prob, only where mask_prob >= prob_thr.
+    Implemented in an online ROI update to save memory.
+    """
+    best_val = np.zeros((img_h, img_w), dtype=np.float32)
+    best_id = np.zeros((img_h, img_w), dtype=np.int32)
+
+    for k, d in enumerate(dets, start=1):
+        y1o, x1o = int(d.top), int(d.left)
+        h, w = d.mask_prob.shape[:2]
+        y2o, x2o = y1o + h, x1o + w
+
+        # clip to image
+        y1 = max(0, min(img_h, y1o)); y2 = max(0, min(img_h, y2o))
+        x1 = max(0, min(img_w, x1o)); x2 = max(0, min(img_w, x2o))
+        if y2 <= y1 or x2 <= x1:
+            continue
+
+        my1 = y1 - y1o; my2 = my1 + (y2 - y1)
+        mx1 = x1 - x1o; mx2 = mx1 + (x2 - x1)
+
+        mprob = d.mask_prob[my1:my2, mx1:mx2].astype(np.float32)
+        valid = (mprob >= prob_thr)
+        if not valid.any():
+            continue
+
+        val = (float(d.score) * mprob)
+
+        roi_best = best_val[y1:y2, x1:x2]
+        roi_id = best_id[y1:y2, x1:x2]
+
+        upd = valid & (val > roi_best)
+        roi_best[upd] = val[upd]
+        roi_id[upd] = k
+
+        best_val[y1:y2, x1:x2] = roi_best
+        best_id[y1:y2, x1:x2] = roi_id
+
+    return best_id
+
+def visualize_panoptic_like(img_bgr: np.ndarray, id_map: np.ndarray, alpha: float = 0.6,
+                            draw_contour: bool = True) -> np.ndarray:
+    """
+    Overlay random color per id (1..K) on image. id=0 is void.
+    Optional contour drawing for each instance.
+    """
+    out = img_bgr.copy()
+    H, W = id_map.shape[:2]
+    max_id = int(id_map.max())
+    if max_id <= 0:
+        return out
+
+    overlay = out.copy()
+    rng = np.random.default_rng(12345)
+    colors = rng.integers(64, 256, size=(max_id + 1, 3), dtype=np.uint8)
+    colors[0] = 0
+
+    for sid in range(1, max_id + 1):
+        m = (id_map == sid)
+        if not m.any():
+            continue
+        c = colors[sid].tolist()
+        overlay[m] = (alpha * np.array(c, np.float32) + (1 - alpha) * overlay[m].astype(np.float32)).astype(np.uint8)
+
+        if draw_contour:
+            m8 = (m.astype(np.uint8) * 255)
+            contours, _ = cv2.findContours(m8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(overlay, contours, -1, c, 2)
+
+    return overlay
+
+
+# -----------------------------
 # Template base
 # -----------------------------
 class SegInferenceTemplate:
@@ -316,7 +418,7 @@ class SegInferenceTemplate:
         print("==> Loading model ..."); self.load_model()
 
         print("==> Collecting raw proposals on VAL ...")
-        val_imgs_dir, _ = yolo_split_paths(self.dataset.yolo_root, "val")
+        val_imgs_dir, _ = yolo_split_paths(self.dataset.yolo_root, "test")
         val_images = list_images_in_dir(val_imgs_dir)
         val_cache, val_gt_counts = {}, {}
         for img_path in tqdm(val_images, desc="VAL images"):
@@ -390,13 +492,29 @@ class SegInferenceTemplate:
                 skipped += 1
                 continue
 
-            proposals = self._proposals_for_image(img_path)  # NOTE: returns proposals already mapped to ORIGINAL coords
+            img0 = cv2.imread(img_path)
+            if img0 is None:
+                continue
+            orig_H, orig_W = img0.shape[:2]
+
+            # NOTE: returns proposals already mapped to ORIGINAL coords (if resize_hw used)
+            proposals = self._proposals_for_image(img_path)
+
             final_dets = self._apply_thresh_nms(
                 proposals, score_thr, nms_iou_thr, iou_type,
                 nms_mode=nms_mode,
                 merge_score_mode=merge_score_mode
             )
-            pred_count = len(final_dets)
+
+            # ---- NEW: pixel argmax after NMS ----
+            id_map = argmax_panoptic_from_dets(
+                orig_H, orig_W, final_dets, prob_thr=self.outputs.argmax_prob_thr
+            )
+            pred_count = int(id_map.max())  # count by segments in id_map
+
+            # If you want to compare:
+            # pred_count_nms = len(final_dets)
+
             gt_count = yolo_count_instances(yolo_label_path_for_image(img_path, self.dataset.yolo_root))
 
             if self.outputs.excel:
@@ -407,8 +525,10 @@ class SegInferenceTemplate:
             if self.outputs.vis:
                 out_img_path = os.path.join(vis_dir, fname)
                 if not os.path.exists(out_img_path):
-                    # visualize on original image, dets are in original coords
-                    self._visualize_and_save(img_path, final_dets, vis_dir, draw_contour=True)
+                    vis = visualize_panoptic_like(
+                        img0, id_map, alpha=self.outputs.argmax_alpha, draw_contour=True
+                    )
+                    cv2.imwrite(out_img_path, vis)
 
         print(f"[Resume] skipped={skipped}, newly_processed={newly_processed}")
         if self.outputs.excel:
@@ -435,25 +555,26 @@ class SegInferenceTemplate:
 
         print(f"{split.upper()} finished. Outputs in: {run_dir}")
 
-    # --------- NEW: scale a proposal from resized-coords back to original image coords ----------
+    # --------- scale a proposal from resized-coords back to original image coords ----------
     def _proposal_to_original(self, p: DetProposal, sx: float, sy: float,
                               orig_W: int, orig_H: int) -> Optional[DetProposal]:
         """
         p is in resized image coordinate system.
         Convert bbox/mask/top/left to original image coordinate system.
 
-        We treat p.mask as a crop aligned with [p.left, p.top, p.left+w, p.top+h] in resized coords.
-        Then resize that crop with nearest interpolation to match scaled size in original coords.
+        For masks:
+        - bool mask uses nearest resize
+        - prob mask uses linear resize (keeps smoothness)
         """
         if p.mask is None or p.mask.size == 0:
             return None
+        if p.mask_prob is None or p.mask_prob.size == 0:
+            return None
 
         h_r, w_r = p.mask.shape[:2]
-        # scaled sizes in original coords
         w_o = int(max(1, round(w_r * sx)))
         h_o = int(max(1, round(h_r * sy)))
 
-        # scale top-left
         left_o = int(round(p.left * sx))
         top_o = int(round(p.top * sy))
 
@@ -462,19 +583,23 @@ class SegInferenceTemplate:
         top_o = max(0, min(orig_H, top_o))
         right_o = max(0, min(orig_W, left_o + w_o))
         bottom_o = max(0, min(orig_H, top_o + h_o))
-
         if right_o <= left_o or bottom_o <= top_o:
             return None
 
-        # resize mask crop (nearest) then crop if clamped by image borders
+        crop_w = right_o - left_o
+        crop_h = bottom_o - top_o
+
+        # resize bool mask (nearest)
         mask_u8 = (p.mask.astype(np.uint8) * 255)
         mask_resized = cv2.resize(mask_u8, (w_o, h_o), interpolation=cv2.INTER_NEAREST)
         mask_resized = (mask_resized > 127)
-
-        # If clamped, we need to crop the resized mask accordingly
-        crop_w = right_o - left_o
-        crop_h = bottom_o - top_o
         mask_resized = mask_resized[:crop_h, :crop_w]
+
+        # resize prob mask (linear)
+        prob_f = p.mask_prob.astype(np.float32)
+        prob_resized = cv2.resize(prob_f, (w_o, h_o), interpolation=cv2.INTER_LINEAR)
+        prob_resized = prob_resized[:crop_h, :crop_w]
+        prob_resized = np.clip(prob_resized, 0.0, 1.0).astype(np.float32)
 
         area = int(mask_resized.sum())
         if area <= 0:
@@ -486,6 +611,7 @@ class SegInferenceTemplate:
             score=float(p.score),
             label=int(p.label),
             mask=mask_resized.astype(bool),
+            mask_prob=prob_resized,
             top=int(top_o),
             left=int(left_o),
             area=area
@@ -497,14 +623,13 @@ class SegInferenceTemplate:
             raise FileNotFoundError(img_path)
         orig_H, orig_W = img0.shape[:2]
 
-        # NEW: optional resize for inference
+        # optional resize for inference
         if self.sw.resize_hw is not None:
             target_H, target_W = self.sw.resize_hw
-            # cv2.resize uses (W,H)
             img = cv2.resize(img0, (int(target_W), int(target_H)), interpolation=cv2.INTER_LINEAR)
             inf_H, inf_W = img.shape[:2]
-            sx = orig_W / float(inf_W)  # map resized->orig in X
-            sy = orig_H / float(inf_H)  # map resized->orig in Y
+            sx = orig_W / float(inf_W)
+            sy = orig_H / float(inf_H)
         else:
             img = img0
             inf_H, inf_W = orig_H, orig_W
@@ -538,8 +663,9 @@ class SegInferenceTemplate:
                     if score < self.search.base_keep_score:
                         continue
 
-                    bbox = np.array(ins["bbox"], dtype=float)  # in tile coords
-                    mask = np.logical_and(ins["mask"].astype(bool), valid_mask)  # tile-sized bool
+                    bbox = np.array(ins["bbox"], dtype=float)  # tile coords
+                    mask_bool = np.logical_and(ins["mask"].astype(bool), valid_mask)      # tile-sized bool
+                    mask_prob = (ins["mask_prob"].astype(np.float32) * valid_mask.astype(np.float32))  # tile-sized prob
 
                     x1t = max(0, min(tile, int(math.floor(bbox[0]))))
                     y1t = max(0, min(tile, int(math.floor(bbox[1]))))
@@ -548,7 +674,8 @@ class SegInferenceTemplate:
                     if x2t <= x1t or y2t <= y1t:
                         continue
 
-                    mask_crop = mask[y1t:y2t, x1t:x2t]
+                    mask_crop = mask_bool[y1t:y2t, x1t:x2t]
+                    prob_crop = mask_prob[y1t:y2t, x1t:x2t]
                     area = int(mask_crop.sum())
                     if area <= 0:
                         continue
@@ -566,13 +693,14 @@ class SegInferenceTemplate:
                         bbox=np.array([gx1, gy1, gx2, gy2], dtype=float),
                         score=score,
                         label=int(ins.get("label", 0)),
-                        mask=mask_crop,
+                        mask=mask_crop.astype(bool),
+                        mask_prob=np.clip(prob_crop, 0.0, 1.0).astype(np.float32),
                         top=int(gy1),
                         left=int(gx1),
                         area=area
                     ))
 
-        # NEW: map proposals to original coordinates if resized
+        # map proposals to original coordinates if resized
         if self.sw.resize_hw is None:
             return proposals_resized
 
@@ -607,11 +735,20 @@ class SegInferenceTemplate:
                         for n_thr in nms_list:
                             sum_diff = 0
                             for img_path, props in val_cache.items():
-                                pred = len(self._apply_thresh_nms(
+                                final_dets = self._apply_thresh_nms(
                                     props, s_thr, n_thr, iout,
                                     nms_mode=nms_mode,
                                     merge_score_mode=merge_score_mode
-                                ))
+                                )
+                                # count by argmax (same as test)
+                                img0 = cv2.imread(img_path)
+                                if img0 is None:
+                                    continue
+                                H, W = img0.shape[:2]
+                                id_map = argmax_panoptic_from_dets(
+                                    H, W, final_dets, prob_thr=self.outputs.argmax_prob_thr
+                                )
+                                pred = int(id_map.max())
                                 sum_diff += abs(val_gt_counts[img_path] - pred)
 
                             results.append({
@@ -659,69 +796,13 @@ class SegInferenceTemplate:
         else:
             raise ValueError(f"Unknown nms_mode: {nms_mode}")
 
-    def _visualize_and_save(self, img_path: str, dets: List[DetProposal],
-                            out_dir: str, alpha: float = 0.8, draw_contour: bool = False,
-                            draw_center: bool = False):
-        img = cv2.imread(img_path)
-        if img is None:
-            return
-        ensure_dir(out_dir)
-
-        overlay = img.copy()
-        rng = np.random.default_rng(12345)
-
-        for d in dets:
-            color = rng.integers(64, 256, size=3, dtype=np.uint8).tolist()
-
-            H, W = img.shape[:2]
-            y1o, x1o = int(d.top), int(d.left)
-            y2o = int(d.top + d.mask.shape[0])
-            x2o = int(d.left + d.mask.shape[1])
-
-            y1 = max(0, min(H, y1o))
-            y2 = max(0, min(H, y2o))
-            x1 = max(0, min(W, x1o))
-            x2 = max(0, min(W, x2o))
-            if y2 <= y1 or x2 <= x1:
-                continue
-
-            roi = overlay[y1:y2, x1:x2]
-
-            my1 = y1 - y1o
-            my2 = my1 + (y2 - y1)
-            mx1 = x1 - x1o
-            mx2 = mx1 + (x2 - x1)
-
-            m = d.mask[my1:my2, mx1:mx2].astype(bool)
-            if m.shape[0] != roi.shape[0] or m.shape[1] != roi.shape[1]:
-                m = m[:roi.shape[0], :roi.shape[1]]
-
-            roi[m] = (alpha * np.array(color, dtype=np.float32) +
-                      (1 - alpha) * roi[m].astype(np.float32)).astype(np.uint8)
-
-            if draw_contour:
-                m8 = (m.astype(np.uint8) * 255)
-                contours, _ = cv2.findContours(m8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                cv2.drawContours(overlay[y1:y2, x1:x2], contours, -1, color, 2)
-
-            if draw_center:
-                ys, xs = np.where(m > 0)
-                if len(xs) > 0 and len(ys) > 0:
-                    cx = int(x1 + np.mean(xs))
-                    cy = int(y1 + np.mean(ys))
-                    cv2.circle(overlay, (cx, cy), radius=6, color=tuple(color), thickness=-1)
-
-        vis = cv2.addWeighted(overlay, 1.0, img, 0.0, 0)
-        out_path = os.path.join(out_dir, os.path.basename(img_path))
-        cv2.imwrite(out_path, vis)
-
     def _draw_scatter(self, xs: List[int], ys: List[int], out_path: str):
         plt.figure(figsize=(6, 6))
         plt.scatter(xs, ys, s=10)
         mn, mx = min(xs + ys), max(xs + ys)
         plt.plot([mn, mx], [mn, mx], linestyle="--")
         plt.xlabel("Ground Truth Count")
-        plt.ylabel("Predicted Count")
+        plt.ylabel("Predicted Count (after argmax)")
         plt.title("GT vs Pred")
         plt.tight_layout()
         ensure_dir(os.path.dirname(out_path))
@@ -786,7 +867,6 @@ class Detectron2SegInference(SegInferenceTemplate):
         from detectron2.projects.deeplab import add_deeplab_config
         add_deeplab_config(cfg)
 
-        # If you use MaskDINO configs, keep this. Otherwise wrap with try/except.
         from maskdino import add_maskdino_config
         add_maskdino_config(cfg)
 
@@ -812,20 +892,26 @@ class Detectron2SegInference(SegInferenceTemplate):
         scores = inst.scores.detach().cpu().numpy() if inst.has("scores") else None
         labels = inst.pred_classes.detach().cpu().numpy() if inst.has("pred_classes") else np.zeros((len(inst),), dtype=np.int32)
 
-        if inst.has("pred_masks"):
-            masks = inst.pred_masks.detach().cpu().numpy().astype(bool)
+        # ---- NEW: prefer soft mask prob from your modified instance_inference ----
+        if inst.has("pred_masks_prob"):
+            masks_prob = inst.pred_masks_prob.detach().cpu().numpy().astype(np.float32)  # [N,H,W]
+            masks_bool = (masks_prob >= 0.5)
+        elif inst.has("pred_masks"):
+            masks_bool = inst.pred_masks.detach().cpu().numpy().astype(bool)
+            masks_prob = masks_bool.astype(np.float32)
         else:
             return []
 
         out = []
-        N = bboxes.shape[0] if bboxes is not None else masks.shape[0]
+        N = bboxes.shape[0] if bboxes is not None else masks_bool.shape[0]
         for i in range(N):
             x1, y1, x2, y2 = bboxes[i].tolist()
             out.append({
                 "bbox": [x1, y1, x2, y2],
                 "score": float(scores[i]) if scores is not None else 0.0,
                 "label": int(labels[i]) if labels is not None else 0,
-                "mask": masks[i]
+                "mask": masks_bool[i],
+                "mask_prob": masks_prob[i],
             })
         return out
 
@@ -834,7 +920,7 @@ class Detectron2SegInference(SegInferenceTemplate):
 # CLI
 # -----------------------------
 def build_argparser():
-    p = argparse.ArgumentParser(description="Wheat Segmentation on Detectron2 with search/infer + resume + optional resize")
+    p = argparse.ArgumentParser(description="Wheat Segmentation on Detectron2 with search/infer + resume + optional resize + argmax-after-nms")
 
     # Modes
     p.add_argument("--mode", choices=["search", "infer"], default="search",
@@ -858,10 +944,9 @@ def build_argparser():
     p.add_argument("--tile", type=int, default=800)
     p.add_argument("--overlap", type=int, default=256)
 
-    # NEW: resize for inference (H W). If not provided, no resize.
-    # Example: --resize_hw 1024 1536
+    # Resize for inference (H W)
     p.add_argument("--resize_hw", type=int, nargs=2, default=None, metavar=("H", "W"),
-                   help="If set, resize whole image to (H,W) for inference, then map results back to original size.")
+                   help="Resize whole image to (H,W) for inference, then map results back to original size.")
 
     # Search space
     p.add_argument("--score_start", type=float, default=0.1)
@@ -886,6 +971,10 @@ def build_argparser():
     p.add_argument("--fix_nms_iou_thr", type=float, default=0.372)
     p.add_argument("--fix_nms_mode", choices=["plain", "merge"], default="merge")
     p.add_argument("--fix_merge_score_mode", choices=["keep_max", "area_weighted"], default="keep_max")
+
+    # Argmax params
+    p.add_argument("--argmax_prob_thr", type=float, default=0.5, help="prob threshold for argmax participation")
+    p.add_argument("--argmax_alpha", type=float, default=0.6, help="overlay alpha for panoptic-like visualization")
 
     # Outputs
     p.add_argument("--out_dir", type=str, default="./swinl_guo_big_images")
@@ -925,7 +1014,9 @@ def main():
         vis=not args.no_vis,
         excel=not args.no_excel,
         draw_scatter=not args.no_scatter,
-        out_dir=args.out_dir
+        out_dir=args.out_dir,
+        argmax_prob_thr=float(args.argmax_prob_thr),
+        argmax_alpha=float(args.argmax_alpha),
     )
 
     runner = Detectron2SegInference(dataset, model, sw, search, outputs)
