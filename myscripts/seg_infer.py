@@ -15,6 +15,13 @@ NEW (Resume + streaming CSV):
 NEW (Resize input for inference, map back to original):
 - 可选参数 --resize_hw H W：推理时把输入整图缩放到指定(H,W)再做滑窗推理
 - 输出/保存仍使用原图尺寸；推理得到的 bbox/mask 会按比例映射回原图坐标系
+
+CHANGE (Your new requirement):
+- 参数筛选标准改为：对 --iou_types 内所有 iou_type 分别推理得到 pred_count，
+  对每张图取 pred_count 的平均值 pred_avg，然后用 |GT - pred_avg| 做误差；
+  grid search 最小化所有图片的 sum(|GT - pred_avg|)。
+- test 时同样使用 iou_types 平均策略写入 CSV（pred_counts 可能为小数）。
+- 可视化时无法“平均出一个 mask”，因此采用：选择 pred_count 最接近 pred_avg 的那个 iou_type 的 dets 来画图。
 """
 
 import os
@@ -25,8 +32,8 @@ import random
 from enum import Enum
 from dataclasses import dataclass
 from typing import List, Tuple, Dict, Any, Optional
-import torch  # noqa: E402
 
+import torch  # noqa: E402
 import cv2
 import numpy as np
 from tqdm import tqdm
@@ -73,11 +80,11 @@ class SlidingWindowConfig:
 
 @dataclass
 class SearchSpace:
-    iou_types: Tuple[str, ...] = ("IOU", "IOU_Min")
+    iou_types: Tuple[str, ...] = ("IOU", "IOU_Min", "IOA_A")
     score_thr_range: Tuple[float, float, int] = (0.1, 0.8, 30)
     nms_iou_thr_range: Tuple[float, float, int] = (0.1, 0.8, 30)
-    nms_modes: Tuple[str, ...] = ("plain", "merge")          # plain=mask_nms, merge=mask_nms_with_merge
-    merge_score_modes: Tuple[str, ...] = ("keep_max",)       # or ("keep_max","area_weighted")
+    nms_modes: Tuple[str, ...] = ("plain", "merge")
+    merge_score_modes: Tuple[str, ...] = ("keep_max",)
     base_keep_score: float = 0.01
 
 @dataclass
@@ -147,12 +154,13 @@ def read_done_set(csv_path: str) -> set:
                 done.add(parts[0].strip())
     return done
 
-def append_csv_row(csv_path: str, filename: str, gt: int, pred: int, write_header_if_new: bool = True):
+def append_csv_row(csv_path: str, filename: str, gt: int, pred: float, write_header_if_new: bool = True):
     is_new = not os.path.exists(csv_path)
     ensure_dir(os.path.dirname(csv_path))
     with open(csv_path, "a", encoding="utf-8") as f:
         if is_new and write_header_if_new:
             f.write("filename,ins_counts,pred_counts\n")
+        # pred may be float when using IOU-types-avg mode
         f.write(f"{filename},{gt},{pred}\n")
         f.flush()
         os.fsync(f.fileno())
@@ -174,6 +182,7 @@ class DetProposal:
 class IOUType(Enum):
     IOU = "IOU"
     IOU_Min = "IOU_Min"
+    IOA_A = "IOA_A"
 
 def mask_iou_between(a: DetProposal, b: DetProposal, iou_type: IOUType) -> float:
     xA = max(a.left, b.left)
@@ -182,17 +191,28 @@ def mask_iou_between(a: DetProposal, b: DetProposal, iou_type: IOUType) -> float
     yB = min(int(round(a.top + a.mask.shape[0])), int(round(b.top + b.mask.shape[0])))
     if xB <= xA or yB <= yA:
         return 0.0
+
     a_roi = a.mask[yA - a.top:yB - a.top, xA - a.left:xB - a.left]
     b_roi = b.mask[yA - b.top:yB - b.top, xA - b.left:xB - b.left]
     inter = np.logical_and(a_roi, b_roi).sum()
     if inter <= 0:
         return 0.0
+
     if iou_type == IOUType.IOU:
         union = a.area + b.area - inter
         return inter / union if union > 0 else 0.0
-    else:
+
+    elif iou_type == IOUType.IOU_Min:
         mn = min(a.area, b.area)
         return inter / mn if mn > 0 else 0.0
+
+    elif iou_type == IOUType.IOA_A:
+        denom = a.area
+        return inter / denom if denom > 0 else 0.0
+
+    else:
+        raise ValueError(f"Unknown IOUType: {iou_type}")
+
 
 def mask_nms(proposals: List[DetProposal], iou_thr: float, iou_type: IOUType) -> List[DetProposal]:
     if not proposals:
@@ -321,30 +341,34 @@ class SegInferenceTemplate:
         val_cache, val_gt_counts = {}, {}
         for img_path in tqdm(val_images, desc="VAL images"):
             val_cache[img_path] = self._proposals_for_image(img_path)
-            val_gt_counts[img_path] = yolo_count_instances(yolo_label_path_for_image(img_path, self.dataset.yolo_root))
+            val_gt_counts[img_path] = yolo_count_instances(
+                yolo_label_path_for_image(img_path, self.dataset.yolo_root)
+            )
 
-        print("==> Grid searching best parameters on VAL ...")
+        print("==> Grid searching best parameters on VAL (criterion uses AVG over --iou_types) ...")
         best_cfg, best_sum_diff = self._grid_search(val_cache, val_gt_counts)
 
-        print(f"[Best on VAL] iou_type={best_cfg['iou_type'].value}, "
+        iou_types_str = "|".join([t.value for t in best_cfg["iou_types"]])
+        print(f"[Best on VAL] iou_types=AVG({iou_types_str}), "
               f"score_thr={best_cfg['score_thr']:.4f}, nms_iou_thr={best_cfg['nms_iou_thr']:.4f}, "
               f"nms_mode={best_cfg['nms_mode']}, merge_score_mode={best_cfg['merge_score_mode']}, "
-              f"sum|GT-Pred|={best_sum_diff}")
+              f"sum|GT-PredAvg|={best_sum_diff:.6f}")
 
         with open(os.path.join(self.outputs.out_dir, "best_params_on_val.txt"), "w", encoding="utf-8") as f:
-            f.write(f"[Best on VAL] iou_type={best_cfg['iou_type'].value}, "
+            f.write(f"[Best on VAL] iou_types=AVG({iou_types_str}), "
                     f"score_thr={best_cfg['score_thr']:.4f}, nms_iou_thr={best_cfg['nms_iou_thr']:.4f}, "
                     f"nms_mode={best_cfg['nms_mode']}, merge_score_mode={best_cfg['merge_score_mode']}, "
-                    f"sum|GT-Pred|={best_sum_diff}\n")
+                    f"sum|GT-PredAvg|={best_sum_diff:.6f}\n")
 
-        print("==> Running TEST with best parameters (resume enabled) ...")
+        print("==> Running TEST with best parameters (resume enabled, also using AVG over iou_types) ...")
         self._run_on_split(
             "test",
-            best_cfg["iou_type"],
-            best_cfg["score_thr"],
-            best_cfg["nms_iou_thr"],
-            best_cfg["nms_mode"],
-            best_cfg["merge_score_mode"],
+            iou_type=None,  # None => avg mode
+            iou_types_for_avg=best_cfg["iou_types"],
+            score_thr=best_cfg["score_thr"],
+            nms_iou_thr=best_cfg["nms_iou_thr"],
+            nms_mode=best_cfg["nms_mode"],
+            merge_score_mode=best_cfg["merge_score_mode"],
         )
 
     def run_infer_only(self, split: str, iou_type: IOUType, score_thr: float, nms_iou_thr: float,
@@ -355,24 +379,82 @@ class SegInferenceTemplate:
         print(f"==> Running {split.upper()} with fixed params (resume enabled): "
               f"iou_type={iou_type.value}, score_thr={score_thr}, nms_iou_thr={nms_iou_thr}, "
               f"nms_mode={nms_mode}, merge_score_mode={merge_score_mode}")
-        self._run_on_split(split, iou_type, score_thr, nms_iou_thr, nms_mode, merge_score_mode)
+        # infer-only keeps single iou_type behavior (not averaging)
+        self._run_on_split(
+            split,
+            iou_type=iou_type,
+            iou_types_for_avg=None,
+            score_thr=score_thr,
+            nms_iou_thr=nms_iou_thr,
+            nms_mode=nms_mode,
+            merge_score_mode=merge_score_mode
+        )
 
     # ====== shared helpers ======
-    def _make_run_tag(self, split: str, iou_type: IOUType, score_thr: float, nms_iou_thr: float,
+    def _make_run_tag(self, split: str,
+                      iou_type: Optional[IOUType],
+                      iou_types_for_avg: Optional[List[IOUType]],
+                      score_thr: float, nms_iou_thr: float,
                       nms_mode: str, merge_score_mode: str) -> str:
-        tag = (f"{split}_iou-{iou_type.value}"
+        if iou_type is None:
+            assert iou_types_for_avg is not None and len(iou_types_for_avg) > 0
+            iou_tag = "AVG(" + "|".join([t.value for t in iou_types_for_avg]) + ")"
+        else:
+            iou_tag = iou_type.value
+
+        tag = (f"{split}_iou-{iou_tag}"
                f"_s-{score_thr:.4f}_n-{nms_iou_thr:.4f}"
                f"_m-{nms_mode}_ms-{merge_score_mode}")
         if self.sw.resize_hw is not None:
             tag += f"_resize-{self.sw.resize_hw[0]}x{self.sw.resize_hw[1]}"
         return tag
 
-    def _run_on_split(self, split: str, iou_type: IOUType, score_thr: float, nms_iou_thr: float,
+    def _predict_avg_count_and_vis_dets(self,
+                                       proposals: List[DetProposal],
+                                       score_thr: float, nms_thr: float,
+                                       iou_types: List[IOUType],
+                                       nms_mode: str, merge_score_mode: str) -> Tuple[float, List[DetProposal]]:
+        """
+        Returns:
+          pred_avg_count (float),
+          dets_for_vis (List[DetProposal])  # from the iou_type whose pred_count is closest to pred_avg_count
+        """
+        counts: List[int] = []
+        dets_list: List[List[DetProposal]] = []
+        for iout in iou_types:
+            dets = self._apply_thresh_nms(
+                proposals, score_thr, nms_thr, iout,
+                nms_mode=nms_mode,
+                merge_score_mode=merge_score_mode
+            )
+            dets_list.append(dets)
+            counts.append(len(dets))
+
+        if len(counts) == 0:
+            return 0.0, []
+
+        pred_avg = float(np.mean(counts))
+        # pick the dets with count closest to pred_avg for visualization
+        best_k = int(np.argmin([abs(c - pred_avg) for c in counts]))
+        return pred_avg, dets_list[best_k]
+
+    def _run_on_split(self, split: str,
+                      iou_type: Optional[IOUType],
+                      iou_types_for_avg: Optional[List[IOUType]],
+                      score_thr: float, nms_iou_thr: float,
                       nms_mode: str, merge_score_mode: str):
         imgs_dir, _ = yolo_split_paths(self.dataset.yolo_root, split)
         images = list_images_in_dir(imgs_dir)
 
-        run_tag = self._make_run_tag(split, iou_type, score_thr, nms_iou_thr, nms_mode, merge_score_mode)
+        run_tag = self._make_run_tag(
+            split=split,
+            iou_type=iou_type,
+            iou_types_for_avg=iou_types_for_avg,
+            score_thr=score_thr,
+            nms_iou_thr=nms_iou_thr,
+            nms_mode=nms_mode,
+            merge_score_mode=merge_score_mode
+        )
         run_dir = os.path.join(self.outputs.out_dir, run_tag)
         ensure_dir(run_dir)
         vis_dir = os.path.join(run_dir, "vis")
@@ -384,20 +466,36 @@ class SegInferenceTemplate:
         skipped = 0
         newly_processed = 0
 
+        use_avg_mode = (iou_type is None)
+        if use_avg_mode:
+            assert iou_types_for_avg is not None and len(iou_types_for_avg) > 0
+
         for img_path in tqdm(images, desc=f"{split.upper()} images", total=len(images)):
             fname = os.path.basename(img_path)
             if fname in done:
                 skipped += 1
                 continue
 
-            proposals = self._proposals_for_image(img_path)  # NOTE: returns proposals already mapped to ORIGINAL coords
-            final_dets = self._apply_thresh_nms(
-                proposals, score_thr, nms_iou_thr, iou_type,
-                nms_mode=nms_mode,
-                merge_score_mode=merge_score_mode
-            )
-            pred_count = len(final_dets)
+            proposals = self._proposals_for_image(img_path)  # proposals already mapped to ORIGINAL coords
             gt_count = yolo_count_instances(yolo_label_path_for_image(img_path, self.dataset.yolo_root))
+
+            if use_avg_mode:
+                pred_count, dets_for_vis = self._predict_avg_count_and_vis_dets(
+                    proposals,
+                    score_thr=score_thr,
+                    nms_thr=nms_iou_thr,
+                    iou_types=iou_types_for_avg,
+                    nms_mode=nms_mode,
+                    merge_score_mode=merge_score_mode
+                )
+            else:
+                final_dets = self._apply_thresh_nms(
+                    proposals, score_thr, nms_iou_thr, iou_type,
+                    nms_mode=nms_mode,
+                    merge_score_mode=merge_score_mode
+                )
+                dets_for_vis = final_dets
+                pred_count = float(len(final_dets))
 
             if self.outputs.excel:
                 append_csv_row(csv_path, fname, gt_count, pred_count, write_header_if_new=True)
@@ -407,8 +505,7 @@ class SegInferenceTemplate:
             if self.outputs.vis:
                 out_img_path = os.path.join(vis_dir, fname)
                 if not os.path.exists(out_img_path):
-                    # visualize on original image, dets are in original coords
-                    self._visualize_and_save(img_path, final_dets, vis_dir, draw_contour=True)
+                    self._visualize_and_save(img_path, dets_for_vis, vis_dir, draw_contour=True)
 
         print(f"[Resume] skipped={skipped}, newly_processed={newly_processed}")
         if self.outputs.excel:
@@ -424,8 +521,8 @@ class SegInferenceTemplate:
                     parts = s.split(",")
                     if len(parts) >= 3:
                         try:
-                            xs.append(int(parts[1]))
-                            ys.append(int(parts[2]))
+                            xs.append(float(parts[1]))
+                            ys.append(float(parts[2]))
                         except Exception:
                             pass
             if xs:
@@ -449,15 +546,12 @@ class SegInferenceTemplate:
             return None
 
         h_r, w_r = p.mask.shape[:2]
-        # scaled sizes in original coords
         w_o = int(max(1, round(w_r * sx)))
         h_o = int(max(1, round(h_r * sy)))
 
-        # scale top-left
         left_o = int(round(p.left * sx))
         top_o = int(round(p.top * sy))
 
-        # clamp ROI into original image bounds
         left_o = max(0, min(orig_W, left_o))
         top_o = max(0, min(orig_H, top_o))
         right_o = max(0, min(orig_W, left_o + w_o))
@@ -466,12 +560,10 @@ class SegInferenceTemplate:
         if right_o <= left_o or bottom_o <= top_o:
             return None
 
-        # resize mask crop (nearest) then crop if clamped by image borders
         mask_u8 = (p.mask.astype(np.uint8) * 255)
         mask_resized = cv2.resize(mask_u8, (w_o, h_o), interpolation=cv2.INTER_NEAREST)
         mask_resized = (mask_resized > 127)
 
-        # If clamped, we need to crop the resized mask accordingly
         crop_w = right_o - left_o
         crop_h = bottom_o - top_o
         mask_resized = mask_resized[:crop_h, :crop_w]
@@ -497,14 +589,13 @@ class SegInferenceTemplate:
             raise FileNotFoundError(img_path)
         orig_H, orig_W = img0.shape[:2]
 
-        # NEW: optional resize for inference
+        # optional resize for inference
         if self.sw.resize_hw is not None:
             target_H, target_W = self.sw.resize_hw
-            # cv2.resize uses (W,H)
             img = cv2.resize(img0, (int(target_W), int(target_H)), interpolation=cv2.INTER_LINEAR)
             inf_H, inf_W = img.shape[:2]
-            sx = orig_W / float(inf_W)  # map resized->orig in X
-            sy = orig_H / float(inf_H)  # map resized->orig in Y
+            sx = orig_W / float(inf_W)
+            sy = orig_H / float(inf_H)
         else:
             img = img0
             inf_H, inf_W = orig_H, orig_W
@@ -538,8 +629,8 @@ class SegInferenceTemplate:
                     if score < self.search.base_keep_score:
                         continue
 
-                    bbox = np.array(ins["bbox"], dtype=float)  # in tile coords
-                    mask = np.logical_and(ins["mask"].astype(bool), valid_mask)  # tile-sized bool
+                    bbox = np.array(ins["bbox"], dtype=float)
+                    mask = np.logical_and(ins["mask"].astype(bool), valid_mask)
 
                     x1t = max(0, min(tile, int(math.floor(bbox[0]))))
                     y1t = max(0, min(tile, int(math.floor(bbox[1]))))
@@ -556,7 +647,6 @@ class SegInferenceTemplate:
                     gx1, gy1 = x0 + x1t, y0 + y1t
                     gx2, gy2 = x0 + x2t, y0 + y2t
 
-                    # clamp to inference image bounds
                     gx1 = max(0, min(inf_W, gx1)); gx2 = max(0, min(inf_W, gx2))
                     gy1 = max(0, min(inf_H, gy1)); gy2 = max(0, min(inf_H, gy2))
                     if gx2 <= gx1 or gy2 <= gy1:
@@ -572,7 +662,6 @@ class SegInferenceTemplate:
                         area=area
                     ))
 
-        # NEW: map proposals to original coordinates if resized
         if self.sw.resize_hw is None:
             return proposals_resized
 
@@ -584,55 +673,65 @@ class SegInferenceTemplate:
         return proposals_orig
 
     def _grid_search(self, val_cache: Dict[str, List[DetProposal]],
-                     val_gt_counts: Dict[str, int]) -> Tuple[Dict[str, Any], int]:
+                     val_gt_counts: Dict[str, int]) -> Tuple[Dict[str, Any], float]:
         score_list = linspace_inclusive(*self.search.score_thr_range)
         nms_list = linspace_inclusive(*self.search.nms_iou_thr_range)
         iou_types = [IOUType(t) for t in self.search.iou_types]
         nms_modes = list(self.search.nms_modes)
         merge_score_modes = list(self.search.merge_score_modes)
 
-        best_cfg, best_sum = None, 1 << 62
+        best_cfg, best_sum = None, float("inf")
 
-        total = len(score_list) * len(nms_list) * len(iou_types) * len(nms_modes) * len(merge_score_modes)
-        pbar = tqdm(total=total, desc="Grid search")
+        # NOTE: no longer multiply by len(iou_types) in total, because iou_types are averaged inside
+        total = len(score_list) * len(nms_list) * len(nms_modes) * len(merge_score_modes)
+        pbar = tqdm(total=total, desc="Grid search (AVG over iou_types)")
 
         results = []
-        for iout in iou_types:
-            for nms_mode in nms_modes:
-                for merge_score_mode in merge_score_modes:
-                    if nms_mode == "plain" and merge_score_mode != merge_score_modes[0]:
-                        continue
+        for nms_mode in nms_modes:
+            for merge_score_mode in merge_score_modes:
+                if nms_mode == "plain" and merge_score_mode != merge_score_modes[0]:
+                    continue
 
-                    for s_thr in score_list:
-                        for n_thr in nms_list:
-                            sum_diff = 0
-                            for img_path, props in val_cache.items():
-                                pred = len(self._apply_thresh_nms(
+                for s_thr in score_list:
+                    for n_thr in nms_list:
+                        sum_diff = 0.0
+
+                        for img_path, props in val_cache.items():
+                            gt = val_gt_counts[img_path]
+
+                            counts = []
+                            for iout in iou_types:
+                                dets = self._apply_thresh_nms(
                                     props, s_thr, n_thr, iout,
                                     nms_mode=nms_mode,
                                     merge_score_mode=merge_score_mode
-                                ))
-                                sum_diff += abs(val_gt_counts[img_path] - pred)
+                                )
+                                counts.append(len(dets))
 
-                            results.append({
-                                "iou_type": iout.value,
+                            pred_avg = float(np.mean(counts)) if len(counts) else 0.0
+                            sum_diff += abs(float(gt) - pred_avg)
+
+                        results.append({
+                            "iou_type": "AVG(" + "|".join([t.value for t in iou_types]) + ")",
+                            "score_thr": s_thr,
+                            "nms_thr": n_thr,
+                            "nms_mode": nms_mode,
+                            "merge_score_mode": merge_score_mode,
+                            "sum_diff": sum_diff
+                        })
+
+                        if sum_diff < best_sum:
+                            best_sum = sum_diff
+                            best_cfg = {
+                                "iou_types": iou_types,        # store list
                                 "score_thr": s_thr,
-                                "nms_thr": n_thr,
+                                "nms_iou_thr": n_thr,
                                 "nms_mode": nms_mode,
-                                "merge_score_mode": merge_score_mode,
-                                "sum_diff": sum_diff
-                            })
+                                "merge_score_mode": merge_score_mode
+                            }
 
-                            if sum_diff < best_sum:
-                                best_sum = sum_diff
-                                best_cfg = {
-                                    "iou_type": iout,
-                                    "score_thr": s_thr,
-                                    "nms_iou_thr": n_thr,
-                                    "nms_mode": nms_mode,
-                                    "merge_score_mode": merge_score_mode
-                                }
-                            pbar.update(1)
+                        pbar.update(1)
+
         pbar.close()
 
         csv_path = os.path.join(self.outputs.out_dir, "grid_search_results.csv")
@@ -640,7 +739,7 @@ class SegInferenceTemplate:
             f.write("iou_type,score_thr,nms_thr,nms_mode,merge_score_mode,sum_diff\n")
             for r in results:
                 f.write(f"{r['iou_type']},{r['score_thr']:.4f},{r['nms_thr']:.4f},"
-                        f"{r['nms_mode']},{r['merge_score_mode']},{r['sum_diff']}\n")
+                        f"{r['nms_mode']},{r['merge_score_mode']},{r['sum_diff']:.6f}\n")
         print(f"[Saved] Grid search results -> {csv_path}")
 
         return best_cfg, best_sum
@@ -715,13 +814,13 @@ class SegInferenceTemplate:
         out_path = os.path.join(out_dir, os.path.basename(img_path))
         cv2.imwrite(out_path, vis)
 
-    def _draw_scatter(self, xs: List[int], ys: List[int], out_path: str):
+    def _draw_scatter(self, xs: List[float], ys: List[float], out_path: str):
         plt.figure(figsize=(6, 6))
         plt.scatter(xs, ys, s=10)
         mn, mx = min(xs + ys), max(xs + ys)
         plt.plot([mn, mx], [mn, mx], linestyle="--")
         plt.xlabel("Ground Truth Count")
-        plt.ylabel("Predicted Count")
+        plt.ylabel("Predicted Count (may be AVG)")
         plt.title("GT vs Pred")
         plt.tight_layout()
         ensure_dir(os.path.dirname(out_path))
@@ -858,8 +957,7 @@ def build_argparser():
     p.add_argument("--tile", type=int, default=800)
     p.add_argument("--overlap", type=int, default=256)
 
-    # NEW: resize for inference (H W). If not provided, no resize.
-    # Example: --resize_hw 1024 1536
+    # Resize for inference (H W). If not provided, no resize.
     p.add_argument("--resize_hw", type=int, nargs=2, default=None, metavar=("H", "W"),
                    help="If set, resize whole image to (H,W) for inference, then map results back to original size.")
 
@@ -870,7 +968,7 @@ def build_argparser():
     p.add_argument("--nms_start", type=float, default=0.1)
     p.add_argument("--nms_end", type=float, default=0.6)
     p.add_argument("--nms_num", type=int, default=12)
-    p.add_argument("--iou_types", type=str, nargs="+", default=["IOU", "IOU_Min"])
+    p.add_argument("--iou_types", type=str, nargs="+", default=["IOU", "IOU_Min", "IOA_A"])
     p.add_argument("--base_keep_score", type=float, default=0.01)
 
     # NMS choices
@@ -879,9 +977,9 @@ def build_argparser():
     p.add_argument("--merge_score_modes", type=str, nargs="+", default=["keep_max"],
                    choices=["keep_max", "area_weighted"])
 
-    # Infer-only fixed params
+    # Infer-only fixed params (single iou_type behavior kept)
     p.add_argument("--infer_split", choices=["test", "val", "train"], default="test")
-    p.add_argument("--fix_iou_type", choices=["IOU", "IOU_Min"], default="IOU_Min")
+    p.add_argument("--fix_iou_type", choices=["IOU", "IOU_Min", "IOA_A"], default="IOU_Min")
     p.add_argument("--fix_score_thr", type=float, default=0.4)
     p.add_argument("--fix_nms_iou_thr", type=float, default=0.372)
     p.add_argument("--fix_nms_mode", choices=["plain", "merge"], default="merge")
