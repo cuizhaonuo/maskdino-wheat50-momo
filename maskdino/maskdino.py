@@ -292,6 +292,41 @@ class MaskDINO(nn.Module):
             else:
                 targets = None
 
+            # # 可视化 images 和 targets
+            # import os
+            # import numpy as np
+            # import cv2
+            # from detectron2.utils.visualizer import Visualizer
+            #
+            # os.makedirs("debug_vis", exist_ok=True)
+            # for idx, (img_tensor, target) in enumerate(zip(images.tensor, targets)):
+            #     # 反归一化图像
+            #     img = img_tensor.cpu() * self.pixel_std.cpu() + self.pixel_mean.cpu()
+            #     img = img.permute(1, 2, 0).numpy()
+            #     img = np.clip(img, 0, 255).astype(np.uint8)
+            #
+            #     # 绘制masks和boxes
+            #     vis_img = img.copy()
+            #     for mask_idx, (mask, label, box) in enumerate(zip(target['masks'], target['labels'], target['boxes'])):
+            #         # 绘制mask
+            #         mask_np = mask.cpu().numpy()
+            #         color = np.random.randint(0, 255, 3).tolist()
+            #         vis_img[mask_np > 0] = vis_img[mask_np > 0] * 0.5 + np.array(color) * 0.5
+            #
+            #         # 转换box坐标 (cxcywh normalized -> xyxy pixel)
+            #         h, w = mask_np.shape
+            #         box_xyxy = box_ops.box_cxcywh_to_xyxy(box.unsqueeze(0))[0]
+            #         box_xyxy = box_xyxy * torch.tensor([w, h, w, h], device=box.device)
+            #         x1, y1, x2, y2 = box_xyxy.cpu().int().tolist()
+            #
+            #         # 绘制box
+            #         cv2.rectangle(vis_img, (x1, y1), (x2, y2), color, 2)
+            #         cv2.putText(vis_img, f"cls:{label.item()}", (x1, y1-5),
+            #                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+            #
+            #     cv2.imwrite(f"debug_vis/train_img_{idx}.jpg", vis_img[:, :, ::-1])
+            # print(f"Saved visualization to debug_vis/ for {len(images.tensor)} images")
+
             # 预处理时已经 pad 好了，不需要在这里 pad 了，因此不传入 mask，即 mask=None
             outputs, outputs_one2many, out_sep, mask_dict = self.sem_seg_head(features, targets=targets)
 

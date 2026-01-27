@@ -176,5 +176,10 @@ def add_maskdino_config(cfg):
     cfg.MODEL.MaskDINO.LAYER_WISE_IOU_ENABLED = False
     # 4
     cfg.MODEL.MaskDINO.ALIGN_LOSS_ENABLED = False
-
+    # 5
     cfg.MODEL.MaskDINO.SEP_BRANCH_ENABLED = False
+    # 6
+    cfg.INPUT.COPYPASTE = False
+    cfg.INPUT.COPYPASTE_PROB = 0.35
+    cfg.INPUT.COPYPASTE_MAX_INSTANCES = 3
+    cfg.INPUT.COPYPASTE_OVERLAP_PROB = 0.85
