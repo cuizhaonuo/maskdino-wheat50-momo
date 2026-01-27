@@ -183,3 +183,6 @@ def add_maskdino_config(cfg):
     cfg.INPUT.COPYPASTE_PROB = 0.35
     cfg.INPUT.COPYPASTE_MAX_INSTANCES = 3
     cfg.INPUT.COPYPASTE_OVERLAP_PROB = 0.85
+    # 7
+    cfg.INPUT.COLOR_AUG = False
+    cfg.INPUT.ROTATE_AUG = False

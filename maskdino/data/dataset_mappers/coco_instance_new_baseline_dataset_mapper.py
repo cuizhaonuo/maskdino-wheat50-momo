@@ -19,7 +19,7 @@ from detectron2.config import configurable
 from detectron2.data import DatasetCatalog
 from detectron2.data import detection_utils as utils
 from detectron2.data import transforms as T
-from detectron2.structures import BoxMode, PolygonMasks
+from detectron2.structures import BoxMode, PolygonMasks, BitMasks
 
 
 __all__ = ["COCOInstanceNewBaselineDatasetMapper"]
@@ -46,7 +46,7 @@ def convert_coco_poly_to_mask(segmentations, height, width):
     return masks
 
 
-def build_transform_gen(cfg, is_train):
+def _build_transform_gen(cfg, is_train):
     """
     Default detectron2-style augmentations:
       - Flip
@@ -80,6 +80,44 @@ def build_transform_gen(cfg, is_train):
         ]
     )
     return augmentation
+
+def build_transform_gen(cfg, is_train):
+    assert is_train
+    image_size = cfg.INPUT.IMAGE_SIZE
+    min_scale = cfg.INPUT.MIN_SCALE
+    max_scale = cfg.INPUT.MAX_SCALE
+
+    aug = []
+
+    if cfg.INPUT.RANDOM_FLIP == "horizontal":
+        aug.append(T.RandomFlip(horizontal=True, vertical=False))
+    elif cfg.INPUT.RANDOM_FLIP == "vertical":
+        aug.append(T.RandomFlip(horizontal=False, vertical=True))
+    elif cfg.INPUT.RANDOM_FLIP == "both":
+        aug.append(T.RandomFlip(horizontal=True, vertical=True))
+
+    aug.append(
+        T.ResizeScale(
+            min_scale=min_scale,
+            max_scale=max_scale,
+            target_height=image_size,
+            target_width=image_size,
+        )
+    )
+    if cfg.INPUT.ROTATE_AUG:
+        aug.append(T.RandomRotation(angle=[-120, 120], expand=False, center=None))
+
+    aug.append(T.FixedSizeCrop(crop_size=(image_size, image_size)))
+
+    if cfg.INPUT.COLOR_AUG:
+        aug.extend([
+            T.RandomBrightness(0.8, 1.2),
+            T.RandomContrast(0.8, 1.2),
+            T.RandomSaturation(0.8, 1.2),
+            # T.RandomLighting(0.1),  # 如果你环境里有
+        ])
+
+    return aug
 
 
 class COCOInstanceNewBaselineDatasetMapper:
@@ -433,3 +471,9 @@ class COCOInstanceNewBaselineDatasetMapper:
             dataset_dict["instances"] = instances
 
         return dataset_dict
+
+
+
+
+
+

@@ -50,6 +50,9 @@ INPUT:
   COPYPASTE_MAX_INSTANCES: 8
   COPYPASTE_OVERLAP_PROB: 0.85
 
+  COLOR_AUG: true
+  ROTATE_AUG: false
+
 # 默认
 #Model:
 #  MaskDINO:
