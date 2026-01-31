@@ -23,7 +23,8 @@ if mode == "ablation":
         # "experiment1/dn100_o2o600_o2m450_k3_iou0.8",
         # "experiment1/dn100_o2o900_o2m1350_k3_iou0.8",
         "maskdino_swinl-time-10-19-20-00",
-        "experiment-longsteps/bs1_dn100_o2o900_o2m1350_k3_iou0.8"
+        "experiment-longsteps/bs1_dn100_o2o900_o2m1350_k3_iou0.8",
+        "experiment-longsteps/bs1_dn100_o2o900_o2m1350_k3_iou0.8_copypaste_pro0.6_max8_overlap0.85/",
     ]
     labels = [
         "base",
@@ -32,7 +33,8 @@ if mode == "ablation":
         # "v1-sep",
         # "e1",
         # "e2",
-        "v1-longsteps"
+        "v1-longsteps",
+        "v2-longsteps",
     ]
 
 if mode == "experiment":
