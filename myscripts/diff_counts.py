@@ -1,7 +1,7 @@
 import pandas as pd
 
 # 读取 CSV 文件
-df = pd.read_csv("./swinl_xinxiang_search/test_pred_vs_gt.csv")
+df = pd.read_csv("./baseline-search/test_iou-IOU_s-0.3000_n-0.3000_m-merge_ms-keep_max/test_pred_vs_gt.csv")
 
 # 计算每行的绝对差值
 df["abs_diff"] = (df["ins_counts"] - df["pred_counts"]).abs()

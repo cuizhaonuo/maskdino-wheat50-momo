@@ -866,10 +866,10 @@ def build_argparser():
     # Search space
     p.add_argument("--score_start", type=float, default=0.1)
     p.add_argument("--score_end", type=float, default=0.6)
-    p.add_argument("--score_num", type=int, default=6)
+    p.add_argument("--score_num", type=int, default=20)
     p.add_argument("--nms_start", type=float, default=0.1)
     p.add_argument("--nms_end", type=float, default=0.6)
-    p.add_argument("--nms_num", type=int, default=12)
+    p.add_argument("--nms_num", type=int, default=20)
     p.add_argument("--iou_types", type=str, nargs="+", default=["IOU", "IOU_Min"])
     p.add_argument("--base_keep_score", type=float, default=0.01)
 
@@ -881,10 +881,10 @@ def build_argparser():
 
     # Infer-only fixed params
     p.add_argument("--infer_split", choices=["test", "val", "train"], default="test")
-    p.add_argument("--fix_iou_type", choices=["IOU", "IOU_Min"], default="IOU_Min")
+    p.add_argument("--fix_iou_type", choices=["IOU", "IOU_Min"], default="IOU")
     p.add_argument("--fix_score_thr", type=float, default=0.4)
     p.add_argument("--fix_nms_iou_thr", type=float, default=0.372)
-    p.add_argument("--fix_nms_mode", choices=["plain", "merge"], default="merge")
+    p.add_argument("--fix_nms_mode", choices=["plain", "merge"], default="plain")
     p.add_argument("--fix_merge_score_mode", choices=["keep_max", "area_weighted"], default="keep_max")
 
     # Outputs
