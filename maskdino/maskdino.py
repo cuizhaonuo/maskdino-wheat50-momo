@@ -111,7 +111,8 @@ class MaskDINO(nn.Module):
         self.semantic_on = semantic_on
         self.instance_on = instance_on
         self.panoptic_on = panoptic_on
-        self.test_topk_per_image = test_topk_per_image
+        # self.test_topk_per_image = test_topk_per_image
+        self.test_topk_per_image = 1000
 
         self.data_loader = data_loader
         self.focus_on_box = focus_on_box
@@ -377,11 +378,36 @@ class MaskDINO(nn.Module):
         else:
             outputs, _, _, _ = self.sem_seg_head(features)
 
+            # outputs = outputs["interm_outputs"]
+
             mask_cls_results = outputs["pred_logits"]
             mask_pred_results = outputs["pred_masks"]
             mask_box_results = outputs["pred_boxes"]
             mask_iou_results = outputs["pred_logits_iou"] if "pred_logits_iou" in outputs else \
                 torch.zeros((*mask_cls_results.shape[:-1], 1), device=mask_cls_results.device)
+
+            # if "instances" in batched_inputs[0]:
+            #     gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
+            #     if 'detr' in self.data_loader:
+            #         targets = self.prepare_targets_detr(gt_instances, images)
+            #     else:
+            #         targets = self.prepare_targets(gt_instances, images)
+            # else:
+            #     targets = None
+
+            interm_outputs = outputs["interm_outputs"]
+            interm_cls_results = interm_outputs["pred_logits"]
+            interm_mask_pred_results = interm_outputs["pred_masks"]
+            interm_box_results = interm_outputs["pred_boxes"]
+            interm_iou_results = interm_outputs["pred_logits_iou"] if "pred_logits_iou" in interm_outputs else \
+                torch.zeros((*interm_cls_results.shape[:-1], 1), device=interm_cls_results.device)
+
+            # concat
+            mask_cls_results = torch.cat([interm_cls_results, mask_cls_results], dim=1)
+            mask_pred_results = torch.cat([interm_mask_pred_results, mask_pred_results], dim=1)
+            mask_box_results = torch.cat([interm_box_results, mask_box_results], dim=1)
+            mask_iou_results = torch.cat([interm_iou_results, mask_iou_results], dim=1)
+
             # upsample masks
             mask_pred_results = F.interpolate(
                 mask_pred_results,
@@ -557,43 +583,45 @@ class MaskDINO(nn.Module):
             return panoptic_seg, segments_info
 
     def instance_inference(self, mask_cls, mask_pred, mask_box_result, mask_iou_result):
-        # mask_pred is already processed to have the same shape as original input
         image_size = mask_pred.shape[-2:]
-        scores = mask_cls.sigmoid()  # [100, 80]
-        # ious = mask_iou_result.sigmoid()
-        # scores = (scores + 1) * ious  # multiply mask iou score
-        labels = torch.arange(self.sem_seg_head.num_classes, device=self.device).unsqueeze(0).repeat(self.num_queries, 1).flatten(0, 1)
-        # labels = torch.ones_like(self.sem_seg_head.num_classes, device=self.device).unsqueeze(0).repeat(self.num_queries, 1).flatten(0, 1)
-        # scores_per_image, topk_indices = scores.flatten(0, 1).topk(self.test_topk_per_image, sorted=False)  # select 100
-        flat_scores = scores.flatten(0, 1)
+        scores = mask_cls.sigmoid()  # [Q, C]
+        num_classes = self.sem_seg_head.num_classes
+        Q = scores.shape[0]
+
+        flat_scores = scores.flatten(0, 1)  # [Q*C]
         k = min(self.test_topk_per_image, flat_scores.numel())
         scores_per_image, topk_indices = flat_scores.topk(k, sorted=False)
-        labels_per_image = labels[topk_indices]
-        topk_indices = topk_indices // self.sem_seg_head.num_classes
-        mask_pred = mask_pred[topk_indices]
-        # if this is panoptic segmentation, we only keep the "thing" classes
+
+        # ✅ 关键：用 topk_indices 计算类别和 query，不再依赖 self.num_queries
+        labels_per_image = (topk_indices % num_classes).to(torch.int64)  # [k]
+        topk_query = (topk_indices // num_classes).to(torch.int64)  # [k]
+
+        mask_pred = mask_pred[topk_query]  # [k, H, W]
+
         if self.panoptic_on:
-            keep = torch.zeros_like(scores_per_image).bool()
+            keep = torch.zeros_like(scores_per_image, dtype=torch.bool)
+            thing_vals = set(self.metadata.thing_dataset_id_to_contiguous_id.values())
             for i, lab in enumerate(labels_per_image):
-                keep[i] = lab in self.metadata.thing_dataset_id_to_contiguous_id.values()
+                keep[i] = int(lab) in thing_vals
             scores_per_image = scores_per_image[keep]
             labels_per_image = labels_per_image[keep]
             mask_pred = mask_pred[keep]
-        result = Instances(image_size)
-        # mask (before sigmoid)
-        result.pred_masks = (mask_pred > 0).float()
-        # half mask box half pred box
-        mask_box_result = mask_box_result[topk_indices]
-        if self.panoptic_on:
-            mask_box_result = mask_box_result[keep]
-        result.pred_boxes = Boxes(mask_box_result)
-        # Uncomment the following to get boxes from masks (this is slow)
-        # result.pred_boxes = BitMasks(mask_pred > 0).get_bounding_boxes()
+            topk_query = topk_query[keep]  # ✅ 别忘了同步 keep
 
-        # calculate average mask prob
-        mask_scores_per_image = (mask_pred.sigmoid().flatten(1) * result.pred_masks.flatten(1)).sum(1) / (result.pred_masks.flatten(1).sum(1) + 1e-6)
+        result = Instances(image_size)
+        result.pred_masks = (mask_pred > 0).float()
+
+        # boxes 同步使用 topk_query
+        mask_box_result = mask_box_result[topk_query]
+        result.pred_boxes = Boxes(mask_box_result)
+
+        mask_scores_per_image = (
+                (mask_pred.sigmoid().flatten(1) * result.pred_masks.flatten(1)).sum(1)
+                / (result.pred_masks.flatten(1).sum(1) + 1e-6)
+        )
         if self.focus_on_box:
             mask_scores_per_image = 1.0
+
         result.scores = scores_per_image * mask_scores_per_image
         result.pred_classes = labels_per_image
         return result
