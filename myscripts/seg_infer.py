@@ -47,6 +47,7 @@ from detectron2.config import get_cfg
 from detectron2.engine import DefaultPredictor
 from detectron2 import model_zoo
 
+from pycocotools import mask as mask_utils
 
 # -----------------------------
 # Config dataclasses
@@ -86,6 +87,7 @@ class OutputOptions:
     excel: bool = True
     draw_scatter: bool = True
     out_dir: str = "./vis_wheat_seg"
+
 
 
 # -----------------------------
@@ -292,6 +294,57 @@ def mask_nms_with_merge(proposals: List[DetProposal], iou_thr: float, iou_type: 
 
     return merged_results
 
+def detproposal_to_coco_ann(
+        det: DetProposal,
+        image_id: int,
+        ann_id: int,
+        img_h: int,
+        img_w: int,
+        category_id: int = 1
+) -> dict:
+    """
+    det.mask 是 bbox crop（h,w），并且 det.top/det.left 是在整图中的位置（原图坐标）。
+    这里会把 crop mask 放回整图大小，然后用 COCO RLE 编码。
+    """
+    # 1) 拼回整图 mask
+    full = np.zeros((img_h, img_w), dtype=np.uint8)
+
+    y1 = int(det.top)
+    x1 = int(det.left)
+    h, w = det.mask.shape[:2]
+    y2 = min(img_h, y1 + h)
+    x2 = min(img_w, x1 + w)
+
+    if y2 <= y1 or x2 <= x1:
+        return None
+
+    crop = det.mask[: (y2 - y1), : (x2 - x1)].astype(np.uint8)
+    full[y1:y2, x1:x2] = crop
+
+    # 2) COCO RLE 编码（注意要 Fortran order）
+    rle = mask_utils.encode(np.asfortranarray(full))
+    # pycocotools 会返回 bytes，需要转成 str 才能 json 序列化
+    rle["counts"] = rle["counts"].decode("utf-8")
+
+    # 3) bbox 用 COCO 格式 [x, y, w, h]（像素）
+    x = float(x1)
+    y = float(y1)
+    bw = float(x2 - x1)
+    bh = float(y2 - y1)
+
+    area = int(mask_utils.area(rle))
+
+    ann = {
+        "id": ann_id,
+        "image_id": image_id,
+        "category_id": int(category_id),
+        "segmentation": rle,
+        "area": area,
+        "bbox": [x, y, bw, bh],
+        "iscrowd": 0,
+        "score": float(det.score),  # COCO GT 不需要，但你这是推理结果，留着很有用
+    }
+    return ann
 
 # -----------------------------
 # Template base
@@ -384,6 +437,20 @@ class SegInferenceTemplate:
         skipped = 0
         newly_processed = 0
 
+        import json  # 放在文件顶部也行
+
+        coco = {
+            "images": [],
+            "annotations": [],
+            "categories": [
+                {"id": 1, "name": "wheat"}  # 你只有1类就这样；多类再扩展
+            ],
+        }
+        image_id_map = {}  # fname -> image_id
+        next_image_id = 1
+        next_ann_id = 1
+
+
         for img_path in tqdm(images, desc=f"{split.upper()} images", total=len(images)):
             fname = os.path.basename(img_path)
             if fname in done:
@@ -398,6 +465,35 @@ class SegInferenceTemplate:
             )
             pred_count = len(final_dets)
             gt_count = yolo_count_instances(yolo_label_path_for_image(img_path, self.dataset.yolo_root))
+
+            img0 = cv2.imread(img_path)
+            H, W = img0.shape[:2]
+
+            fname = os.path.basename(img_path)
+            if fname not in image_id_map:
+                image_id_map[fname] = next_image_id
+                coco["images"].append({
+                    "id": next_image_id,
+                    "file_name": fname,
+                    "height": H,
+                    "width": W
+                })
+                next_image_id += 1
+
+            image_id = image_id_map[fname]
+
+            for det in final_dets:
+                ann = detproposal_to_coco_ann(
+                    det=det,
+                    image_id=image_id,
+                    ann_id=next_ann_id,
+                    img_h=H,
+                    img_w=W,
+                    category_id=1
+                )
+                if ann is not None:
+                    coco["annotations"].append(ann)
+                    next_ann_id += 1
 
             if self.outputs.excel:
                 append_csv_row(csv_path, fname, gt_count, pred_count, write_header_if_new=True)
@@ -432,6 +528,11 @@ class SegInferenceTemplate:
                 scatter_path = os.path.join(run_dir, f"scatter_{split}.png")
                 self._draw_scatter(xs, ys, scatter_path)
                 print(f"[Saved] Scatter -> {scatter_path}")
+
+        json_path = os.path.join(run_dir, f"{split}_pred_coco.json")
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(coco, f, ensure_ascii=False)
+        print(f"[Saved] COCO JSON -> {json_path}")
 
         print(f"{split.upper()} finished. Outputs in: {run_dir}")
 
@@ -672,6 +773,10 @@ class SegInferenceTemplate:
 
         for d in dets:
             color = rng.integers(64, 256, size=3, dtype=np.uint8).tolist()
+
+            # 只绘制蓝色框，另外 mask 透明
+            color = (255, 0, 0)
+            alpha = 0
 
             H, W = img.shape[:2]
             y1o, x1o = int(d.top), int(d.left)
