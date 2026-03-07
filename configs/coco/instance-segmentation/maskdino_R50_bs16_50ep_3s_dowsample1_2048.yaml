@@ -1,4 +1,4 @@
-_BASE_: Base-COCO-InstanceSegmentation.yaml
+_BASE_: Wheat-COCO-InstanceSegmentation.yaml
 MODEL:
   META_ARCHITECTURE: "MaskDINO"
   SEM_SEG_HEAD:
@@ -29,7 +29,7 @@ MODEL:
     BOX_WEIGHT: 5.0
     GIOU_WEIGHT: 2.0
     HIDDEN_DIM: 256
-    NUM_OBJECT_QUERIES: 300
+    NUM_OBJECT_QUERIES: 900
     NHEADS: 8
     DROPOUT: 0.0
     DIM_FEEDFORWARD: 2048

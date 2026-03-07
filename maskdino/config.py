@@ -186,3 +186,5 @@ def add_maskdino_config(cfg):
     # 7
     cfg.INPUT.COLOR_AUG = False
     cfg.INPUT.ROTATE_AUG = False
+
+    cfg.SOLVER.GRAD_ACCUM_STEPS = 1
