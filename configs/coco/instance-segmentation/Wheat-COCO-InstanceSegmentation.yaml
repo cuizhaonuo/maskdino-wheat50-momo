@@ -57,8 +57,10 @@ SOLVER:
     NORM_TYPE: 2.0
   AMP:
     ENABLED: True
+  CHECKPOINT_PERIOD: 100 # 每个 epoch 都保存一次权重
+
 TEST:
-  EVAL_PERIOD: 10000   # 如果你原来想按 5000 iter(bs16) 验证一次，这里可翻倍
+  EVAL_PERIOD: 100 # 每个 epoch 都验证一次
 
 INPUT:
   IMAGE_SIZE: 1024
