@@ -162,3 +162,5 @@ def add_maskdino_config(cfg):
     cfg.MODEL.DINOV3_STA.CONV_INPLANE = 32
 
     cfg.Default_loading=True  # a bug in my d2. resume use this; if first time ResNet load, set it false
+
+    cfg.SOLVER.GRAD_ACCUM_STEPS = 1
