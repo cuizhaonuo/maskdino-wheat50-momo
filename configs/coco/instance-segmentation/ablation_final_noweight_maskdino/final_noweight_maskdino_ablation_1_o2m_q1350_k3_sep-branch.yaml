@@ -1,0 +1,15 @@
+_BASE_: ../final_noweight_maskdino_R50_bs16_50ep_3s_dowsample1_2048.yaml
+
+MODEL:
+  MaskDINO:
+    O2M_MATCHING_ENABLED: true
+    NUM_OBJECT_QUERIES_O2M: 1350
+    NUM_TARGETS_K: 3
+    SEP_BRANCH_ENABLED: true
+
+    DDQ_ENABLED: false
+    DDQ_IOU_THRESHOLD: 0.8
+    MATCHDER_NMS_ENABLED: false
+
+    LAYER_WISE_IOU_ENABLED: false
+    ALIGN_LOSS_ENABLED: false
