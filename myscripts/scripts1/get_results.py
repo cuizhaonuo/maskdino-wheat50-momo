@@ -10,9 +10,9 @@ import matplotlib.pyplot as plt
 # =========================
 # 路径配置
 # =========================
-MASKDINO_ROOT = Path("/public/home/zncui/pycharm_project/MaskDINO/output/normal")
+MASKDINO_ROOT = Path("/public/home/zncui/pycharm_project/MaskDINO/output/experiment-longsteps")
 MMDET_ROOT = Path("/public/home/zncui/pycharm_project/mmdetection/work_dirs/zhaoxian")
-OUT_DIR = Path("./metric_curve_plots")
+OUT_DIR = Path("./metric_curve_plots3")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -75,6 +75,17 @@ def is_mmdet_eval_record(d):
     return ("coco/bbox_mAP" in d) or ("coco/segm_mAP" in d)
 
 
+def round_metric_columns(df, decimals=4):
+    metric_cols = [
+        "bbox/AP", "bbox/AP50", "bbox/AP75", "bbox/APs", "bbox/APm", "bbox/APl",
+        "segm/AP", "segm/AP50", "segm/AP75", "segm/APs", "segm/APm", "segm/APl",
+    ]
+    for col in metric_cols:
+        if col in df.columns:
+            df[col] = df[col].round(decimals)
+    return df
+
+
 # =========================
 # 读取 MaskDINO
 # =========================
@@ -97,14 +108,20 @@ def collect_maskdino_eval_history(root: Path):
         if not records:
             continue
 
+        eval_idx = 0
         for d in records:
             if not is_maskdino_eval_record(d):
                 continue
-            print(d.get("bbox/AP"), ' -- ', d.get('iteration'))
+
+            eval_idx += 1
+
             rows.append({
                 "source": "MaskDINO",
                 "experiment": subdir.name,
                 "file": str(metric_file),
+                "iteration": safe_float(d.get("iteration")),
+                "epoch": safe_float(d.get("epoch")),
+                "eval_order_in_file": eval_idx,
 
                 "bbox/AP": safe_float(d.get("bbox/AP")),
                 "bbox/AP50": safe_float(d.get("bbox/AP50")),
@@ -150,14 +167,21 @@ def collect_mmdet_eval_history(root: Path):
         else:
             experiment = str(scalars_file.relative_to(root))
 
+        eval_idx = 0
         for d in records:
             if not is_mmdet_eval_record(d):
                 continue
+
+            eval_idx += 1
 
             rows.append({
                 "source": "MMDetection",
                 "experiment": experiment,
                 "file": str(scalars_file),
+                "step": safe_float(d.get("step")),
+                "epoch": safe_float(d.get("epoch")),
+                "iter": safe_float(d.get("iter")),
+                "eval_order_in_file": eval_idx,
 
                 "bbox/AP": normalize_percent(d.get("coco/bbox_mAP")),
                 "bbox/AP50": normalize_percent(d.get("coco/bbox_mAP_50")),
@@ -175,6 +199,141 @@ def collect_mmdet_eval_history(root: Path):
             })
 
     return rows
+
+
+# =========================
+# 提取每个模型最后一次评估结果
+# =========================
+def build_final_eval_table(df):
+    """
+    从全部评估历史中，提取每个 experiment_full 的最后一次评估结果
+    """
+    if df.empty:
+        return pd.DataFrame()
+
+    work_df = df.copy()
+    work_df = work_df.sort_values(["experiment_full", "eval_id"])
+
+    final_df = work_df.groupby("experiment_full", as_index=False).tail(1).copy()
+
+    preferred_cols = [
+        "source",
+        "experiment",
+        "experiment_full",
+        "eval_id",
+        "epoch",
+        "iteration",
+        "iter",
+        "step",
+        "bbox/AP",
+        "bbox/AP50",
+        "bbox/AP75",
+        "bbox/APs",
+        "bbox/APm",
+        "bbox/APl",
+        "segm/AP",
+        "segm/AP50",
+        "segm/AP75",
+        "segm/APs",
+        "segm/APm",
+        "segm/APl",
+        "file",
+    ]
+
+    final_cols = [c for c in preferred_cols if c in final_df.columns] + [
+        c for c in final_df.columns if c not in preferred_cols
+    ]
+    final_df = final_df[final_cols]
+
+    sort_cols = []
+    ascending = []
+    if "segm/AP" in final_df.columns:
+        sort_cols.append("segm/AP")
+        ascending.append(False)
+    if "bbox/AP" in final_df.columns:
+        sort_cols.append("bbox/AP")
+        ascending.append(False)
+
+    if sort_cols:
+        final_df = final_df.sort_values(sort_cols, ascending=ascending)
+
+    final_df = round_metric_columns(final_df, decimals=4)
+    final_df.reset_index(drop=True, inplace=True)
+    return final_df
+
+
+# =========================
+# 提取每个模型最佳 segm/AP
+# 规则：
+# 1. 每个模型内部找 segm/AP 最大
+# 2. 若 segm/AP 相同，取 eval_id 最大
+# 3. 每个模型只保留 1 条
+# =========================
+def build_best_segm_ap_table(df):
+    """
+    对每个模型（experiment_full）分别找出 segm/AP 最高的一次评估结果。
+    如果同一模型内部 segm/AP 并列最高，则选择 eval_id 最大的那一条。
+    最终每个模型只保留 1 条记录。
+    """
+    if df.empty or "segm/AP" not in df.columns:
+        return pd.DataFrame()
+
+    work_df = df.copy()
+    work_df = work_df[~work_df["segm/AP"].isna()].copy()
+
+    if work_df.empty:
+        return pd.DataFrame()
+
+    result_rows = []
+
+    for exp_name, sub_df in work_df.groupby("experiment_full"):
+        sub_df = sub_df.copy()
+
+        best_segm_ap = sub_df["segm/AP"].max()
+        candidate_df = sub_df[sub_df["segm/AP"] == best_segm_ap].copy()
+
+        best_row = candidate_df.sort_values("eval_id", ascending=True).tail(1)
+        result_rows.append(best_row)
+
+    best_df = pd.concat(result_rows, axis=0, ignore_index=True)
+
+    preferred_cols = [
+        "source",
+        "experiment",
+        "experiment_full",
+        "eval_id",
+        "epoch",
+        "iteration",
+        "iter",
+        "step",
+        "bbox/AP",
+        "bbox/AP50",
+        "bbox/AP75",
+        "bbox/APs",
+        "bbox/APm",
+        "bbox/APl",
+        "segm/AP",
+        "segm/AP50",
+        "segm/AP75",
+        "segm/APs",
+        "segm/APm",
+        "segm/APl",
+        "file",
+    ]
+
+    final_cols = [c for c in preferred_cols if c in best_df.columns] + [
+        c for c in best_df.columns if c not in preferred_cols
+    ]
+    best_df = best_df[final_cols]
+
+    best_df = best_df.sort_values(
+        by=["segm/AP", "bbox/AP", "experiment_full"],
+        ascending=[False, False, True]
+    )
+
+    best_df = round_metric_columns(best_df, decimals=4)
+    best_df.reset_index(drop=True, inplace=True)
+    return best_df
 
 
 # =========================
@@ -285,15 +444,55 @@ def main():
     # 完整实验名，避免重名
     df["experiment_full"] = df["source"] + "/" + df["experiment"]
 
-    # 保证原始顺序下，每个实验的评估编号为 1,2,3,...
+    # 保证每个实验评估编号为 1,2,3,...
     df["eval_id"] = df.groupby("experiment_full").cumcount() + 1
 
     bbox_cols = ["bbox/AP", "bbox/AP50", "bbox/AP75", "bbox/APs", "bbox/APm", "bbox/APl"]
     segm_cols = ["segm/AP", "segm/AP50", "segm/AP75", "segm/APs", "segm/APm", "segm/APl"]
 
-    # 保存总表
-    df.to_csv(OUT_DIR / "all_eval_history.csv", index=False, encoding="utf-8-sig")
-    print(f"[INFO] 保存 CSV: {OUT_DIR / 'all_eval_history.csv'}")
+    df = round_metric_columns(df, decimals=4)
+
+    # 保存总历史表
+    history_csv = OUT_DIR / "all_eval_history.csv"
+    history_xlsx = OUT_DIR / "all_eval_history.xlsx"
+    df.to_csv(history_csv, index=False, encoding="utf-8-sig")
+    df.to_excel(history_xlsx, index=False)
+    print(f"[INFO] 保存 CSV: {history_csv}")
+    print(f"[INFO] 保存 Excel: {history_xlsx}")
+
+    # 每个模型最后一次评估结果
+    final_df = build_final_eval_table(df)
+
+    final_csv = OUT_DIR / "final_eval_results.csv"
+    final_xlsx = OUT_DIR / "final_eval_results.xlsx"
+    final_df.to_csv(final_csv, index=False, encoding="utf-8-sig")
+    final_df.to_excel(final_xlsx, index=False)
+
+    print(f"[INFO] 保存最后一次评估结果 CSV: {final_csv}")
+    print(f"[INFO] 保存最后一次评估结果 Excel: {final_xlsx}")
+
+    print("\n========== 每个模型最后一次评估结果 ==========")
+    with pd.option_context("display.max_columns", None, "display.width", 200):
+        print(final_df)
+
+    # 每个模型最佳 segm/AP，若 segm/AP 相同则取 eval_id 最大
+    best_segm_df = build_best_segm_ap_table(df)
+
+    if not best_segm_df.empty:
+        best_csv = OUT_DIR / "best_segm_ap_result.csv"
+        best_xlsx = OUT_DIR / "best_segm_ap_result.xlsx"
+
+        best_segm_df.to_csv(best_csv, index=False, encoding="utf-8-sig")
+        best_segm_df.to_excel(best_xlsx, index=False)
+
+        print(f"[INFO] 保存每个模型最佳 segm/AP 结果 CSV: {best_csv}")
+        print(f"[INFO] 保存每个模型最佳 segm/AP 结果 Excel: {best_xlsx}")
+
+        print("\n========== 每个模型最佳 segm/AP 结果（若并列取 eval_id 最大）==========")
+        with pd.option_context("display.max_columns", None, "display.width", 200):
+            print(best_segm_df)
+    else:
+        print("[WARN] 没有找到有效的 segm/AP 结果，未生成 best_segm_ap_result 文件")
 
     # 分组大图
     plot_metric_group_curves(
