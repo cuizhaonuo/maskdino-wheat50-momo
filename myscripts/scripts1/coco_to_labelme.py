@@ -153,7 +153,45 @@ def bbox_to_rectangle_shape(bbox, label, score=None, group_id=None):
     }
 
 
-def rle_segmentation_to_shapes(segmentation, label, score=None, group_id=None):
+def simplify_polygon_points(points, simplify_epsilon_ratio=0.003, max_points=80):
+    """Simplify dense polygon points for easier manual editing in LabelMe."""
+    if not isinstance(points, list) or len(points) < 3:
+        return points
+
+    simplified = points
+
+    # Prefer Douglas-Peucker simplification when OpenCV/Numpy are available.
+    if cv2 is not None and np is not None and simplify_epsilon_ratio > 0:
+        try:
+            contour = np.array(points, dtype=np.float32).reshape((-1, 1, 2))
+            perimeter = cv2.arcLength(contour, True)
+            epsilon = max(0.5, perimeter * float(simplify_epsilon_ratio))
+            approx = cv2.approxPolyDP(contour, epsilon, True)
+            if approx is not None and len(approx) >= 3:
+                simplified = [[float(p[0][0]), float(p[0][1])] for p in approx]
+        except Exception:
+            simplified = points
+
+    # Hard cap point count to avoid over-dense polygons.
+    if isinstance(max_points, int) and max_points >= 3 and len(simplified) > max_points:
+        step = max(1, len(simplified) // max_points)
+        sampled = simplified[::step]
+        if len(sampled) > max_points:
+            sampled = sampled[:max_points]
+        if len(sampled) >= 3:
+            simplified = sampled
+
+    return simplified
+
+
+def rle_segmentation_to_shapes(
+    segmentation,
+    label,
+    score=None,
+    group_id=None,
+    simplify_epsilon_ratio=0.003,
+    polygon_max_points=80,
+):
     shapes = []
 
     if mask_utils is None or cv2 is None or np is None:
@@ -173,7 +211,14 @@ def rle_segmentation_to_shapes(segmentation, label, score=None, group_id=None):
 
     try:
         if isinstance(counts, list):
-            rle = mask_utils.frPyObjects(segmentation, height, width)
+            # Uncompressed RLE: convert counts list to encoded RLE first.
+            rle_objs = mask_utils.frPyObjects(counts, height, width)
+            if isinstance(rle_objs, list):
+                if not rle_objs:
+                    return shapes
+                rle = rle_objs[0]
+            else:
+                rle = rle_objs
         else:
             rle = segmentation
 
@@ -198,6 +243,12 @@ def rle_segmentation_to_shapes(segmentation, label, score=None, group_id=None):
             x, y = p[0]
             points.append([float(x), float(y)])
 
+        points = simplify_polygon_points(
+            points,
+            simplify_epsilon_ratio=simplify_epsilon_ratio,
+            max_points=polygon_max_points,
+        )
+
         if len(points) < 3:
             continue
 
@@ -213,7 +264,14 @@ def rle_segmentation_to_shapes(segmentation, label, score=None, group_id=None):
     return shapes
 
 
-def segmentation_to_shapes(segmentation, label, score=None, group_id=None):
+def segmentation_to_shapes(
+    segmentation,
+    label,
+    score=None,
+    group_id=None,
+    simplify_epsilon_ratio=0.003,
+    polygon_max_points=80,
+):
     """
     支持两种格式：
     1) polygon: [[x1,y1,x2,y2,...], [...]]
@@ -235,6 +293,14 @@ def segmentation_to_shapes(segmentation, label, score=None, group_id=None):
                 y = float(seg[i + 1])
                 points.append([x, y])
 
+            points = simplify_polygon_points(
+                points,
+                simplify_epsilon_ratio=simplify_epsilon_ratio,
+                max_points=polygon_max_points,
+            )
+            if len(points) < 3:
+                continue
+
             shape = {
                 "label": label,
                 "points": points,
@@ -253,6 +319,8 @@ def segmentation_to_shapes(segmentation, label, score=None, group_id=None):
             label=label,
             score=score,
             group_id=group_id,
+            simplify_epsilon_ratio=simplify_epsilon_ratio,
+            polygon_max_points=polygon_max_points,
         )
         return shapes, "rle"
 
@@ -327,6 +395,18 @@ def main():
         action="store_true",
         help="是否在 description 中写入 score"
     )
+    parser.add_argument(
+        "--polygon_simplify_epsilon_ratio",
+        type=float,
+        default=0.003,
+        help="多边形简化强度(相对轮廓周长比例)，越大点越少，默认 0.003"
+    )
+    parser.add_argument(
+        "--polygon_max_points",
+        type=int,
+        default=80,
+        help="每个 polygon 最多保留点数，默认 80"
+    )
     args = parser.parse_args()
 
     coco_json_path = Path(args.coco_json)
@@ -376,7 +456,9 @@ def main():
                 segmentation=segmentation,
                 label=label,
                 score=score if args.include_score else None,
-                group_id=idx
+                group_id=idx,
+                simplify_epsilon_ratio=args.polygon_simplify_epsilon_ratio,
+                polygon_max_points=args.polygon_max_points,
             )
 
             if seg_mode == "rle" and ann_shapes:
@@ -415,9 +497,15 @@ def main():
     print(f"RLE 转 polygon 成功 {total_rle_ok} 个标注")
     print(f"bbox 回退写入 {total_bbox_fallback} 个标注")
     print(f"无法转换并跳过 {total_empty_ann} 个标注")
+    print(
+        "polygon 简化参数: "
+        f"epsilon_ratio={args.polygon_simplify_epsilon_ratio}, "
+        f"max_points={args.polygon_max_points}"
+    )
     print(f"完成，总共写入 {total_written} 个 LabelMe json")
     print(f"缺失原图映射 {total_missing} 个")
 
 
 if __name__ == "__main__":
     main()
+
