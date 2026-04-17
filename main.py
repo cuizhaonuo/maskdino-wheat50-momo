@@ -5,6 +5,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Optional, Tuple, List, Dict
 
 import cv2
@@ -12,6 +13,11 @@ import numpy as np
 import torch
 import torch.fx
 import distutils.version
+
+try:
+    from openpyxl import load_workbook
+except ImportError:  # pragma: no cover
+    load_workbook = None
 
 # Ensure project-root imports work when running this file directly.
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -46,6 +52,10 @@ class InferenceSettings:
     nms_iou_thr: float = 0.3
     base_keep_score: float = 0.01
     polygon_epsilon: float = 2.0
+
+
+ERROR_PATH_COLUMN = "文件夹路径"
+ERROR_PATH_PREFIX = "/media/ubuntu/农场数据采集硬盘1"
 
 
 class InstanceSegService:
@@ -217,6 +227,94 @@ def write_log_line(log_path: str, stem: str, status_code: int):
         f.write(f"{stem}#{status_code}\n")
 
 
+def normalize_error_path(raw_path: str) -> Optional[Path]:
+    path_text = raw_path.strip().replace("\\", "/")
+    if not path_text:
+        return None
+
+    if path_text == ERROR_PATH_PREFIX:
+        return None
+    if path_text.startswith(ERROR_PATH_PREFIX + "/"):
+        path_text = path_text[len(ERROR_PATH_PREFIX) + 1 :]
+
+    return Path(path_text.lstrip("/"))
+
+
+def load_skip_dirs_from_excel(error_file: str, root: Path) -> set[Path]:
+    if load_workbook is None:
+        print("openpyxl is not installed, skip error-file filtering.")
+        return set()
+
+    excel_path = Path(error_file).expanduser()
+    if not excel_path.is_absolute():
+        excel_path = (Path.cwd() / excel_path).resolve(strict=False)
+
+    if not excel_path.exists():
+        print(f"error_file not found: {excel_path}, skip filtering.")
+        return set()
+
+    try:
+        wb = load_workbook(excel_path, read_only=True, data_only=True)
+    except Exception as exc:
+        print(f"failed to read error_file {excel_path}: {exc}")
+        return set()
+
+    ws = wb.active
+    header = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), None)
+    if not header:
+        wb.close()
+        print(f"{excel_path} has empty header, skip filtering.")
+        return set()
+
+    title_to_idx = {
+        str(col).strip(): idx for idx, col in enumerate(header) if col is not None and str(col).strip()
+    }
+    if ERROR_PATH_COLUMN not in title_to_idx:
+        wb.close()
+        print(f"{excel_path} missing column '{ERROR_PATH_COLUMN}', skip filtering.")
+        return set()
+
+    col_idx = title_to_idx[ERROR_PATH_COLUMN]
+    root_resolved = root.resolve(strict=False)
+    skip_dirs: set[Path] = set()
+    ignored_rows = 0
+
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        value = row[col_idx] if col_idx < len(row) else None
+        if value is None:
+            continue
+
+        rel_path = normalize_error_path(str(value))
+        if rel_path is None:
+            ignored_rows += 1
+            continue
+
+        candidate = (root / rel_path).resolve(strict=False)
+        try:
+            candidate.relative_to(root_resolved)
+        except ValueError:
+            ignored_rows += 1
+            continue
+
+        if candidate.exists() and candidate.is_dir():
+            skip_dirs.add(candidate)
+
+    wb.close()
+    print(f"Loaded {len(skip_dirs)} skipped directories from error_file (ignored rows: {ignored_rows}).")
+    return skip_dirs
+
+
+def is_under_skipped_dir(path: Path, scan_root: Path, skip_dirs: set[Path]) -> bool:
+    current = path.resolve(strict=False)
+    root_resolved = scan_root.resolve(strict=False)
+    while True:
+        if current in skip_dirs:
+            return True
+        if current == root_resolved or current.parent == current:
+            return False
+        current = current.parent
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Batch instance segmentation runner")
     parser.add_argument("-i", "--input_dir", required=True, help="Input image directory")
@@ -228,6 +326,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=parse_bool,
         default=True,
         help="Whether to save overlay images, default: true",
+    )
+    parser.add_argument(
+        "-r",
+        "--error_file",
+        default=None,
+        help="Optional Excel file used to skip listed directories",
     )
 
     parser.add_argument("--model_config_rel", default=InferenceSettings.model_config_rel)
@@ -260,6 +364,7 @@ def main():
     saved_images_dir = os.path.join(output_dir, "saved_images")
     if save_images:
         os.makedirs(saved_images_dir, exist_ok=True)
+    input_root_name = os.path.basename(os.path.normpath(input_dir))
 
     settings = InferenceSettings(
         project_root=PROJECT_ROOT,
@@ -275,10 +380,34 @@ def main():
     )
 
     service = InstanceSegService(settings)
-    image_paths = list_images_in_dir(input_dir)
+
+    # Filter images by supported extensions, case-insensitive
+    valid_extensions = {".jpg", ".jpeg", ".png"}
+    skip_dirs: set[Path] = set()
+    if args.error_file:
+        skip_dirs = load_skip_dirs_from_excel(args.error_file, Path(input_dir))
+
+    all_image_paths = list_images_in_dir(input_dir)
+    image_paths = [p for p in all_image_paths if os.path.splitext(p)[1].lower() in valid_extensions]
+    if skip_dirs:
+        filtered_paths = []
+        skipped_images = 0
+        input_root_path = Path(input_dir)
+        for p in image_paths:
+            parent_dir = Path(p).resolve(strict=False).parent
+            if is_under_skipped_dir(parent_dir, input_root_path, skip_dirs):
+                skipped_images += 1
+                continue
+            filtered_paths.append(p)
+        image_paths = filtered_paths
+        print(f"Skip {skipped_images} images by error_file, remain {len(image_paths)} images for inference.")
 
     records = []
     for img_path in image_paths:
+        abs_img_path = os.path.abspath(img_path)
+        # Keep input_dir as the root so saved_images starts from input folder name.
+        rel_path = os.path.relpath(abs_img_path, start=input_dir)
+        rel_dir = os.path.dirname(rel_path)
         stem = os.path.splitext(os.path.basename(img_path))[0]
         write_log_line(log_path, stem, 1)
 
@@ -287,7 +416,10 @@ def main():
             saved_overlay = ""
             if save_images:
                 overlay = service.render_overlay(img_path, dets)
-                saved_overlay = os.path.join(saved_images_dir, f"{stem}_overlay.jpg")
+                target_dir = os.path.join(saved_images_dir, input_root_name, rel_dir)
+                os.makedirs(target_dir, exist_ok=True)
+                ext = os.path.splitext(os.path.basename(img_path))[1] or ".jpg"
+                saved_overlay = os.path.join(target_dir, f"{stem}{ext}")
                 cv2.imwrite(saved_overlay, overlay)
 
             record = {

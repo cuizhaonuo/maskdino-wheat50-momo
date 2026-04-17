@@ -22,7 +22,6 @@ Notes
 import os
 import sys
 import math
-import glob
 import argparse
 import random
 from enum import Enum
@@ -93,10 +92,17 @@ def ensure_dir(p: str):
     os.makedirs(p, exist_ok=True)
 
 def list_images_in_dir(d: str) -> List[str]:
-    exts = ("*.jpg", "*.jpeg", "*.png", "*.bmp", "*.tif", "*.tiff", "*.JPG", "*.JPEG", "*.PNG", "*.BMP", "*.TIF", "*.TIFF")
-    files = []
-    for e in exts:
-        files.extend(glob.glob(os.path.join(d, e)))
+    root = os.path.abspath(os.path.expanduser(d))
+    if not os.path.isdir(root):
+        return []
+
+    valid_exts = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+    files: List[str] = []
+    for cur_dir, _, names in os.walk(root):
+        for name in names:
+            if os.path.splitext(name)[1].lower() in valid_exts:
+                files.append(os.path.join(cur_dir, name))
+
     files.sort()
     return files
 
