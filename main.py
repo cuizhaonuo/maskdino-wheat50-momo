@@ -33,7 +33,6 @@ from myscripts.seg_infer import (
     OutputOptions,
     SearchSpace,
     SlidingWindowConfig,
-    list_images_in_dir,
 )
 
 
@@ -240,6 +239,34 @@ def normalize_error_path(raw_path: str) -> Optional[Path]:
     return Path(path_text.lstrip("/"))
 
 
+def candidate_dirs_from_rel_path(root: Path, rel_path: Path) -> List[Path]:
+    """Build candidate directories under root for a normalized error-file path."""
+    root_resolved = root.resolve(strict=False)
+    candidates: List[Path] = []
+    seen: set[Path] = set()
+
+    def _push(p: Path):
+        p = p.resolve(strict=False)
+        if p in seen:
+            return
+        seen.add(p)
+        candidates.append(p)
+
+    # Default behavior: treat rel_path as relative to scan root.
+    _push(root_resolved / rel_path)
+
+    # If input_dir is already a child root (e.g. .../2025定兴基地玉米收集数据),
+    # trim the leading matching segment from rel_path.
+    parts = rel_path.parts
+    if parts:
+        matched_indices = [i for i, part in enumerate(parts) if part == root_resolved.name]
+        for i in matched_indices:
+            trimmed = Path(*parts[i + 1 :]) if i + 1 < len(parts) else Path(".")
+            _push(root_resolved / trimmed)
+
+    return candidates
+
+
 def load_skip_dirs_from_excel(error_file: str, root: Path) -> set[Path]:
     if load_workbook is None:
         print("openpyxl is not installed, skip error-file filtering.")
@@ -289,15 +316,20 @@ def load_skip_dirs_from_excel(error_file: str, root: Path) -> set[Path]:
             ignored_rows += 1
             continue
 
-        candidate = (root / rel_path).resolve(strict=False)
-        try:
-            candidate.relative_to(root_resolved)
-        except ValueError:
-            ignored_rows += 1
-            continue
+        matched = False
+        for candidate in candidate_dirs_from_rel_path(root, rel_path):
+            try:
+                candidate.relative_to(root_resolved)
+            except ValueError:
+                continue
 
-        if candidate.exists() and candidate.is_dir():
-            skip_dirs.add(candidate)
+            if candidate.exists() and candidate.is_dir():
+                skip_dirs.add(candidate)
+                matched = True
+                break
+
+        if not matched:
+            ignored_rows += 1
 
     wb.close()
     print(f"Loaded {len(skip_dirs)} skipped directories from error_file (ignored rows: {ignored_rows}).")
@@ -313,6 +345,30 @@ def is_under_skipped_dir(path: Path, scan_root: Path, skip_dirs: set[Path]) -> b
         if current == root_resolved or current.parent == current:
             return False
         current = current.parent
+
+
+def list_images_in_dir_with_prune(root: Path, skip_dirs: set[Path], valid_extensions: set[str]) -> List[str]:
+    root_resolved = root.resolve(strict=False)
+    image_paths: List[str] = []
+
+    for current_dir, dirs, files in os.walk(root_resolved, topdown=True):
+        current_path = Path(current_dir).resolve(strict=False)
+
+        # Prune directories listed in error_file so their subtree is never scanned.
+        if is_under_skipped_dir(current_path, root_resolved, skip_dirs):
+            dirs[:] = []
+            continue
+
+        dirs[:] = [d for d in dirs if not is_under_skipped_dir(current_path / d, root_resolved, skip_dirs)]
+
+        for file_name in files:
+            file_path = current_path / file_name
+            if file_path.suffix.lower() not in valid_extensions:
+                continue
+            image_paths.append(str(file_path))
+
+    image_paths.sort()
+    return image_paths
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -387,20 +443,9 @@ def main():
     if args.error_file:
         skip_dirs = load_skip_dirs_from_excel(args.error_file, Path(input_dir))
 
-    all_image_paths = list_images_in_dir(input_dir)
-    image_paths = [p for p in all_image_paths if os.path.splitext(p)[1].lower() in valid_extensions]
+    image_paths = list_images_in_dir_with_prune(Path(input_dir), skip_dirs, valid_extensions)
     if skip_dirs:
-        filtered_paths = []
-        skipped_images = 0
-        input_root_path = Path(input_dir)
-        for p in image_paths:
-            parent_dir = Path(p).resolve(strict=False).parent
-            if is_under_skipped_dir(parent_dir, input_root_path, skip_dirs):
-                skipped_images += 1
-                continue
-            filtered_paths.append(p)
-        image_paths = filtered_paths
-        print(f"Skip {skipped_images} images by error_file, remain {len(image_paths)} images for inference.")
+        print(f"Collected {len(image_paths)} images after pruning directories from error_file.")
 
     records = []
     for img_path in image_paths:
