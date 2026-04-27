@@ -371,6 +371,56 @@ def list_images_in_dir_with_prune(root: Path, skip_dirs: set[Path], valid_extens
     return image_paths
 
 
+def _format_hms(seconds: float) -> str:
+    secs = max(0, int(seconds))
+    h, rem = divmod(secs, 3600)
+    m, s = divmod(rem, 60)
+    if h > 0:
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+
+def print_infer_progress(
+    current: int,
+    total: int,
+    success: int,
+    failed: int,
+    width: int = 28,
+    *,
+    last_sec: Optional[float] = None,
+    elapsed_sec: Optional[float] = None,
+    eta_sec: Optional[float] = None,
+):
+    if total <= 0:
+        return
+
+    elapsed_text = _format_hms(elapsed_sec or 0.0) if elapsed_sec is not None else "--:--"
+    eta_text = _format_hms(eta_sec or 0.0) if eta_sec is not None else "--:--"
+    per_text = f"{last_sec:.2f}s/img" if last_sec is not None else "--.--s/img"
+
+    speed_text = "--.--it/s"
+    if elapsed_sec is not None and elapsed_sec > 0 and current > 0:
+        speed_text = f"{(current / elapsed_sec):.2f}it/s"
+
+    if sys.stdout.isatty():
+        ratio = max(0.0, min(1.0, float(current) / float(total)))
+        filled = int(round(width * ratio))
+        bar = "=" * filled + "-" * max(0, width - filled)
+        line = (
+            f"\rInfer progress [{bar}] {current}/{total} "
+            f"({ratio * 100:5.1f}%) ok:{success} fail:{failed} "
+            f"| {per_text} | elapsed {elapsed_text} | eta {eta_text} | {speed_text}"
+        )
+        end = "\n" if current >= total else ""
+        print(line, end=end, flush=True)
+    else:
+        print(
+            f"Infer progress {current}/{total} ok:{success} fail:{failed} "
+            f"| {per_text} | elapsed {elapsed_text} | eta {eta_text} | {speed_text}",
+            flush=True,
+        )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Batch instance segmentation runner")
     parser.add_argument("-i", "--input_dir", required=True, help="Input image directory")
@@ -448,7 +498,15 @@ def main():
         print(f"Collected {len(image_paths)} images after pruning directories from error_file.")
 
     records = []
-    for img_path in image_paths:
+    total_images = len(image_paths)
+    success_count = 0
+    failed_count = 0
+    batch_start_ts = time.time()
+    if total_images > 0:
+        print_infer_progress(0, total_images, success_count, failed_count, elapsed_sec=0.0, eta_sec=None)
+
+    for idx, img_path in enumerate(image_paths, start=1):
+        iter_start_ts = time.time()
         abs_img_path = os.path.abspath(img_path)
         # Keep input_dir as the root so saved_images starts from input folder name.
         rel_path = os.path.relpath(abs_img_path, start=input_dir)
@@ -477,6 +535,7 @@ def main():
             }
             records.append(record)
             write_log_line(log_path, stem, 2)
+            success_count += 1
         except Exception as e:
             records.append(
                 {
@@ -490,6 +549,21 @@ def main():
                 }
             )
             write_log_line(log_path, stem, 3)
+            failed_count += 1
+
+        iter_elapsed = max(0.0, time.time() - iter_start_ts)
+        elapsed = max(0.0, time.time() - batch_start_ts)
+        avg_per_image = (elapsed / idx) if idx > 0 else 0.0
+        eta = avg_per_image * max(0, total_images - idx)
+        print_infer_progress(
+            idx,
+            total_images,
+            success_count,
+            failed_count,
+            last_sec=iter_elapsed,
+            elapsed_sec=elapsed,
+            eta_sec=eta,
+        )
 
     with open(output_json_path, "w", encoding="utf-8") as f:
         json.dump({"results": records}, f, ensure_ascii=False, indent=2)
@@ -513,3 +587,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
