@@ -368,12 +368,6 @@ class MaskDINODecoder(nn.Module):
         :param masks: mask in the original image
         :param targets: used for denoising training
         """
-
-        # debug: encoder 输出的 feature 画热力图
-        # x: dict of feature maps Tensor (B, C, H, W)
-        # from maskdino.analysis.tool_lab import draw_encoder_heatmap
-        # draw_encoder_heatmap(x)
-
         assert len(x) == self.num_feature_levels
         device = x[0].device
         # size_list = []
@@ -416,40 +410,9 @@ class MaskDINODecoder(nn.Module):
             # enc_outputs_coord_unselected = output_proposals
             topk = self.num_queries
             topk_proposals = torch.topk(enc_outputs_class_unselected.max(-1)[0], topk, dim=1)[1]
-
-            # from maskdino.ctx import indices_ctx
-            # indices = indices_ctx.get()
-
-            # debug: 检查预测 target_id = 22 实例的位点
-            # if indices is not None:
-            #     target_index = torch.where(indices[0][1] == 22)[0]  # 这里 target_id = 22
-            #     # target_id = indices[0][1][target_index]
-            #     pred_id = indices[0][0][target_index]
-            #     print('pred_id: ', pred_id)
-
-            # debug: 查看 enc_outputs_class_unselected 类别热力图
-            # from maskdino.analysis.tool_lab import draw_encoder_class_heatmap
-            # draw_encoder_class_heatmap(enc_outputs_class_unselected.max(-1)[0][0], level_start_index, spatial_shapes)
-
-            # from maskdino.ctx import draw_encoder_class_vars_ctx
-            # draw_encoder_class_vars = (enc_outputs_class_unselected.max(-1)[0][0], level_start_index, spatial_shapes)
-            # draw_encoder_class_vars_ctx.set(draw_encoder_class_vars)
-
-            # debug: 探索 topk 来自哪些 feature level
-            # from maskdino.analysis.tool_lab import check_topk_proposals
-            # check_topk_proposals(topk_proposals, level_start_index)
-
             refpoint_embed_undetach = torch.gather(enc_outputs_coord_unselected, 1,
                                                    topk_proposals.unsqueeze(-1).repeat(1, 1, 4))  # unsigmoid
             refpoint_embed = refpoint_embed_undetach.detach()
-
-            # debug: 观察偏移点
-            # from maskdino.analysis.tool_lab import draw_center_point_on_image
-            # proposal_boxes = torch.gather(output_proposals, 1,
-            #                                        topk_proposals.unsqueeze(-1).repeat(1, 1, 4))
-            # draw_center_point_on_image(refpoint_embed.sigmoid()[0], proposal_boxes.sigmoid()[0])
-
-
             tgt_undetach = torch.gather(output_memory, 1,
                                   topk_proposals.unsqueeze(-1).repeat(1, 1, self.hidden_dim))  # unsigmoid
 
@@ -461,13 +424,6 @@ class MaskDINODecoder(nn.Module):
             interm_outputs['pred_logits'] = outputs_class
             interm_outputs['pred_boxes'] = refpoint_embed_undetach.sigmoid()
             interm_outputs['pred_masks'] = outputs_mask
-
-            # debug: pred_boxes 中间结果绘制到图像上
-            # from maskdino.analysis.tool_lab import draw_bboxes_on_image
-            # draw_bboxes_on_image(interm_outputs['pred_boxes'][0])
-            # debug: pred_boxes 绘制到 heatmap 上
-            # from maskdino.analysis.tool_lab import draw_bboxes_on_heatmap
-            # draw_bboxes_on_heatmap(x, refpoint_embed.sigmoid()[0], proposal_boxes.sigmoid()[0], topk_proposals[0], level_start_index)
 
             if self.initialize_box_type != 'no':
                 # convert masks into boxes to better initialize box in the decoder
@@ -483,11 +439,6 @@ class MaskDINODecoder(nn.Module):
                 refpoint_embed = box_ops.box_xyxy_to_cxcywh(refpoint_embed) / torch.as_tensor([w, h, w, h],
                                                                                               dtype=torch.float).to(device)
                 refpoint_embed = refpoint_embed.reshape(outputs_mask.shape[0], outputs_mask.shape[1], 4)
-
-                # debug 检查召回率
-                # from maskdino.analysis.tool_lab import check_recall
-                # check_recall(refpoint_embed, targets)
-
                 refpoint_embed = inverse_sigmoid(refpoint_embed)
         elif not self.two_stage:
             tgt = self.query_feat.weight[None].repeat(bs, 1, 1)
@@ -621,13 +572,6 @@ class MaskDINODecoder(nn.Module):
         }
         if self.two_stage:
             out['interm_outputs'] = interm_outputs
-        # debug: 观察一下经过 decoder之后每个 query score 的变化
-        # from maskdino.analysis.tool_lab import analyze_query_scores
-        # analyze_query_scores(out)
-
-        # debug: 可视化每次 decoder 的输出结果
-        # from maskdino.analysis.tool_lab import visualize_decoder_outputs
-        # visualize_decoder_outputs(out)
         return out, mask_dict
 
     def forward_prediction_heads(self, output, mask_features, pred_mask=True):

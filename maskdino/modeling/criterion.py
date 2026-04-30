@@ -49,7 +49,8 @@ def sigmoid_focal_loss(inputs, targets, num_boxes, alpha: float = 0.25, gamma: f
         alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
         loss = alpha_t * loss
 
-
+    # loss.mean(1), the loss of all queries in this batch averaged
+    # .sun(), the loss of all batches summed
     return loss.mean(1).sum() / num_boxes
 
 
@@ -355,11 +356,9 @@ class SetCriterion(nn.Module):
                     output_idx = tgt_idx = torch.tensor([]).long().cuda()
                 exc_idx.append((output_idx, tgt_idx))
         indices = self.matcher(outputs_without_aux, targets)
-        # debug: 可视化正负样本匹配结果
-        # from maskdino.analysis.tool_lab import visualize_matching
-        # visualize_matching(indices, outputs, targets)
 
-        # Compute the average number of target boxes accross all nodes, for normalization purposes
+        # If you run code at only 1 gpu, then you can jump this part below
+        # Compute the average number of target boxes across all nodes, for normalization purposes
         num_masks = sum(len(t["labels"]) for t in targets)
         num_masks = torch.as_tensor(
             [num_masks], dtype=torch.float, device=next(iter(outputs.values())).device

@@ -116,7 +116,6 @@ class HungarianMatcher(nn.Module):
         bs, num_queries = outputs["pred_logits"].shape[:2]
 
         indices = []
-        C_list = []
         # Iterate through batch size
         for b in range(bs):
             out_bbox = outputs["pred_boxes"][b]
@@ -135,13 +134,6 @@ class HungarianMatcher(nn.Module):
             gamma = 2.0
             neg_cost_class = (1 - alpha) * (out_prob ** gamma) * (-(1 - out_prob + 1e-8).log())
             pos_cost_class = alpha * ((1 - out_prob) ** gamma) * (-(out_prob + 1e-8).log())
-            # debug: 获取 neg_cost_class 和 pos_cost_class 的柱状图
-            # from maskdino.analysis.tool_lab import draw_neg_and_post
-            # draw_neg_and_post(neg_cost_class, pos_cost_class)
-
-            # debug
-            # from maskdino.analysis.tool_lab import temporal_diff_bar_scatter
-            # temporal_diff_bar_scatter(self, neg_cost_class, pos_cost_class)
 
             cost_class = pos_cost_class[:, tgt_ids] - neg_cost_class[:, tgt_ids]
 
@@ -208,68 +200,7 @@ class HungarianMatcher(nn.Module):
             )
             C = C.reshape(num_queries, -1).cpu()
 
-            # debug: 可视化 cost_xxx 在 C 中的占比
-            # from maskdino.analysis.tool_lab import visualize_cost_components, visualize_cost_components_bar_sorted
-            # no weighted
-            # visualize_cost_components(C, cost_class, cost_mask, cost_dice,
-            #                           cost_bbox, cost_giou)
-            # add weighted
-            # visualize_cost_components(C,
-            #                           self.cost_class * cost_class,
-            #                           self.cost_mask * cost_mask,
-            #                           self.cost_dice * cost_dice,
-            #                           self.cost_box * cost_bbox,
-            #                           self.cost_giou * cost_giou,
-            #                           outputs,
-            #                           targets)
-            # visualize_cost_components_bar_sorted(C,
-            #                           self.cost_class * cost_class,
-            #                           self.cost_mask * cost_mask,
-            #                           self.cost_dice * cost_dice,
-            #                           self.cost_box * cost_bbox,
-            #                           self.cost_giou * cost_giou,
-            #                           outputs,
-            #                           targets)
-
-
-            # debug: 绘制cost矩阵热力图
-            # from maskdino.analysis.tool_lab import save_cost_matrix_heatmap
-            # src_id, tgt_id = linear_sum_assignment(C)
-            # save_cost_matrix_heatmap(C, src_id, tgt_id, 'cost_matrix_C.jpg')
-
-            # debug: 检验是否 cost 最小的行就是匹配结果
-            # print(f"batch idx: {b}")
-            # import numpy as np
-            # C = np.asarray(C)
-            # src_id, tgt_id = linear_sum_assignment(C)
-            # min_cost_rows = np.sum(C, axis=1)
-            # idx = np.argsort(min_cost_rows)[:len(tgt_id)]
-            # # min_vals = min_cost_rows[idx]
-            # # for i, v in zip(idx, min_vals):
-            # #     print(f"Row {i} min cost: {v}")
-            # matched_count = 0
-            # for i in src_id:
-            #     if i in idx:
-            #         matched_count += 1
-            #         # print("index match found in min cost rows:", i)
-            # print(f"Matched count in min cost rows: {matched_count} / {len(tgt_id)}")
-
-            C_list.append(C)
-            # C_list.append(self.cost_class * cost_class.cpu())
             indices.append(linear_sum_assignment(C))
-
-
-        # debug: 统计每个query被匹配的次数
-        # from maskdino.analysis.tool_lab import count_query_frequency
-        # count_query_frequency(indices)
-
-        # debug: 可视化 target 对应的每个 query
-        # from maskdino.analysis.tool_lab import visualize_matched_queries
-        # visualize_matched_queries(outputs, targets, indices, C_list)
-
-        # debug: 绘制 class 柱形图
-        # from maskdino.analysis.tool_lab import plot_class_distribution
-        # plot_class_distribution(outputs)
 
         return [
             (torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64))

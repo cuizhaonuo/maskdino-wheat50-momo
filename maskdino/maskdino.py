@@ -246,34 +246,10 @@ class MaskDINO(nn.Module):
                         Each dict contains keys "id", "category_id", "isthing".
         """
         images = [x["image"].to(self.device) for x in batched_inputs]
-
-        # debug: 处理过的图像名保存到一个 txt 文件中
-        # with open("/public/home/zncui/pycharm_project/MaskDINO/myscripts/processed_image_names.txt", "a") as f:
-        #     for x in batched_inputs:
-        #         if "file_name" in x:
-        #             f.write(x["file_name"] + "\n")
-
-        # debug: 可视化 transformed image
-        # 将张量从 GPU 移至 CPU，并转换为 NumPy 数组
-        # Detectron2 加载的图像通常是 BGR 格式，范围是 [0, 255]
-        # cv2.imwrite 也需要 BGR 格式的图像
-
-        # import cv2
-        # import numpy as np
-        # img = images[0].detach().cpu().permute(1, 2, 0).numpy()
-        # img = np.clip(img, 0, 255).astype(np.uint8)
-        # img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-        # save_path = "/public/home/zncui/pycharm_project/MaskDINO/myscripts/transformed_image_v1.jpg"
-        # cv2.imwrite(save_path, img_bgr)
-
         images = [(x - self.pixel_mean) / self.pixel_std for x in images]
         images = ImageList.from_tensors(images, self.size_divisibility)
 
         features = self.backbone(images.tensor)
-        # debug：可视化 backbone 热力图
-        # from maskdino.analysis.tool_lab import show_heatmap
-        # show_heatmap(features, batched_inputs,
-        #              save_path="/public/home/zncui/pycharm_project/MaskDINO/myscripts/output_heatmap/maskdino_mean_all_heatmaps.png")
 
         if self.training:
             # dn_args={"scalar":30,"noise_scale":0.4}
@@ -287,48 +263,11 @@ class MaskDINO(nn.Module):
             else:
                 targets = None
 
-            # from maskdino.ctx import indices_ctx
-            # indices_ctx.set(None)
-
             # 预处理时已经 pad 好了，不需要在这里 pad 了，因此不传入 mask，即 mask=None
             outputs,mask_dict = self.sem_seg_head(features, targets=targets)
 
-            # # debug: 可视化每一层 decoder 的结果，观察这些结果所各自预测的对象
-            # from maskdino.analysis.tool_lab import vis_decoder_layer_results
-            # # vis_decoder_layer_results(outputs, batched_inputs)
-            # from maskdino.ctx import stacked_attn_output_weights_ctx
-            # stacked_attn_output_weights = stacked_attn_output_weights_ctx.get()
-            # vis_decoder_layer_results(outputs, batched_inputs, stacked_attn_output_weights)
-
             # bipartite matching-based loss
             losses, indices = self.criterion(outputs, targets, mask_dict)
-            # bid = 0
-            # target_index = torch.where(indices[bid][1] == 22)[0]  # 这里 target_id = 22
-            # # target_id = indices[0][1][target_index]
-            # pred_id = indices[bid][0][target_index]
-            # print('pred_id: ', pred_id)
-
-            # from maskdino.analysis.tool_lab import vis_attention_bar_from_csv
-            # vis_attention_bar_from_csv(
-            #     pred_id=pred_id,
-            #     save_path="/public/home/zncui/pycharm_project/MaskDINO/myscripts/attn_query_bar.jpg"
-            # )
-
-            # from maskdino.ctx import draw_encoder_class_vars_ctx
-            # encoder_class_vars = draw_encoder_class_vars_ctx.get()
-            # from maskdino.ctx import attn_output_weights_ctx
-            # attn_output_weights_var = attn_output_weights_ctx.get()
-            # query_id = 200
-            # selected_attn_output_weights = attn_output_weights_var[bid][query_id].squeeze()
-            # # selected_attn_output_weights = attn_output_weights_var[bid][pred_id].squeeze()
-            # from maskdino.analysis.tool_lab import draw_encoder_class_heatmap
-            # draw_encoder_class_heatmap(encoder_class_vars[0], encoder_class_vars[1], encoder_class_vars[2], query_id, selected_attn_output_weights)
-            # # 另外观察废弃 query 在关注什么
-
-            # debug
-            # print('debug -----> indices: ', )
-            # indices_ctx.set(indices)  # 设置值
-            # outputs, mask_dict = self.sem_seg_head(features, targets=targets)
 
             for k in list(losses.keys()):
                 if k in self.criterion.weight_dict:
@@ -336,9 +275,6 @@ class MaskDINO(nn.Module):
                 else:
                     # remove this loss if not specified in `weight_dict`
                     losses.pop(k)
-            # debug: loss 的组成部分
-            # from maskdino.analysis.tool_lab import vis_loss_bar
-            # vis_loss_bar(losses, title="Example loss", save_path="loss_bar_no_weight.png")
             return losses
         else:
 
