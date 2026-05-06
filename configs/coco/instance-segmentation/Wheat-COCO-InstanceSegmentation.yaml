@@ -16,8 +16,8 @@ MODEL:
 DATASETS:
 #  TRAIN: ("coco_2017_train",)
 #  TEST: ("coco_2017_val",)
-  TRAIN: ("wheat_coco_train",)
-  TEST: ("wheat_coco_val",)
+  TRAIN: ("wheat_cat2_coco_train",)
+  TEST: ("wheat_cat2_coco_val",)
 
 #SOLVER:
 #  IMS_PER_BATCH: 16
@@ -66,8 +66,8 @@ SOLVER:
   IMS_PER_BATCH: 4
   GRAD_ACCUM_STEPS: 1
   BASE_LR: 0.0001
-  MAX_ITER: 10000
-  STEPS: (8000, 9000)
+  MAX_ITER: 11250
+  STEPS: (9000, 10500)
   WARMUP_FACTOR: 0.001
   WARMUP_ITERS: 1000
   WEIGHT_DECAY: 0.05
@@ -80,10 +80,10 @@ SOLVER:
     NORM_TYPE: 2.0
   AMP:
     ENABLED: True
-  CHECKPOINT_PERIOD: 200
+  CHECKPOINT_PERIOD: 225
 
 TEST:
-  EVAL_PERIOD: 200
+  EVAL_PERIOD: 225
 
 INPUT:
   IMAGE_SIZE: 1024
