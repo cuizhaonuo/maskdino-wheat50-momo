@@ -368,7 +368,7 @@ class SegInferenceTemplate:
                 start_ins_id = img_id
                 self._save_coco_annotation(img_id, start_ins_id, img_path, final_dets, self.outputs.out_dir)
             if self.outputs.vis:
-                self._visualize_and_save(img_path, final_dets, self.outputs.out_dir, draw_contour=True)
+                self._visualize_and_save(img_path, final_dets, self.outputs.out_dir)
 
         if self.outputs.excel:
             csv_path = os.path.join(self.outputs.out_dir, f"{split}_pred_vs_gt.csv")
@@ -588,48 +588,51 @@ class SegInferenceTemplate:
             with open(json_path, "w", encoding="utf-8") as f:
                 json.dump(coco_output, f, indent=2, ensure_ascii=False)
 
-    import os
-    import cv2
-    import numpy as np
-    from typing import List
+    # 每个类别一种颜色（BGR），按 label 索引
+    _CATEGORY_COLORS = [
+        (0, 0, 255),      # 0: 红色
+        (255, 0, 0),      # 1: 蓝色
+        (0, 255, 0),      # 2: 绿色
+        (255, 255, 0),    # 3: 青色
+        (255, 0, 255),    # 4: 品红
+        (0, 255, 255),    # 5: 黄色
+        (128, 0, 128),    # 6: 紫色
+        (128, 128, 0),    # 7: 橄榄绿
+        (0, 128, 128),    # 8: 深青
+        (128, 0, 0),      # 9: 深蓝
+    ]
+
+    def _get_category_color(self, label: int) -> tuple:
+        # “””根据类别标签返回固定颜色，超出预定义范围则循环使用”””
+        colors = self._CATEGORY_COLORS
+        return colors[label % len(colors)]
 
     def _visualize_and_save(self, img_path: str, dets: List[DetProposal],
-                            out_dir: str, alpha: float = 0.8, draw_contour: bool = False,
-                            draw_center: bool = False):
+                            out_dir: str, draw_center: bool = False):
         img = cv2.imread(img_path)
         if img is None:
             return
 
         ensure_dir(out_dir)
-
-        # 用 overlay 叠加颜色
-        overlay = img.copy()
-
-        # 固定随机种子，保证每次可复现（想要每次都不一样可以删掉 seed）
-        rng = np.random.default_rng(12345)
+        vis = img.copy()
 
         for d in dets:
-            # --- 1. 随机生成一个“较深”的 BGR 颜色 ---
-            # 让每个通道都在 64~255 之间，避免太浅
-            color = rng.integers(64, 256, size=3, dtype=np.uint8).tolist()  # [B, G, R]
+            # --- 1. 按类别取颜色 ---
+            color = self._get_category_color(d.label)
 
             # --- 2. 取对应 ROI（严格对齐 mask 与 roi）---
             H, W = img.shape[:2]
 
-            # det 的原始全局框（对应 d.mask 的坐标系）
             y1o, x1o = int(d.top), int(d.left)
             y2o = int(d.top + d.mask.shape[0])
             x2o = int(d.left + d.mask.shape[1])
 
-            # clamp 到图像内，得到实际 roi
             y1 = max(0, min(H, y1o))
             y2 = max(0, min(H, y2o))
             x1 = max(0, min(W, x1o))
             x2 = max(0, min(W, x2o))
             if y2 <= y1 or x2 <= x1:
                 continue
-
-            roi = overlay[y1:y2, x1:x2]
 
             # 计算 roi 相对 det-mask 的偏移，并裁剪 mask 使其与 roi 尺寸一致
             my1 = y1 - y1o
@@ -639,45 +642,22 @@ class SegInferenceTemplate:
 
             m = d.mask[my1:my2, mx1:mx2].astype(bool)
 
-            # 双保险：确保尺寸完全一致
-            if m.shape[0] != roi.shape[0] or m.shape[1] != roi.shape[1]:
-                m = m[:roi.shape[0], :roi.shape[1]]
+            if m.shape[0] != vis[y1:y2, x1:x2].shape[0] or m.shape[1] != vis[y1:y2, x1:x2].shape[1]:
+                m = m[:vis[y1:y2, x1:x2].shape[0], :vis[y1:y2, x1:x2].shape[1]]
 
-            # --- 3. 叠加颜色 ---
-            roi[m] = (alpha * np.array(color, dtype=np.float32) +
-                      (1 - alpha) * roi[m].astype(np.float32)).astype(np.uint8)
+            # --- 3. 只画轮廓，不填充颜色 ---
+            m8 = (m.astype(np.uint8) * 255)
+            contours, _ = cv2.findContours(m8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(vis[y1:y2, x1:x2], contours, -1, color, 2)
 
-            # --- 4. 画轮廓（用同一个颜色）---
-            if draw_contour:
-                m8 = (m.astype(np.uint8) * 255)
-                contours, _ = cv2.findContours(m8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                cv2.drawContours(overlay[y1:y2, x1:x2], contours, -1, color, 2)
-
-            # --- 5. 按 score 画中心点（颜色可以根据 score 改，也可以直接用实例颜色）---
+            # --- 4. 按 score 画中心点 ---
             if draw_center:
-                score = d.score
                 ys, xs = np.where(m > 0)
                 if len(xs) > 0 and len(ys) > 0:
                     cx = int(x1 + np.mean(xs))
                     cy = int(y1 + np.mean(ys))
-
-                    # 如果你想用 score 决定颜色，就用下面这段
-                    # if score > 0.5:
-                    #     point_color = (0, 0, 255)      # 红色
-                    # elif score > 0.2:
-                    #     point_color = (0, 255, 255)    # 黄色
-                    # else:
-                    #     point_color = (0, 255, 0)      # 绿色
-
-                    # 或者直接用这个实例自身的颜色：
-                    point_color = tuple(color)
-
-                    cv2.circle(overlay, (cx, cy), radius=6,
-                               color=point_color, thickness=-1)
-
-        # --- 6. 最终可视化图像：img 和 overlay 做一次整体的加权 ---
-        # 如果你已经在 roi 那一步做了 alpha 混合，也可以直接 vis = overlay
-        vis = cv2.addWeighted(overlay, 1.0, img, 0.0, 0)
+                    cv2.circle(vis, (cx, cy), radius=6,
+                               color=color, thickness=-1)
 
         out_path = os.path.join(out_dir, os.path.basename(img_path))
         cv2.imwrite(out_path, vis)
