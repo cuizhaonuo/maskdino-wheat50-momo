@@ -351,13 +351,23 @@ class MaskDINO(nn.Module):
             gt_masks = targets_per_image.gt_masks
             padded_masks = torch.zeros((gt_masks.shape[0], h_pad, w_pad), dtype=gt_masks.dtype, device=gt_masks.device)
             padded_masks[:, : gt_masks.shape[1], : gt_masks.shape[2]] = gt_masks
-            new_targets.append(
-                {
-                    "labels": targets_per_image.gt_classes,
-                    "masks": padded_masks,
-                    "boxes":box_ops.box_xyxy_to_cxcywh(targets_per_image.gt_boxes.tensor)/image_size_xyxy
-                }
-            )
+            target_dict = {
+                "labels": targets_per_image.gt_classes,
+                "masks": padded_masks,
+                "boxes": box_ops.box_xyxy_to_cxcywh(targets_per_image.gt_boxes.tensor) / image_size_xyxy,
+            }
+            if hasattr(targets_per_image, "gt_points"):
+                target_dict["points"] = targets_per_image.gt_points
+            if hasattr(targets_per_image, "gt_density_maps"):
+                gt_density_maps = targets_per_image.gt_density_maps
+                padded_density_maps = torch.zeros(
+                    (gt_density_maps.shape[0], h_pad, w_pad),
+                    dtype=gt_density_maps.dtype,
+                    device=gt_density_maps.device,
+                )
+                padded_density_maps[:, : gt_density_maps.shape[1], : gt_density_maps.shape[2]] = gt_density_maps
+                target_dict["density_maps"] = padded_density_maps
+            new_targets.append(target_dict)
         return new_targets
 
 
@@ -372,13 +382,23 @@ class MaskDINO(nn.Module):
             gt_masks = targets_per_image.gt_masks
             padded_masks = torch.zeros((gt_masks.shape[0], h_pad, w_pad), dtype=gt_masks.dtype, device=gt_masks.device)
             padded_masks[:, : gt_masks.shape[1], : gt_masks.shape[2]] = gt_masks
-            new_targets.append(
-                {
-                    "labels": targets_per_image.gt_classes,
-                    "masks": padded_masks,
-                    "boxes": box_ops.box_xyxy_to_cxcywh(targets_per_image.gt_boxes.tensor) / image_size_xyxy
-                }
-            )
+            target_dict = {
+                "labels": targets_per_image.gt_classes,
+                "masks": padded_masks,
+                "boxes": box_ops.box_xyxy_to_cxcywh(targets_per_image.gt_boxes.tensor) / image_size_xyxy,
+            }
+            if hasattr(targets_per_image, "gt_points"):
+                target_dict["points"] = targets_per_image.gt_points
+            if hasattr(targets_per_image, "gt_density_maps"):
+                gt_density_maps = targets_per_image.gt_density_maps
+                padded_density_maps = torch.zeros(
+                    (gt_density_maps.shape[0], h_pad, w_pad),
+                    dtype=gt_density_maps.dtype,
+                    device=gt_density_maps.device,
+                )
+                padded_density_maps[:, : gt_density_maps.shape[1], : gt_density_maps.shape[2]] = gt_density_maps
+                target_dict["density_maps"] = padded_density_maps
+            new_targets.append(target_dict)
         return new_targets
 
     def semantic_inference(self, mask_cls, mask_pred):
