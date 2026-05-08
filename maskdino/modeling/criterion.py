@@ -348,7 +348,7 @@ class SetCriterion(nn.Module):
 
         valid = target_density.flatten(1).sum(dim=1) > 0
         if valid.any():
-            loss = F.l1_loss(src_density[valid], target_density[valid], reduction="sum") / valid.sum().clamp(min=1)
+            loss = F.l1_loss(src_density[valid], target_density[valid], reduction="mean")
         else:
             loss = src_density.sum() * 0.0
 
