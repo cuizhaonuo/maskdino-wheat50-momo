@@ -139,6 +139,7 @@ class MaskDINODecoder(nn.Module):
                 self.class_embed = nn.Linear(hidden_dim, num_classes)
         self.label_enc=nn.Embedding(num_classes,hidden_dim)
         self.mask_embed = MLP(hidden_dim, hidden_dim, mask_dim, 3)
+        self.density_embed = MLP(hidden_dim, hidden_dim, mask_dim, 3)
 
         # init decoder
         self.decoder_norm = decoder_norm = nn.LayerNorm(hidden_dim)
@@ -312,7 +313,7 @@ class MaskDINODecoder(nn.Module):
 
         return input_query_label,input_query_bbox,attn_mask,mask_dict
 
-    def dn_post_process(self,outputs_class,outputs_coord,mask_dict,outputs_mask):
+    def dn_post_process(self,outputs_class,outputs_coord,mask_dict,outputs_mask, outputs_density_maps=None):
         """
             post process of dn after output from the transformer
             put the dn part in the mask_dict
@@ -325,11 +326,28 @@ class MaskDINODecoder(nn.Module):
         if outputs_mask is not None:
             output_known_mask = outputs_mask[:, :, :mask_dict['pad_size'], :]
             outputs_mask = outputs_mask[:, :, mask_dict['pad_size']:, :]
-        out = {'pred_logits': output_known_class[-1], 'pred_boxes': output_known_coord[-1],'pred_masks': output_known_mask[-1]}
+        else:
+            output_known_mask = None
+        if outputs_density_maps is not None:
+            output_known_density = outputs_density_maps[:, :, :mask_dict['pad_size'], :]
+            outputs_density_maps = outputs_density_maps[:, :, mask_dict['pad_size']:, :]
+        else:
+            output_known_density = None
+        out = {
+            'pred_logits': output_known_class[-1],
+            'pred_boxes': output_known_coord[-1],
+            'pred_masks': output_known_mask[-1] if output_known_mask is not None else None,
+            'pred_density_maps': output_known_density[-1] if output_known_density is not None else None,
+        }
 
-        out['aux_outputs'] = self._set_aux_loss(output_known_class, output_known_mask,output_known_coord)
+        out['aux_outputs'] = self._set_aux_loss(
+            output_known_class,
+            output_known_mask,
+            output_known_coord,
+            output_known_density,
+        )
         mask_dict['output_known_lbs_bboxes']=out
-        return outputs_class, outputs_coord, outputs_mask
+        return outputs_class, outputs_coord, outputs_mask, outputs_density_maps
 
     def get_valid_ratio(self, mask):
         _, H, W = mask.shape
@@ -401,6 +419,7 @@ class MaskDINODecoder(nn.Module):
 
         predictions_class = []
         predictions_mask = []
+        predictions_density = []
         if self.two_stage:
             output_memory, output_proposals = gen_encoder_output_proposals(src_flatten, mask_flatten, spatial_shapes)
             output_memory = self.enc_output_norm(self.enc_output(output_memory))
@@ -416,7 +435,9 @@ class MaskDINODecoder(nn.Module):
             tgt_undetach = torch.gather(output_memory, 1,
                                   topk_proposals.unsqueeze(-1).repeat(1, 1, self.hidden_dim))  # unsigmoid
 
-            outputs_class, outputs_mask = self.forward_prediction_heads(tgt_undetach.transpose(0, 1), mask_features)
+            outputs_class, outputs_mask, outputs_density = self.forward_prediction_heads(
+                tgt_undetach.transpose(0, 1), mask_features
+            )
             tgt = tgt_undetach.detach()
             if self.learn_tgt:
                 tgt = self.query_feat.weight[None].repeat(bs, 1, 1)
@@ -424,6 +445,7 @@ class MaskDINODecoder(nn.Module):
             interm_outputs['pred_logits'] = outputs_class
             interm_outputs['pred_boxes'] = refpoint_embed_undetach.sigmoid()
             interm_outputs['pred_masks'] = outputs_mask
+            interm_outputs['pred_density_maps'] = outputs_density
 
             if self.initialize_box_type != 'no':
                 # convert masks into boxes to better initialize box in the decoder
@@ -464,13 +486,14 @@ class MaskDINODecoder(nn.Module):
         # direct prediction from the matching and denoising part in the begining
         if self.initial_pred:
             # 暂时注释
-            outputs_class, outputs_mask = self.forward_prediction_heads(tgt.transpose(0, 1), mask_features, self.training)
+            outputs_class, outputs_mask, outputs_density = self.forward_prediction_heads(tgt.transpose(0, 1), mask_features, self.training)
 
             # debug: 查看推理时每一层的预测结果
             # outputs_class, outputs_mask = self.forward_prediction_heads(tgt.transpose(0, 1), mask_features, pred_mask=True)
 
             predictions_class.append(outputs_class)
             predictions_mask.append(outputs_mask)
+            predictions_density.append(outputs_density)
         if self.dn != "no" and self.training and mask_dict is not None:
             refpoint_embed=torch.cat([input_query_bbox,refpoint_embed],dim=1)
         # 此处 refpoint_embed 变成了 (bs, dn_pad + num_queries, 4)，position query + denoising query
@@ -515,13 +538,15 @@ class MaskDINODecoder(nn.Module):
             # 这样做的目的是减少计算量，因为掩码预测比较耗时
 
             # 暂时注释
-            outputs_class, outputs_mask = self.forward_prediction_heads(output.transpose(0, 1), mask_features, self.training or (i == len(hs)-1))
-
-            # debug: 查看推理时每一层的预测结果
-            # outputs_class, outputs_mask = self.forward_prediction_heads(output.transpose(0, 1), mask_features, pred_mask=True)
+            outputs_class, outputs_mask, outputs_density = self.forward_prediction_heads(
+                output.transpose(0, 1),
+                mask_features,
+                self.training or (i == len(hs)-1),
+            )
 
             predictions_class.append(outputs_class)
             predictions_mask.append(outputs_mask)
+            predictions_density.append(outputs_density)
 
         # iteratively box prediction
         '''
@@ -546,17 +571,25 @@ class MaskDINODecoder(nn.Module):
         else:
             out_boxes = self.pred_box(references, hs)
         if mask_dict is not None:
-            predictions_mask=torch.stack(predictions_mask)
-            predictions_class=torch.stack(predictions_class)
+            predictions_mask = torch.stack(predictions_mask)
+            predictions_class = torch.stack(predictions_class)
+            predictions_density = torch.stack(predictions_density)
             # 包含中间的所有结果
             # predictions_mask: (num_layers + 1, bs, dn_pad + num_queries, h, w)
             # predictions_class: (num_layers + 1, bs, dn_pad + num_queries, num_classes)
             # out_boxes: (num_layers + 1, bs, dn_pad + num_queries, 4)
-            predictions_class, out_boxes,predictions_mask=\
-                self.dn_post_process(predictions_class,out_boxes,mask_dict,predictions_mask)
-            predictions_class,predictions_mask=list(predictions_class),list(predictions_mask)
+            predictions_class, out_boxes, predictions_mask, predictions_density = \
+                self.dn_post_process(
+                    predictions_class,
+                    out_boxes,
+                    mask_dict,
+                    predictions_mask,
+                    predictions_density,
+                )
+            predictions_class, predictions_mask = list(predictions_class), list(predictions_mask)
+            predictions_density = list(predictions_density)
         elif self.training:  # this is to insure self.label_enc participate in the model
-            predictions_class[-1] += 0.0*self.label_enc.weight.sum()
+            predictions_class[-1] += 0.0 * self.label_enc.weight.sum()
 
         # 最终的返回结果
         # 训练中，返回 9 个 decoder 的结果，加上 1 个 tgt 的结果：pred_logits, pred_masks, pred_boxes 是最后一层解码器的结果
@@ -565,9 +598,13 @@ class MaskDINODecoder(nn.Module):
         out = {
             'pred_logits': predictions_class[-1],
             'pred_masks': predictions_mask[-1],
-            'pred_boxes':out_boxes[-1],
+            'pred_boxes': out_boxes[-1],
+            'pred_density_maps': predictions_density[-1],
             'aux_outputs': self._set_aux_loss(
-                predictions_class if self.mask_classification else None, predictions_mask,out_boxes
+                predictions_class if self.mask_classification else None,
+                predictions_mask,
+                out_boxes,
+                predictions_density,
             )
         }
         if self.two_stage:
@@ -579,25 +616,38 @@ class MaskDINODecoder(nn.Module):
         decoder_output = decoder_output.transpose(0, 1)
         outputs_class = self.class_embed(decoder_output)
         outputs_mask = None
+        outputs_density = None
         if pred_mask:
             mask_embed = self.mask_embed(decoder_output)
             outputs_mask = torch.einsum("bqc,bchw->bqhw", mask_embed, mask_features)
+            density_embed = self.density_embed(decoder_output)
+            outputs_density = torch.einsum("bqc,bchw->bqhw", density_embed, mask_features)
 
-        return outputs_class, outputs_mask
+        return outputs_class, outputs_mask, outputs_density
 
     @torch.jit.unused
-    def _set_aux_loss(self, outputs_class, outputs_seg_masks, out_boxes=None):
+    def _set_aux_loss(self, outputs_class, outputs_seg_masks, out_boxes=None, outputs_density_maps=None):
         # this is a workaround to make torchscript happy, as torchscript
         # doesn't support dictionary with non-homogeneous values, such
         # as a dict having both a Tensor and a list.
         # if self.mask_classification:
         if out_boxes is None:
+            if outputs_density_maps is None:
+                return [
+                    {"pred_logits": a, "pred_masks": b}
+                    for a, b in zip(outputs_class[:-1], outputs_seg_masks[:-1])
+                ]
             return [
-                {"pred_logits": a, "pred_masks": b}
-                for a, b in zip(outputs_class[:-1], outputs_seg_masks[:-1])
+                {"pred_logits": a, "pred_masks": b, "pred_density_maps": d}
+                for a, b, d in zip(outputs_class[:-1], outputs_seg_masks[:-1], outputs_density_maps[:-1])
             ]
-        else:
+        if outputs_density_maps is None:
             return [
-                {"pred_logits": a, "pred_masks": b, "pred_boxes":c}
+                {"pred_logits": a, "pred_masks": b, "pred_boxes": c}
                 for a, b, c in zip(outputs_class[:-1], outputs_seg_masks[:-1], out_boxes[:-1])
             ]
+        return [
+            {"pred_logits": a, "pred_masks": b, "pred_boxes": c, "pred_density_maps": d}
+            for a, b, c, d in zip(outputs_class[:-1], outputs_seg_masks[:-1], out_boxes[:-1], outputs_density_maps[:-1])
+        ]
+
