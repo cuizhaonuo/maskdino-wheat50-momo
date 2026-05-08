@@ -133,6 +133,7 @@ class MaskDINO(nn.Module):
         box_weight = cfg.MODEL.MaskDINO.BOX_WEIGHT  #
         cost_giou_weight = cfg.MODEL.MaskDINO.COST_GIOU_WEIGHT
         giou_weight = cfg.MODEL.MaskDINO.GIOU_WEIGHT  #
+        density_weight = cfg.MODEL.MaskDINO.DENSITY_WEIGHT
         # building matcher
         matcher = HungarianMatcher(
             cost_class=cost_class_weight,
@@ -145,7 +146,9 @@ class MaskDINO(nn.Module):
 
         weight_dict = {"loss_ce": class_weight}
         weight_dict.update({"loss_mask": mask_weight, "loss_dice": dice_weight})
-        weight_dict.update({"loss_bbox":box_weight,"loss_giou":giou_weight})
+        weight_dict.update({"loss_bbox": box_weight, "loss_giou": giou_weight})
+        if density_weight > 0:
+            weight_dict.update({"loss_density": density_weight})
         # two stage is the query selection scheme
         if cfg.MODEL.MaskDINO.TWO_STAGE:
             interm_weight_dict = {}
@@ -168,9 +171,11 @@ class MaskDINO(nn.Module):
                 aux_weight_dict.update({k + f"_{i}": v for k, v in weight_dict.items()})
             weight_dict.update(aux_weight_dict)
         if cfg.MODEL.MaskDINO.BOX_LOSS:
-            losses = ["labels", "masks","boxes"]
+            losses = ["labels", "masks", "boxes"]
         else:
             losses = ["labels", "masks"]
+        if density_weight > 0:
+            losses.append("density")
         # building criterion
         criterion = SetCriterion(
             sem_seg_head.num_classes,
@@ -264,7 +269,7 @@ class MaskDINO(nn.Module):
                 targets = None
 
             # 预处理时已经 pad 好了，不需要在这里 pad 了，因此不传入 mask，即 mask=None
-            outputs,mask_dict = self.sem_seg_head(features, targets=targets)
+            outputs, mask_dict = self.sem_seg_head(features, targets=targets)
 
             # bipartite matching-based loss
             losses, indices = self.criterion(outputs, targets, mask_dict)
@@ -526,5 +531,4 @@ class MaskDINO(nn.Module):
         scale_fct = scale_fct.to(out_bbox)
         boxes = boxes * scale_fct
         return boxes
-
 

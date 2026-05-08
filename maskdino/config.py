@@ -43,6 +43,7 @@ def add_maskdino_config(cfg):
     cfg.MODEL.MaskDINO.MASK_WEIGHT = 5.0
     cfg.MODEL.MaskDINO.BOX_WEIGHT = 5.
     cfg.MODEL.MaskDINO.GIOU_WEIGHT = 2.
+    cfg.MODEL.MaskDINO.DENSITY_WEIGHT = 1.0
 
     # cost weight
     cfg.MODEL.MaskDINO.COST_CLASS_WEIGHT = 4.0

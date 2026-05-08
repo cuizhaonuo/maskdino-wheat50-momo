@@ -323,11 +323,43 @@ class SetCriterion(nn.Module):
         tgt_idx = torch.cat([tgt for (_, tgt) in indices])
         return batch_idx, tgt_idx
 
+    def loss_density(self, outputs, targets, indices, num_masks):
+        if "pred_density_maps" not in outputs:
+            return {"loss_density": torch.as_tensor(0.0, device=next(iter(outputs.values())).device)}
+        if not targets or "density_maps" not in targets[0]:
+            return {"loss_density": torch.as_tensor(0.0, device=next(iter(outputs.values())).device)}
+
+        src_idx = self._get_src_permutation_idx(indices)
+        tgt_idx = self._get_tgt_permutation_idx(indices)
+
+        src_density = outputs["pred_density_maps"][src_idx]
+        density_maps = [t["density_maps"] for t in targets]
+        target_density, _ = nested_tensor_from_tensor_list(density_maps).decompose()
+        target_density = target_density.to(src_density)
+        target_density = target_density[tgt_idx]
+
+        if target_density.shape[-2:] != src_density.shape[-2:]:
+            target_density = F.interpolate(
+                target_density[:, None],
+                size=src_density.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(1)
+
+        valid = target_density.flatten(1).sum(dim=1) > 0
+        if valid.any():
+            loss = F.l1_loss(src_density[valid], target_density[valid], reduction="sum") / valid.sum().clamp(min=1)
+        else:
+            loss = src_density.sum() * 0.0
+
+        return {"loss_density": loss}
+
     def get_loss(self, loss, outputs, targets, indices, num_masks):
         loss_map = {
             'labels': self.loss_labels_ce if self.semantic_ce_loss else self.loss_labels,
             'masks': self.loss_masks,
             'boxes': self.loss_boxes_panoptic if self.panoptic_on else self.loss_boxes,
+            'density': self.loss_density,
         }
         assert loss in loss_map, f"do you really want to compute {loss} loss?"
         return loss_map[loss](outputs, targets, indices, num_masks)
