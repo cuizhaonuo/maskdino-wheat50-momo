@@ -354,6 +354,54 @@ class SetCriterion(nn.Module):
 
         return {"loss_density": loss}
 
+    def loss_sampling_density(self, outputs, targets, indices, num_masks):
+        if "pred_density_maps" not in outputs:
+            return {"loss_density": torch.as_tensor(0.0, device=next(iter(outputs.values())).device)}
+        if not targets or "density_maps" not in targets[0]:
+            return {"loss_density": torch.as_tensor(0.0, device=next(iter(outputs.values())).device)}
+
+        src_idx = self._get_src_permutation_idx(indices)
+        tgt_idx = self._get_tgt_permutation_idx(indices)
+
+        src_density = outputs["pred_density_maps"][src_idx]
+
+        density_maps = [t["density_maps"] for t in targets]
+        target_density, _ = nested_tensor_from_tensor_list(density_maps).decompose()
+        target_density = target_density.to(src_density)
+        target_density = target_density[tgt_idx]
+
+        valid = target_density.flatten(1).sum(dim=1) > 0
+
+        if valid.any():
+            src_density = src_density[valid][:, None]
+            target_density = target_density[valid][:, None]
+
+            point_coords = torch.rand(
+                src_density.shape[0],
+                self.num_points,
+                2,
+                device=src_density.device,
+            )
+
+            point_pred = point_sample(
+                src_density,
+                point_coords,
+                align_corners=False,
+            ).squeeze(1)
+
+            point_target = point_sample(
+                target_density,
+                point_coords,
+                align_corners=False,
+            ).squeeze(1)
+
+            loss = F.l1_loss(point_pred, point_target, reduction="none")
+            loss = loss.mean(1).sum() / num_masks
+        else:
+            loss = src_density.sum() * 0.0
+
+        return {"loss_density": loss}
+
     def get_loss(self, loss, outputs, targets, indices, num_masks):
         loss_map = {
             'labels': self.loss_labels_ce if self.semantic_ce_loss else self.loss_labels,
