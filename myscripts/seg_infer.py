@@ -128,6 +128,26 @@ def linspace_inclusive(start: float, end: float, num: int) -> List[float]:
     step = (end - start) / (num - 1)
     return [start + i * step for i in range(num)]
 
+def _extract_density_peaks(density: np.ndarray, mask: Optional[np.ndarray],
+                           min_value: float = 1e-6, kernel_size: int = 7) -> np.ndarray:
+    if density is None or density.size == 0:
+        return np.zeros((0, 2), dtype=np.int32)
+    dmap = density.astype(np.float32)
+    if mask is not None:
+        dmap = dmap * mask.astype(np.float32)
+    if np.max(dmap) <= min_value:
+        return np.zeros((0, 2), dtype=np.int32)
+
+    k = max(3, int(kernel_size))
+    if k % 2 == 0:
+        k += 1
+    dilated = cv2.dilate(dmap, np.ones((k, k), np.uint8))
+    peaks = (dmap >= dilated - 1e-6) & (dmap > min_value)
+    ys, xs = np.where(peaks)
+    if len(xs) == 0:
+        return np.zeros((0, 2), dtype=np.int32)
+    return np.stack([xs, ys], axis=1).astype(np.int32)
+
 
 # -----------------------------
 # Proposal & IoU / NMS
@@ -142,6 +162,7 @@ class DetProposal:
     left: int           # global x of bbox left
     area: int           # mask.sum()
     density: Optional[np.ndarray] = None  # cropped to bbox (h,w) float32
+    points: Optional[np.ndarray] = None   # (K, 2) local xy points
 
 class IOUType(Enum):
     IOU = "IOU"
@@ -464,9 +485,12 @@ class SegInferenceTemplate:
                         continue
 
                     density_crop = None
+                    points = None
                     if ins.get("density") is not None:
                         density = ins["density"].astype(np.float32)
                         density_crop = density[y1t:y2t, x1t:x2t]
+                        if int(ins.get("label", 0)) == 1:
+                            points = _extract_density_peaks(density_crop, mask_crop)
 
                     proposals.append(DetProposal(
                         bbox=np.array([gx1, gy1, gx2, gy2], dtype=float),
@@ -477,6 +501,7 @@ class SegInferenceTemplate:
                         left=int(gx1),
                         area=area,
                         density=density_crop,
+                        points=points,
                     ))
         return proposals
 
@@ -664,7 +689,7 @@ class SegInferenceTemplate:
             if m.shape[0] != vis[y1:y2, x1:x2].shape[0] or m.shape[1] != vis[y1:y2, x1:x2].shape[1]:
                 m = m[:vis[y1:y2, x1:x2].shape[0], :vis[y1:y2, x1:x2].shape[1]]
 
-            # --- 2.5 叠加 density heatmap（仅 wheat_2，label==1）---
+            # # --- 2.5 叠加 density heatmap（仅 wheat_2，label==1）---
             if d.label == 1 and d.density is not None:
                 dmap = d.density[my1:my2, mx1:mx2]
                 if dmap.shape != m.shape:
@@ -678,6 +703,14 @@ class SegInferenceTemplate:
                     blend = (roi.astype(np.float32) * (1 - alpha) + heat.astype(np.float32) * alpha).astype(np.uint8)
                     roi[m] = blend[m]
                     vis[y1:y2, x1:x2] = roi
+
+            # --- 2.6 叠加预测点（局部极大）---
+            if d.label == 1 and d.points is not None and len(d.points) > 0:
+                for px, py in d.points:
+                    gx = x1o + int(px)
+                    gy = y1o + int(py)
+                    if 0 <= gx < W and 0 <= gy < H:
+                        cv2.circle(vis, (gx, gy), radius=2, color=(0, 0, 255), thickness=-1)
 
             # --- 3. 只画轮廓，不填充颜色 ---
             m8 = (m.astype(np.uint8) * 255)
