@@ -293,6 +293,7 @@ class MaskDINO(nn.Module):
             mask_cls_results = outputs["pred_logits"]
             mask_pred_results = outputs["pred_masks"]
             mask_box_results = outputs["pred_boxes"]
+            density_pred_results = outputs.get("pred_density_maps", None)
             # upsample masks
             mask_pred_results = F.interpolate(
                 mask_pred_results,
@@ -300,12 +301,20 @@ class MaskDINO(nn.Module):
                 mode="bilinear",
                 align_corners=False,
             )
+            if density_pred_results is not None:
+                density_pred_results = F.interpolate(
+                    density_pred_results,
+                    size=(images.tensor.shape[-2], images.tensor.shape[-1]),
+                    mode="bilinear",
+                    align_corners=False,
+                )
 
             del outputs
 
             processed_results = []
-            for mask_cls_result, mask_pred_result, mask_box_result, input_per_image, image_size in zip(
-                mask_cls_results, mask_pred_results, mask_box_results, batched_inputs, images.image_sizes
+            density_iter = density_pred_results if density_pred_results is not None else [None] * len(mask_cls_results)
+            for mask_cls_result, mask_pred_result, mask_box_result, input_per_image, image_size, density_pred_result in zip(
+                mask_cls_results, mask_pred_results, mask_box_results, batched_inputs, images.image_sizes, density_iter
             ):  # image_size is augmented size, not divisible to 32
                 height = input_per_image.get("height", image_size[0])  # real size
                 width = input_per_image.get("width", image_size[1])
@@ -317,6 +326,10 @@ class MaskDINO(nn.Module):
                     mask_pred_result = retry_if_cuda_oom(sem_seg_postprocess)(
                         mask_pred_result, image_size, height, width
                     )
+                    if density_pred_result is not None:
+                        density_pred_result = retry_if_cuda_oom(sem_seg_postprocess)(
+                            density_pred_result, image_size, height, width
+                        )
                     mask_cls_result = mask_cls_result.to(mask_pred_result)
                     # mask_box_result = mask_box_result.to(mask_pred_result)
                     # mask_box_result = self.box_postprocess(mask_box_result, height, width)
@@ -340,7 +353,9 @@ class MaskDINO(nn.Module):
                     width = new_size[1]/image_size[1]*width
                     mask_box_result = self.box_postprocess(mask_box_result, height, width)
 
-                    instance_r = retry_if_cuda_oom(self.instance_inference)(mask_cls_result, mask_pred_result, mask_box_result)
+                    instance_r = retry_if_cuda_oom(self.instance_inference)(
+                        mask_cls_result, mask_pred_result, mask_box_result, density_pred_result
+                    )
                     processed_results[-1]["instances"] = instance_r
 
             return processed_results
@@ -487,7 +502,7 @@ class MaskDINO(nn.Module):
 
             return panoptic_seg, segments_info
 
-    def instance_inference(self, mask_cls, mask_pred, mask_box_result):
+    def instance_inference(self, mask_cls, mask_pred, mask_box_result, density_pred=None):
         # mask_pred is already processed to have the same shape as original input
         image_size = mask_pred.shape[-2:]
         scores = mask_cls.sigmoid()  # [100, 80]
@@ -497,6 +512,8 @@ class MaskDINO(nn.Module):
         labels_per_image = labels[topk_indices]
         topk_indices = topk_indices // self.sem_seg_head.num_classes
         mask_pred = mask_pred[topk_indices]
+        if density_pred is not None:
+            density_pred = density_pred[topk_indices]
         # if this is panoptic segmentation, we only keep the "thing" classes
         if self.panoptic_on:
             keep = torch.zeros_like(scores_per_image).bool()
@@ -505,9 +522,13 @@ class MaskDINO(nn.Module):
             scores_per_image = scores_per_image[keep]
             labels_per_image = labels_per_image[keep]
             mask_pred = mask_pred[keep]
+            if density_pred is not None:
+                density_pred = density_pred[keep]
         result = Instances(image_size)
         # mask (before sigmoid)
         result.pred_masks = (mask_pred > 0).float()
+        if density_pred is not None:
+            result.pred_density_maps = density_pred
         # half mask box half pred box
         mask_box_result = mask_box_result[topk_indices]
         if self.panoptic_on:

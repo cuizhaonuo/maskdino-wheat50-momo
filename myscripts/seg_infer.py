@@ -141,6 +141,7 @@ class DetProposal:
     top: int            # global y of bbox top
     left: int           # global x of bbox left
     area: int           # mask.sum()
+    density: Optional[np.ndarray] = None  # cropped to bbox (h,w) float32
 
 class IOUType(Enum):
     IOU = "IOU"
@@ -203,23 +204,34 @@ def _merge_two_proposals(a: DetProposal, b: DetProposal, score_mode: str = "keep
 
     # 2) 将两个局部 mask 放到并集坐标的大画布上
     canvas = np.zeros((U_h, U_w), dtype=bool)
+    density_canvas = None
+    if a.density is not None or b.density is not None:
+        density_canvas = np.zeros((U_h, U_w), dtype=np.float32)
     # a 的偏移
     ay_off, ax_off = a.top - uy1, a.left - ux1
     canvas[ay_off:ay_off + a.mask.shape[0], ax_off:ax_off + a.mask.shape[1]] |= a.mask
+    if density_canvas is not None and a.density is not None:
+        density_canvas[ay_off:ay_off + a.density.shape[0], ax_off:ax_off + a.density.shape[1]] += a.density
     # b 的偏移
     by_off, bx_off = b.top - uy1, b.left - ux1
     canvas[by_off:by_off + b.mask.shape[0], bx_off:bx_off + b.mask.shape[1]] |= b.mask
+    if density_canvas is not None and b.density is not None:
+        density_canvas[by_off:by_off + b.density.shape[0], bx_off:bx_off + b.density.shape[1]] += b.density
 
     # 3) 对合成后的 mask 做紧致裁剪（去掉全零边框）
     if not canvas.any():
         # 理论上不会发生（因为 a、b 至少一个有像素）
         new_mask = canvas
         tight_x1 = tight_y1 = 0
-    else        :
+        new_density = density_canvas
+    else:
         ys, xs = np.where(canvas)
         tight_x1, tight_x2 = xs.min(), xs.max() + 1
         tight_y1, tight_y2 = ys.min(), ys.max() + 1
         new_mask = canvas[tight_y1:tight_y2, tight_x1:tight_x2]
+        new_density = None
+        if density_canvas is not None:
+            new_density = density_canvas[tight_y1:tight_y2, tight_x1:tight_x2]
 
     # 4) 组合后的全局左上角、bbox、面积
     new_left = int(ux1 + tight_x1)
@@ -245,6 +257,7 @@ def _merge_two_proposals(a: DetProposal, b: DetProposal, score_mode: str = "keep
         top=int(new_top),
         left=int(new_left),
         area=int(new_area),
+        density=new_density.astype(np.float32) if new_density is not None else None,
     )
 
 
@@ -450,6 +463,11 @@ class SegInferenceTemplate:
                         # print(3)
                         continue
 
+                    density_crop = None
+                    if ins.get("density") is not None:
+                        density = ins["density"].astype(np.float32)
+                        density_crop = density[y1t:y2t, x1t:x2t]
+
                     proposals.append(DetProposal(
                         bbox=np.array([gx1, gy1, gx2, gy2], dtype=float),
                         score=score,
@@ -457,7 +475,8 @@ class SegInferenceTemplate:
                         mask=mask_crop,
                         top=int(gy1),
                         left=int(gx1),
-                        area=area
+                        area=area,
+                        density=density_crop,
                     ))
         return proposals
 
@@ -645,6 +664,21 @@ class SegInferenceTemplate:
             if m.shape[0] != vis[y1:y2, x1:x2].shape[0] or m.shape[1] != vis[y1:y2, x1:x2].shape[1]:
                 m = m[:vis[y1:y2, x1:x2].shape[0], :vis[y1:y2, x1:x2].shape[1]]
 
+            # --- 2.5 叠加 density heatmap（仅 wheat_2，label==1）---
+            if d.label == 1 and d.density is not None:
+                dmap = d.density[my1:my2, mx1:mx2]
+                if dmap.shape != m.shape:
+                    dmap = dmap[:m.shape[0], :m.shape[1]]
+                if dmap.size > 0 and np.max(dmap) > 0:
+                    norm = dmap / (np.max(dmap) + 1e-6)
+                    heat = (norm * 255).astype(np.uint8)
+                    heat = cv2.applyColorMap(heat, cv2.COLORMAP_JET)
+                    roi = vis[y1:y2, x1:x2]
+                    alpha = 0.4
+                    blend = (roi.astype(np.float32) * (1 - alpha) + heat.astype(np.float32) * alpha).astype(np.uint8)
+                    roi[m] = blend[m]
+                    vis[y1:y2, x1:x2] = roi
+
             # --- 3. 只画轮廓，不填充颜色 ---
             m8 = (m.astype(np.uint8) * 255)
             contours, _ = cv2.findContours(m8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -777,6 +811,10 @@ class Detectron2SegInference(SegInferenceTemplate):
             # 没有分割掩码的模型无法用于本脚本
             return []
 
+        density_maps = None
+        if inst.has("pred_density_maps"):
+            density_maps = inst.pred_density_maps.detach().cpu().numpy().astype(np.float32)
+
         out = []
         N = bboxes.shape[0] if bboxes is not None else masks.shape[0]
         for i in range(N):
@@ -785,7 +823,8 @@ class Detectron2SegInference(SegInferenceTemplate):
                 "bbox": [x1, y1, x2, y2],
                 "score": float(scores[i]) if scores is not None else 0.0,
                 "label": int(labels[i]) if labels is not None else 0,
-                "mask": masks[i]
+                "mask": masks[i],
+                "density": density_maps[i] if density_maps is not None else None,
             })
         return out
 
