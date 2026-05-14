@@ -22,42 +22,48 @@ __all__ = ["COCOInstanceNewBaselineDatasetMapper", "generate_density_map", "visu
 
 def generate_density_map(points, image_size, sigma=3.0):
     """
-    Generate a density map from point annotations using Gaussian kernels.
+    Generate a normalized density map from point annotations using Gaussian kernels.
 
-    Args:
-        points: point coordinates. Supported formats:
-            - np.ndarray of shape (N, 2)
-            - list of [x, y] pairs: [[x1, y1], [x2, y2], ...]
-            - list of tensors (e.g., instances.gt_points): concatenated automatically
-        image_size (tuple): (H, W) of the target density map.
-        sigma (float or str): Gaussian sigma in pixels.
-            If "adaptive", uses k-nearest-neighbor distance * 0.3 (crowd counting heuristic).
-
-    Returns:
-        np.ndarray: (H, W) float32 density map. The integral over the map equals the
-        total number of valid points (within image bounds and with sigma > 0).
+    Each valid point contributes 1.0 to the density-map integral.
+    Therefore:
+        density_map.sum() ~= number of valid points
     """
     H, W = int(image_size[0]), int(image_size[1])
 
     # ---- Normalize input to (N, 2) np.ndarray ----
     if isinstance(points, list) and len(points) > 0:
         if torch.is_tensor(points[0]):
-            points = torch.cat([p for p in points if p.numel() > 0]).numpy()
+            valid_tensors = [p for p in points if p.numel() > 0]
+            if len(valid_tensors) == 0:
+                return np.zeros((H, W), dtype=np.float32)
+            points = torch.cat(valid_tensors, dim=0).detach().cpu().numpy()
         elif isinstance(points[0], np.ndarray):
-            points = np.concatenate([p for p in points if len(p) > 0], axis=0)
+            valid_arrays = [p for p in points if len(p) > 0]
+            if len(valid_arrays) == 0:
+                return np.zeros((H, W), dtype=np.float32)
+            points = np.concatenate(valid_arrays, axis=0)
         else:
             points = np.array(points, dtype=np.float32)
     else:
-        points = np.array(points, dtype=np.float32)
+        if torch.is_tensor(points):
+            points = points.detach().cpu().numpy()
+        else:
+            points = np.array(points, dtype=np.float32)
 
     points = points.reshape(-1, 2).astype(np.float32)
 
     if len(points) == 0:
         return np.zeros((H, W), dtype=np.float32)
 
-    # ---- Clip to image bounds ----
-    valid = (points[:, 0] >= 0) & (points[:, 0] < W) & (points[:, 1] >= 0) & (points[:, 1] < H)
+    # ---- Keep only points inside image bounds ----
+    valid = (
+        (points[:, 0] >= 0) &
+        (points[:, 0] < W) &
+        (points[:, 1] >= 0) &
+        (points[:, 1] < H)
+    )
     points = points[valid]
+
     if len(points) == 0:
         return np.zeros((H, W), dtype=np.float32)
 
@@ -67,50 +73,77 @@ def generate_density_map(points, image_size, sigma=3.0):
             from scipy.spatial import KDTree
             tree = KDTree(points)
             distances, _ = tree.query(points, k=min(4, len(points)))
-            avg_dist = distances[:, 1:].mean() if distances.ndim > 1 and distances.shape[1] > 1 else distances.mean()
-            sigma = max(avg_dist * 0.3, 1.0)
+
+            if distances.ndim > 1 and distances.shape[1] > 1:
+                avg_dist = distances[:, 1:].mean()
+            else:
+                avg_dist = distances.mean()
+
+            sigma = max(float(avg_dist) * 0.3, 1.0)
         except ImportError:
-            sigma = 3.0  # fallback if scipy not available
+            sigma = 3.0
     elif isinstance(sigma, str):
         sigma = 3.0
+
     sigma = float(sigma)
+
+    if sigma <= 0:
+        return np.zeros((H, W), dtype=np.float32)
 
     # ---- Generate Gaussian kernel ----
     ksize = int(6 * sigma)
     if ksize % 2 == 0:
         ksize += 1
+
     ksize = max(3, min(ksize, 99))
     half = ksize // 2
 
     ax = np.arange(-half, half + 1, dtype=np.float32)
-    gx = np.exp(-ax ** 2 / (2 * sigma ** 2))
-    kernel_2d = np.outer(gx, gx)  # 2D Gaussian via outer product
+    gx = np.exp(-(ax ** 2) / (2 * sigma ** 2))
+    kernel_2d = np.outer(gx, gx).astype(np.float32)
 
-    # ---- Add Gaussians to density map ----
+    # Normalize the full kernel first.
+    kernel_sum = kernel_2d.sum()
+    if kernel_sum <= 0:
+        return np.zeros((H, W), dtype=np.float32)
+
+    kernel_2d /= kernel_sum
+
+    # ---- Add normalized Gaussians to density map ----
     density_map = np.zeros((H, W), dtype=np.float32)
+
     for x0_f, y0_f in points:
-        x0, y0 = int(round(x0_f)), int(round(y0_f))
+        x0, y0 = int(round(float(x0_f))), int(round(float(y0_f)))
 
         x_min = x0 - half
         x_max = x0 + half + 1
         y_min = y0 - half
         y_max = y0 + half + 1
 
-        # Clamp to image bounds
+        # Kernel crop coordinates
         kx_min = max(0, -x_min)
         kx_max = ksize - max(0, x_max - W)
         ky_min = max(0, -y_min)
         ky_max = ksize - max(0, y_max - H)
 
+        # Image crop coordinates
         x_min = max(0, x_min)
         x_max = min(W, x_max)
         y_min = max(0, y_min)
         y_max = min(H, y_max)
 
         if x_min < x_max and y_min < y_max:
-            density_map[y_min:y_max, x_min:x_max] += kernel_2d[ky_min:ky_max, kx_min:kx_max]
+            patch = kernel_2d[ky_min:ky_max, kx_min:kx_max]
 
-    return density_map
+            # Important:
+            # Re-normalize the visible patch so that boundary points
+            # still contribute exactly 1.0.
+            patch_sum = patch.sum()
+
+            if patch_sum > 0:
+                density_map[y_min:y_max, x_min:x_max] += patch / patch_sum
+
+    return density_map.astype(np.float32)
 
 
 def convert_coco_poly_to_mask(segmentations, height, width):

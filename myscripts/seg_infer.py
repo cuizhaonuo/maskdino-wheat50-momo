@@ -131,41 +131,89 @@ def linspace_inclusive(start: float, end: float, num: int) -> List[float]:
 def _extract_density_peaks(
     density: np.ndarray,
     mask: Optional[np.ndarray],
-    min_value: float = 1e-6,
-    kernel_size: int = 7,
-    topk: Optional[int] = 15,
+    min_value: Optional[float] = None,
+    relative_thr: float = 0.1,
+    kernel_size: int = 5,
+    topk: Optional[int] = None,
 ) -> np.ndarray:
+    """
+    Extract local maxima from a density map.
+
+    Returns:
+        np.ndarray: (K, 2), local xy coordinates.
+    """
     if density is None or density.size == 0:
         return np.zeros((0, 2), dtype=np.int32)
-    dmap = density.astype(np.float32)
+
+    dmap = density.astype(np.float32).copy()
+
     if mask is not None:
-        dmap = dmap * mask.astype(np.float32)
-    if np.max(dmap) <= min_value:
+        mask_bool = mask.astype(bool)
+
+        # 保证 mask 和 density 尺寸一致
+        h = min(dmap.shape[0], mask_bool.shape[0])
+        w = min(dmap.shape[1], mask_bool.shape[1])
+        dmap = dmap[:h, :w]
+        mask_bool = mask_bool[:h, :w]
+
+        dmap = dmap * mask_bool.astype(np.float32)
+
+    max_value = float(np.max(dmap))
+    if max_value <= 0:
+        return np.zeros((0, 2), dtype=np.int32)
+
+    # 用相对阈值，而不是固定 1e-6
+    if min_value is None:
+        min_value = relative_thr * max_value
+
+    if max_value <= min_value:
         return np.zeros((0, 2), dtype=np.int32)
 
     k = max(3, int(kernel_size))
     if k % 2 == 0:
         k += 1
+
     dilated = cv2.dilate(dmap, np.ones((k, k), np.uint8))
-    peaks = (dmap >= dilated - 1e-6) & (dmap > min_value)
-    ys, xs = np.where(peaks)
-    if len(xs) == 0:
+    peak_mask = (dmap >= dilated - 1e-6) & (dmap > min_value)
+
+    if mask is not None:
+        peak_mask = peak_mask & mask_bool
+
+    # 每个平顶区域只保留一个最高点
+    num_labels, labels = cv2.connectedComponents(peak_mask.astype(np.uint8))
+
+    coords = []
+    scores = []
+
+    for label_id in range(1, num_labels):
+        ys, xs = np.where(labels == label_id)
+        if len(xs) == 0:
+            continue
+
+        values = dmap[ys, xs]
+        best_idx = int(np.argmax(values))
+
+        x = int(xs[best_idx])
+        y = int(ys[best_idx])
+        score = float(values[best_idx])
+
+        coords.append([x, y])
+        scores.append(score)
+
+    if len(coords) == 0:
         return np.zeros((0, 2), dtype=np.int32)
-    # 每个 peak 对应的 density 响应值，可以看作该点的强度/置信度
-    peak_scores = dmap[ys, xs]
 
-    # 按 density 响应从大到小排序
-    order = np.argsort(-peak_scores)
-    xs = xs[order]
-    ys = ys[order]
+    coords = np.asarray(coords, dtype=np.int32)
+    scores = np.asarray(scores, dtype=np.float32)
 
-    # 只保留前 topk 个
+    order = np.argsort(-scores)
+    coords = coords[order]
+
     if topk is not None:
         topk = max(0, int(topk))
-        xs = xs[:topk]
-        ys = ys[:topk]
+        coords = coords[:topk]
 
-    return np.stack([xs, ys], axis=1).astype(np.int32)
+    return coords.astype(np.int32)
 
 
 # -----------------------------
@@ -250,13 +298,32 @@ def _merge_two_proposals(a: DetProposal, b: DetProposal, score_mode: str = "keep
     # a 的偏移
     ay_off, ax_off = a.top - uy1, a.left - ux1
     canvas[ay_off:ay_off + a.mask.shape[0], ax_off:ax_off + a.mask.shape[1]] |= a.mask
+    # if density_canvas is not None and a.density is not None:
+    #     density_canvas[ay_off:ay_off + a.density.shape[0], ax_off:ax_off + a.density.shape[1]] += a.density
     if density_canvas is not None and a.density is not None:
-        density_canvas[ay_off:ay_off + a.density.shape[0], ax_off:ax_off + a.density.shape[1]] += a.density
+        roi = density_canvas[
+            ay_off:ay_off + a.density.shape[0],
+            ax_off:ax_off + a.density.shape[1]
+        ]
+        density_canvas[
+            ay_off:ay_off + a.density.shape[0],
+            ax_off:ax_off + a.density.shape[1]
+        ] = np.maximum(roi, a.density)
+
     # b 的偏移
     by_off, bx_off = b.top - uy1, b.left - ux1
     canvas[by_off:by_off + b.mask.shape[0], bx_off:bx_off + b.mask.shape[1]] |= b.mask
+    # if density_canvas is not None and b.density is not None:
+    #     density_canvas[by_off:by_off + b.density.shape[0], bx_off:bx_off + b.density.shape[1]] += b.density
     if density_canvas is not None and b.density is not None:
-        density_canvas[by_off:by_off + b.density.shape[0], bx_off:bx_off + b.density.shape[1]] += b.density
+        roi = density_canvas[
+            by_off:by_off + b.density.shape[0],
+            bx_off:bx_off + b.density.shape[1]
+        ]
+        density_canvas[
+            by_off:by_off + b.density.shape[0],
+            bx_off:bx_off + b.density.shape[1]
+        ] = np.maximum(roi, b.density)
 
     # 3) 对合成后的 mask 做紧致裁剪（去掉全零边框）
     if not canvas.any():
@@ -289,15 +356,31 @@ def _merge_two_proposals(a: DetProposal, b: DetProposal, score_mode: str = "keep
         # 默认：保留较大分数（保持“以高分实例为主”的语义）
         new_score = float(max(a.score, b.score))
 
+    new_points = None
+    if a.label == 1 and new_density is not None:
+        density_for_count = new_density * new_mask.astype(np.float32)
+        pred_k = int(round(float(density_for_count.sum())))
+        pred_k = max(0, pred_k)
+
+        new_points = _extract_density_peaks(
+            new_density,
+            new_mask,
+            min_value=None,
+            relative_thr=0.1,
+            kernel_size=5,
+            topk=pred_k,
+        )
+
     return DetProposal(
         bbox=new_bbox,
         score=new_score,
-        label=a.label,          # 如需也可做多数表决
+        label=a.label,
         mask=new_mask.astype(bool),
         top=int(new_top),
         left=int(new_left),
         area=int(new_area),
         density=new_density.astype(np.float32) if new_density is not None else None,
+        points=new_points,
     )
 
 
@@ -509,7 +592,18 @@ class SegInferenceTemplate:
                         density = ins["density"].astype(np.float32)
                         density_crop = density[y1t:y2t, x1t:x2t]
                         if int(ins.get("label", 0)) == 1:
-                            points = _extract_density_peaks(density_crop, mask_crop)
+                            density_for_count = density_crop * mask_crop.astype(np.float32)
+                            pred_k = int(round(float(density_for_count.sum())))
+                            pred_k = max(0, pred_k)
+
+                            points = _extract_density_peaks(
+                                density_crop,
+                                mask_crop,
+                                min_value=None,
+                                relative_thr=0.1,
+                                kernel_size=5,
+                                topk=pred_k,
+                            )
 
                     proposals.append(DetProposal(
                         bbox=np.array([gx1, gy1, gx2, gy2], dtype=float),
