@@ -128,8 +128,13 @@ def linspace_inclusive(start: float, end: float, num: int) -> List[float]:
     step = (end - start) / (num - 1)
     return [start + i * step for i in range(num)]
 
-def _extract_density_peaks(density: np.ndarray, mask: Optional[np.ndarray],
-                           min_value: float = 1e-6, kernel_size: int = 7) -> np.ndarray:
+def _extract_density_peaks(
+    density: np.ndarray,
+    mask: Optional[np.ndarray],
+    min_value: float = 1e-6,
+    kernel_size: int = 7,
+    topk: Optional[int] = 15,
+) -> np.ndarray:
     if density is None or density.size == 0:
         return np.zeros((0, 2), dtype=np.int32)
     dmap = density.astype(np.float32)
@@ -146,6 +151,20 @@ def _extract_density_peaks(density: np.ndarray, mask: Optional[np.ndarray],
     ys, xs = np.where(peaks)
     if len(xs) == 0:
         return np.zeros((0, 2), dtype=np.int32)
+    # 每个 peak 对应的 density 响应值，可以看作该点的强度/置信度
+    peak_scores = dmap[ys, xs]
+
+    # 按 density 响应从大到小排序
+    order = np.argsort(-peak_scores)
+    xs = xs[order]
+    ys = ys[order]
+
+    # 只保留前 topk 个
+    if topk is not None:
+        topk = max(0, int(topk))
+        xs = xs[:topk]
+        ys = ys[:topk]
+
     return np.stack([xs, ys], axis=1).astype(np.int32)
 
 
