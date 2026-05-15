@@ -26,5 +26,6 @@ from .test_time_augmentation import SemanticSegmentorWithTTA
 
 # evaluation
 from .evaluation.instance_evaluation import InstanceSegEvaluator
+from .evaluation.density_evaluation import DensityEvaluator
 # util
 from .utils import box_ops, misc, utils

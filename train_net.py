@@ -28,7 +28,7 @@ import torch
 import detectron2.utils.comm as comm
 from detectron2.checkpoint import DetectionCheckpointer
 from detectron2.config import get_cfg
-from detectron2.data import MetadataCatalog, build_detection_train_loader
+from detectron2.data import MetadataCatalog, build_detection_train_loader, build_detection_test_loader
 
 from detectron2.evaluation import (
     CityscapesInstanceEvaluator,
@@ -48,6 +48,7 @@ from detectron2.utils.logger import setup_logger
 from maskdino import (
     COCOInstanceNewBaselineDatasetMapper,
     COCOPanopticNewBaselineDatasetMapper,
+    DensityEvaluator,
     InstanceSegEvaluator,
     MaskFormerSemanticDatasetMapper,
     SemanticSegmentorWithTTA,
@@ -151,6 +152,7 @@ class Trainer(DefaultTrainer):
         # instance segmentation
         if evaluator_type == "coco":
             evaluator_list.append(COCOEvaluator(dataset_name, output_dir=output_folder))
+            evaluator_list.append(DensityEvaluator(dataset_name, output_dir=output_folder))
         # panoptic segmentation
         if evaluator_type in [
             "coco_panoptic_seg",
@@ -229,6 +231,15 @@ class Trainer(DefaultTrainer):
         else:
             mapper = None
             return build_detection_train_loader(cfg, mapper=mapper)
+
+    @classmethod
+    def build_test_loader(cls, cfg, dataset_name):
+        # Use the same dataset mapper as training so GT density maps
+        # are available for DensityEvaluator during evaluation.
+        if cfg.INPUT.DATASET_MAPPER_NAME == "coco_instance_lsj":
+            mapper = COCOInstanceNewBaselineDatasetMapper(cfg, False)
+            return build_detection_test_loader(cfg, dataset_name, mapper=mapper)
+        return build_detection_test_loader(cfg, dataset_name)
 
     @classmethod
     def build_lr_scheduler(cls, cfg, optimizer):

@@ -166,33 +166,41 @@ def convert_coco_poly_to_mask(segmentations, height, width):
 def build_transform_gen(cfg, is_train):
     """
     Create a list of default :class:`Augmentation` from config.
-    Now it includes resizing and flipping.
+    Training: random flip + resize + fixed crop.
+    Test: deterministic shortest-edge resize (no crop / flip).
     Returns:
         list[Augmentation]
     """
-    assert is_train, "Only support training augmentation"
-    image_size = cfg.INPUT.IMAGE_SIZE
-    min_scale = cfg.INPUT.MIN_SCALE
-    max_scale = cfg.INPUT.MAX_SCALE
+    if is_train:
+        image_size = cfg.INPUT.IMAGE_SIZE
+        min_scale = cfg.INPUT.MIN_SCALE
+        max_scale = cfg.INPUT.MAX_SCALE
 
-    augmentation = []
+        augmentation = []
 
-    if cfg.INPUT.RANDOM_FLIP != "none":
-        augmentation.append(
-            T.RandomFlip(
-                horizontal=cfg.INPUT.RANDOM_FLIP == "horizontal",
-                vertical=cfg.INPUT.RANDOM_FLIP == "vertical",
+        if cfg.INPUT.RANDOM_FLIP != "none":
+            augmentation.append(
+                T.RandomFlip(
+                    horizontal=cfg.INPUT.RANDOM_FLIP == "horizontal",
+                    vertical=cfg.INPUT.RANDOM_FLIP == "vertical",
+                )
             )
-        )
 
-    augmentation.extend([
-        T.ResizeScale(
-            min_scale=min_scale, max_scale=max_scale, target_height=image_size, target_width=image_size
-        ),
-        T.FixedSizeCrop(crop_size=(image_size, image_size)),
-    ])
+        augmentation.extend([
+            T.ResizeScale(
+                min_scale=min_scale, max_scale=max_scale, target_height=image_size, target_width=image_size
+            ),
+            T.FixedSizeCrop(crop_size=(image_size, image_size)),
+        ])
 
-    return augmentation
+        return augmentation
+    else:
+        augmentation = [
+            T.ResizeShortestEdge(
+                cfg.INPUT.MIN_SIZE_TEST, cfg.INPUT.MAX_SIZE_TEST
+            ),
+        ]
+        return augmentation
 
 
 class COCOInstanceNewBaselineDatasetMapper:
@@ -276,8 +284,58 @@ class COCOInstanceNewBaselineDatasetMapper:
         dataset_dict["padding_mask"] = torch.as_tensor(np.ascontiguousarray(padding_mask))
 
         if not self.is_train:
-            # USER: Modify this if you want to keep them for some reason.
-            dataset_dict.pop("annotations", None)
+            # ---- Keep GT annotations for evaluation ----
+            if "annotations" in dataset_dict:
+                annos = [
+                    obj for obj in dataset_dict.pop("annotations")
+                    if obj.get("iscrowd", 0) == 0
+                ]
+                H_orig, W_orig = dataset_dict["height"], dataset_dict["width"]
+
+                instances = utils.annotations_to_instances(annos, (H_orig, W_orig))
+                if not instances.has('gt_masks'):
+                    instances.gt_masks = PolygonMasks([])
+                instances.gt_boxes = instances.gt_masks.get_bounding_boxes()
+
+                # Filter empty instances
+                instances, keep = utils.filter_empty_instances(instances, return_mask=True)
+                kept_annos = [anno for anno, k in zip(annos, keep.tolist()) if k]
+
+                # Attach points
+                gt_points = [
+                    torch.as_tensor(anno["points"], dtype=torch.float32)
+                    if "points" in anno and len(anno["points"]) > 0
+                    else torch.zeros((0, 2), dtype=torch.float32)
+                    for anno in kept_annos
+                ]
+                instances.gt_points = gt_points
+
+                # Convert polygon masks to BitMasks
+                h, w = instances.image_size
+                if hasattr(instances, 'gt_masks') and len(instances.gt_masks) > 0:
+                    gt_masks = instances.gt_masks
+                    if hasattr(gt_masks, 'polygons'):
+                        gt_masks = convert_coco_poly_to_mask(gt_masks.polygons, h, w)
+                    instances.gt_masks = gt_masks
+
+                # Generate density maps at original image resolution
+                if len(instances) == 0:
+                    instances.gt_density_maps = torch.zeros((0, h, w), dtype=torch.float32)
+                else:
+                    density_maps = [
+                        torch.as_tensor(
+                            generate_density_map(
+                                pts.cpu().numpy() if torch.is_tensor(pts) else pts,
+                                (h, w),
+                            ),
+                            dtype=torch.float32,
+                        )
+                        for pts in instances.gt_points
+                    ]
+                    instances.gt_density_maps = torch.stack(density_maps, dim=0)
+
+                dataset_dict["instances"] = instances
+
             return dataset_dict
 
         if "annotations" in dataset_dict:
