@@ -56,7 +56,8 @@ from detectron2 import model_zoo
 # -----------------------------
 @dataclass
 class DatasetConfig:
-    yolo_root: str
+    yolo_root: Optional[str] = None
+    coco_root: Optional[str] = None
 
 @dataclass
 class ModelConfig:
@@ -121,6 +122,55 @@ def yolo_count_instances(label_path: str) -> int:
                 continue
             c += 1
     return c
+
+
+# -----------------------------
+# COCO helpers
+# -----------------------------
+def load_coco_annotations(coco_root: str, split: str):
+    """Load COCO annotation JSON via pycocotools."""
+    from pycocotools.coco import COCO
+    json_path = os.path.join(coco_root, "annotations", f"instances_{split}.json")
+    if not os.path.exists(json_path):
+        raise FileNotFoundError(f"COCO annotation not found: {json_path}")
+    return COCO(json_path)
+
+
+def _build_coco_img_index(coco) -> Dict[str, int]:
+    """Build {file_basename: img_id} reverse map."""
+    idx = {}
+    for img_id, img_info in coco.imgs.items():
+        idx[os.path.basename(img_info["file_name"])] = img_id
+    return idx
+
+
+def coco_list_images(coco_root: str, split: str) -> List[str]:
+    """Get sorted list of image paths for a COCO split."""
+    coco = load_coco_annotations(coco_root, split)
+    img_dir = os.path.join(coco_root, split)
+    images = []
+    for img_info in coco.loadImgs(coco.getImgIds()):
+        images.append(os.path.join(img_dir, img_info["file_name"]))
+    images.sort()
+    return images
+
+
+def coco_get_gt_count_and_points(coco, img_path: str) -> Tuple[int, List[np.ndarray]]:
+    """Return (instance_count, list_of_per_instance_point_arrays) for an image."""
+    img_id = _build_coco_img_index(coco).get(os.path.basename(img_path))
+    if img_id is None:
+        return 0, []
+    anns = coco.loadAnns(coco.getAnnIds(imgIds=[img_id]))
+    count = len(anns)
+    points_list = []
+    for ann in anns:
+        pts = ann.get("points", [])
+        if pts and len(pts) > 0:
+            points_list.append(np.array(pts, dtype=np.float32).reshape(-1, 2))
+        else:
+            points_list.append(np.zeros((0, 2), dtype=np.float32))
+    return count, points_list
+
 
 def linspace_inclusive(start: float, end: float, num: int) -> List[float]:
     if num <= 1:
@@ -440,10 +490,62 @@ class SegInferenceTemplate:
         self.search = search
         self.outputs = outputs
         self.model = None  # backend-specific predictor
+        self._coco_cache: Dict[str, Any] = {}  # key = "coco_root:split"
 
     # hooks
     def load_model(self): raise NotImplementedError
     def infer_tile(self, tile_img: np.ndarray) -> List[Dict[str, Any]]: raise NotImplementedError
+
+    # ====== Format-agnostic dispatch ======
+    def _detect_format(self) -> str:
+        """Return 'yolo' or 'coco' based on which root is configured."""
+        if self.dataset.coco_root is not None:
+            return "coco"
+        if self.dataset.yolo_root is not None:
+            return "yolo"
+        raise ValueError("Either yolo_root or coco_root must be set in DatasetConfig")
+
+    def _get_val_split_name(self) -> str:
+        """Return the validation split name used in grid search."""
+        return "val2017" if self._detect_format() == "coco" else "val"
+
+    def _get_coco_for_split(self, split: str):
+        """Load (cached) COCO object for a given split."""
+        cache_key = f"{self.dataset.coco_root}:{split}"
+        if cache_key not in self._coco_cache:
+            self._coco_cache[cache_key] = load_coco_annotations(self.dataset.coco_root, split)
+        return self._coco_cache[cache_key]
+
+    def _infer_split_from_path(self, img_path: str) -> str:
+        """Extract split name from an image path."""
+        if self._detect_format() == "coco":
+            rel = os.path.relpath(img_path, self.dataset.coco_root)
+        else:
+            rel = os.path.relpath(img_path, os.path.join(self.dataset.yolo_root, "images"))
+        return rel.split(os.sep)[0]
+
+    def _list_images(self, split: str) -> List[str]:
+        """List image paths for a split (format-agnostic)."""
+        if self._detect_format() == "coco":
+            return coco_list_images(self.dataset.coco_root, split)
+        imgs_dir, _ = yolo_split_paths(self.dataset.yolo_root, split)
+        return list_images_in_dir(imgs_dir)
+
+    def _get_gt_count(self, img_path: str) -> int:
+        """Get GT instance count for an image (format-agnostic)."""
+        if self._detect_format() == "coco":
+            coco = self._get_coco_for_split(self._infer_split_from_path(img_path))
+            count, _ = coco_get_gt_count_and_points(coco, img_path)
+            return count
+        return yolo_count_instances(yolo_label_path_for_image(img_path, self.dataset.yolo_root))
+
+    def _get_gt_points(self, img_path: str) -> List[np.ndarray]:
+        """Get GT per-instance point arrays (COCO only; YOLO returns [])."""
+        if self._detect_format() == "coco":
+            coco = self._get_coco_for_split(self._infer_split_from_path(img_path))
+            _, points = coco_get_gt_count_and_points(coco, img_path)
+            return points
+        return []
 
     # ====== Modes ======
     def run_search(self):
@@ -453,12 +555,12 @@ class SegInferenceTemplate:
         print("==> Loading model ..."); self.load_model()
 
         print("==> Collecting raw proposals on VAL ...")
-        val_imgs_dir, _ = yolo_split_paths(self.dataset.yolo_root, "val")
-        val_images = list_images_in_dir(val_imgs_dir)
+        val_split = self._get_val_split_name()
+        val_images = self._list_images(val_split)
         val_cache, val_gt_counts = {}, {}
         for img_path in tqdm(val_images, desc="VAL images"):
             val_cache[img_path] = self._proposals_for_image(img_path)
-            val_gt_counts[img_path] = yolo_count_instances(yolo_label_path_for_image(img_path, self.dataset.yolo_root))
+            val_gt_counts[img_path] = self._get_gt_count(img_path)
 
         print("==> Grid searching best parameters on VAL ...")
         best_cfg, best_sum_diff = self._grid_search(val_cache, val_gt_counts)
@@ -486,8 +588,7 @@ class SegInferenceTemplate:
 
     # ====== shared helpers ======
     def _run_on_split(self, split: str, iou_type: IOUType, score_thr: float, nms_iou_thr: float):
-        imgs_dir, _ = yolo_split_paths(self.dataset.yolo_root, split)
-        images = list_images_in_dir(imgs_dir)
+        images = self._list_images(split)
 
         rows = [("filename", "ins_counts", "pred_counts")]
         xs, ys = [], []
@@ -495,7 +596,7 @@ class SegInferenceTemplate:
             proposals = self._proposals_for_image(img_path)
             final_dets = self._apply_thresh_nms(proposals, score_thr, nms_iou_thr, iou_type)
             pred_count = len(final_dets)
-            gt_count = yolo_count_instances(yolo_label_path_for_image(img_path, self.dataset.yolo_root))
+            gt_count = self._get_gt_count(img_path)
             rows.append((os.path.basename(img_path), gt_count, pred_count))
             xs.append(gt_count); ys.append(pred_count)
             save_coco = False
@@ -986,8 +1087,10 @@ def build_argparser():
                    help="search: grid search on val then test; infer: direct inference with fixed params")
 
     # Dataset
-    p.add_argument("--yolo_root", type=str,
-                   default="/public/home/zncui/datasets/wheat-guo-dataset/yolo_wheat_big_image")
+    p.add_argument("--yolo_root", type=str, default=None,
+                   help="YOLO format dataset root directory.")
+    p.add_argument("--coco_root", type=str, default=None,
+                   help="COCO format dataset root directory.")
 
     # Model (兼容：本地相对路径 / 模型动物园别名 / detectron2:// / http URL)
     p.add_argument("--project_root", type=str,
@@ -1015,7 +1118,7 @@ def build_argparser():
     p.add_argument("--base_keep_score", type=float, default=0.01)
 
     # Infer-only fixed params
-    p.add_argument("--infer_split", choices=["test", "val", "train"], default="test")
+    p.add_argument("--infer_split", choices=["test", "val", "train", "train2017", "val2017", "test2017"], default="test")
     p.add_argument("--fix_iou_type", choices=["IOU", "IOU_Min"], default="IOU_Min")
     p.add_argument("--fix_score_thr", type=float, default=0.4)
     p.add_argument("--fix_nms_iou_thr", type=float, default=0.372)
@@ -1030,9 +1133,14 @@ def build_argparser():
 
 
 def main():
-    args = build_argparser().parse_args()
+    p = build_argparser()
+    args = p.parse_args()
 
-    dataset = DatasetConfig(yolo_root=args.yolo_root)
+    # Validate: exactly one of yolo_root or coco_root must be provided
+    if (args.yolo_root is not None) == (args.coco_root is not None):
+        p.error("Exactly one of --yolo_root or --coco_root must be provided.")
+
+    dataset = DatasetConfig(yolo_root=args.yolo_root, coco_root=args.coco_root)
     model = ModelConfig(
         project_root=args.project_root,
         config_rel=args.model_config_rel,
