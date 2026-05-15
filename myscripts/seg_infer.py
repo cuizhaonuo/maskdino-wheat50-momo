@@ -85,6 +85,7 @@ class OutputOptions:
     vis: bool = True
     excel: bool = True
     draw_scatter: bool = True
+    spikelet_grid: bool = False
     out_dir: str = "./vis_wheat_seg"
 
 
@@ -170,6 +171,57 @@ def coco_get_gt_count_and_points(coco, img_path: str) -> Tuple[int, List[np.ndar
         else:
             points_list.append(np.zeros((0, 2), dtype=np.float32))
     return count, points_list
+
+
+def coco_get_gt_instances(coco, img_path: str) -> List[Dict[str, Any]]:
+    """Return per-GT-instance dicts with keys: points, mask, bbox_xywh.
+
+    mask is a full-image binary mask decoded from polygon segmentation via cv2.fillPoly.
+    """
+    img_id = _build_coco_img_index(coco).get(os.path.basename(img_path))
+    if img_id is None:
+        return []
+    img_info = coco.imgs[img_id]
+    H, W = img_info["height"], img_info["width"]
+    anns = coco.loadAnns(coco.getAnnIds(imgIds=[img_id]))
+    instances = []
+    for ann in anns:
+        # --- mask from polygon segmentation ---
+        seg = ann.get("segmentation", [])
+        mask = np.zeros((H, W), dtype=bool)
+        if isinstance(seg, list):
+            # polygon format
+            mask_uint8 = np.zeros((H, W), dtype=np.uint8)
+            for poly in seg:
+                if len(poly) < 6:
+                    continue
+                pts = np.asarray(poly, dtype=np.float32).reshape(-1, 2)
+                pts = np.round(pts).astype(np.int32)
+                cv2.fillPoly(mask_uint8, [pts], 1)
+            mask = mask_uint8.astype(bool)
+        elif isinstance(seg, dict) and "counts" in seg and "size" in seg:
+            # RLE format
+            from pycocotools import mask as coco_mask_util
+            decoded = coco_mask_util.decode(seg)
+            if decoded.ndim == 3:
+                decoded = decoded[..., 0]
+            mask = decoded.astype(bool)
+
+        # --- points ---
+        pts = ann.get("points", [])
+        if pts and len(pts) > 0:
+            points = np.array(pts, dtype=np.float32).reshape(-1, 2)
+        else:
+            points = np.zeros((0, 2), dtype=np.float32)
+
+        # --- bbox (COCO xywh → xyxy) ---
+        bbox_xywh = ann.get("bbox", [0, 0, 0, 0])
+        instances.append({
+            "points": points,
+            "mask": mask,
+            "bbox_xywh": np.array(bbox_xywh, dtype=np.float32),
+        })
+    return instances
 
 
 def linspace_inclusive(start: float, end: float, num: int) -> List[float]:
@@ -547,6 +599,56 @@ class SegInferenceTemplate:
             return points
         return []
 
+    def _get_gt_instances(self, img_path: str) -> List[Dict[str, Any]]:
+        """Get GT per-instance dicts with points, mask, bbox (COCO only; YOLO returns [])."""
+        if self._detect_format() == "coco":
+            coco = self._get_coco_for_split(self._infer_split_from_path(img_path))
+            return coco_get_gt_instances(coco, img_path)
+        return []
+
+    def _match_predictions_to_gt(self, pred_dets: List[DetProposal],
+                                  gt_instances: List[Dict[str, Any]]) -> Dict[int, int]:
+        """Match each label=1 prediction to the best GT instance by mask IoU.
+
+        Returns:
+            dict[int, int]: {pred_index: gt_index}, only for preds with label==1 and IoU >= 0.1.
+        """
+        match = {}
+        if not gt_instances:
+            return match
+
+        for p_idx, det in enumerate(pred_dets):
+            if det.label != 1:
+                continue
+            # pred mask local crop shape
+            ph, pw = det.mask.shape
+            best_gt, best_iou = -1, 0.0
+            for g_idx, gt in enumerate(gt_instances):
+                gt_mask = gt["mask"]
+                # crop GT mask to pred bbox region
+                y1, x1 = int(det.top), int(det.left)
+                y2, x2 = y1 + ph, x1 + pw
+                H_gt, W_gt = gt_mask.shape
+                if x1 < 0 or y1 < 0 or x2 > W_gt or y2 > H_gt:
+                    # safety clamp
+                    x1c, y1c = max(0, x1), max(0, y1)
+                    x2c, y2c = min(W_gt, x2), min(H_gt, y2)
+                    gt_crop = gt_mask[y1c:y2c, x1c:x2c]
+                    pred_crop = det.mask[y1c - y1:y2c - y1, x1c - x1:x2c - x1]
+                else:
+                    gt_crop = gt_mask[y1:y2, x1:x2]
+                    pred_crop = det.mask
+                if gt_crop.shape != pred_crop.shape:
+                    continue
+                inter = np.logical_and(gt_crop, pred_crop).sum()
+                union = np.logical_or(gt_crop, pred_crop).sum()
+                iou = inter / union if union > 0 else 0.0
+                if iou > best_iou:
+                    best_iou, best_gt = iou, g_idx
+            if best_gt >= 0 and best_iou >= 0.05:
+                match[p_idx] = best_gt
+        return match
+
     # ====== Modes ======
     def run_search(self):
         """Grid-search on val, then test with best params."""
@@ -606,6 +708,8 @@ class SegInferenceTemplate:
                 self._save_coco_annotation(img_id, start_ins_id, img_path, final_dets, self.outputs.out_dir)
             if self.outputs.vis:
                 self._visualize_and_save(img_path, final_dets, self.outputs.out_dir)
+            if self.outputs.spikelet_grid:
+                self._visualize_spikelet_grid(img_path, final_dets, self.outputs.out_dir)
 
         if self.outputs.excel:
             csv_path = os.path.join(self.outputs.out_dir, f"{split}_pred_vs_gt.csv")
@@ -952,6 +1056,131 @@ class SegInferenceTemplate:
         plt.title("GT vs Pred")
         plt.tight_layout(); plt.savefig(out_path, dpi=160); plt.close()
 
+    def _visualize_spikelet_grid(self, img_path: str, dets: List[DetProposal],
+                                  out_dir: str):
+        """Generate N×4 grid at full-image scale: GT points | GT density | Pred points | Pred density.
+
+        One row per label=1 prediction. GT columns are matched via mask IoU.
+        All subplots show the full original image as background (no cropping).
+        """
+        label1_dets = [d for d in dets if d.label == 1]
+        N = len(label1_dets)
+        if N == 0:
+            print(f"[spikelet_grid] No label=1 predictions for {os.path.basename(img_path)}, skip.")
+            return
+
+        # Read original image
+        img_bgr = cv2.imread(img_path)
+        if img_bgr is None:
+            return
+        H, W = img_bgr.shape[:2]
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+
+        gt_instances = self._get_gt_instances(img_path)
+        match = self._match_predictions_to_gt(dets, gt_instances)
+
+        # Build ordered label=1 index list with their GT match
+        label1_idx_in_dets = [i for i, d in enumerate(dets) if d.label == 1]
+
+        # Lazy import generate_density_map (only once)
+        from maskdino.data.dataset_mappers.coco_instance_new_baseline_dataset_mapper import generate_density_map
+
+        fig, axes = plt.subplots(N, 4, figsize=(4 * 3.5, N * 3.5))
+        if N == 1:
+            axes = axes.reshape(1, -1)
+
+        col_titles = ["GT points", "GT density (Gaussian)", "Pred points", "Pred density (model)"]
+
+        for row, (det_idx, det) in enumerate(zip(label1_idx_in_dets, label1_dets)):
+            gt_idx = match.get(det_idx, -1)
+
+            # Compute pred mask contour in global coords (for context outline)
+            mask_uint8 = (det.mask.astype(np.uint8) * 255)
+            contours, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            global_contours = []
+            for cnt in contours:
+                cnt_global = cnt.copy()
+                cnt_global[:, 0, 0] += int(det.left)
+                cnt_global[:, 0, 1] += int(det.top)
+                global_contours.append(cnt_global)
+
+            # --- common axis setup (full image extent, original image bg) ---
+            for col in range(4):
+                ax = axes[row, col]
+                ax.set_xlim(0, W)
+                ax.set_ylim(H, 0)
+                ax.set_aspect("equal")
+                ax.set_xticks([])
+                ax.set_yticks([])
+                ax.imshow(img_rgb, extent=[0, W, H, 0], zorder=0)
+
+            # --- Col 0: GT points on original image ---
+            ax0 = axes[row, 0]
+            if gt_idx >= 0:
+                gt_pts = gt_instances[gt_idx]["points"]
+                if len(gt_pts) > 0:
+                    ax0.scatter(gt_pts[:, 0], gt_pts[:, 1], c="red", s=4, marker="o", zorder=3)
+            for cnt in global_contours:
+                ax0.plot(cnt[:, 0, 0], cnt[:, 0, 1], color="lime", linewidth=1.5, zorder=2)
+
+            # --- Col 1: GT density overlaid on original image ---
+            ax1 = axes[row, 1]
+            if gt_idx >= 0:
+                gt_pts = gt_instances[gt_idx]["points"]
+                if len(gt_pts) > 0:
+                    gt_density = generate_density_map(gt_pts, (H, W), sigma=3.0)
+                    gt_density_norm = gt_density / (np.max(gt_density) + 1e-6)
+                    ax1.imshow(gt_density_norm, cmap="jet", alpha=0.5, extent=[0, W, H, 0], zorder=1)
+            for cnt in global_contours:
+                ax1.plot(cnt[:, 0, 0], cnt[:, 0, 1], color="lime", linewidth=1.5, zorder=2)
+
+            # --- Col 2: Predicted points on original image ---
+            ax2 = axes[row, 2]
+            if det.points is not None and len(det.points) > 0:
+                gx = det.points[:, 0] + det.left
+                gy = det.points[:, 1] + det.top
+                ax2.scatter(gx, gy, c="cyan", s=4, marker="o", zorder=3)
+            for cnt in global_contours:
+                ax2.plot(cnt[:, 0, 0], cnt[:, 0, 1], color="red", linewidth=1.5, zorder=2)
+
+            # --- Col 3: Predicted density overlaid on original image ---
+            ax3 = axes[row, 3]
+            if det.density is not None and det.density.size > 0 and np.max(det.density) > 0:
+                full_density = np.zeros((H, W), dtype=np.float32)
+                y1, x1 = int(det.top), int(det.left)
+                y2 = y1 + det.density.shape[0]
+                x2 = x1 + det.density.shape[1]
+                y1c, y2c = max(0, y1), min(H, y2)
+                x1c, x2c = max(0, x1), min(W, x2)
+                dy1 = y1c - y1
+                dy2 = y2c - y1
+                dx1 = x1c - x1
+                dx2 = x2c - x1
+                full_density[y1c:y2c, x1c:x2c] = det.density[dy1:dy2, dx1:dx2]
+                full_norm = full_density / (np.max(full_density) + 1e-6)
+                ax3.imshow(full_norm, cmap="jet", alpha=0.5, extent=[0, W, H, 0], zorder=1)
+            for cnt in global_contours:
+                ax3.plot(cnt[:, 0, 0], cnt[:, 0, 1], color="red", linewidth=1.5, zorder=2)
+
+            # --- row label ---
+            gt_npts = len(gt_instances[gt_idx]["points"]) if gt_idx >= 0 else 0
+            pred_npts = len(det.points) if det.points is not None else 0
+            axes[row, 0].set_ylabel(f"R{row+1} s={det.score:.2f}\nGT:{gt_npts} Pr:{pred_npts}",
+                                    fontsize=7, rotation=0, labelpad=30, va="center")
+
+        # --- column titles (top row) ---
+        for col, title in enumerate(col_titles):
+            axes[0, col].set_title(title, fontsize=9)
+
+        fig.suptitle(os.path.basename(img_path), fontsize=10, y=1.01)
+        fig.tight_layout()
+
+        out_name = os.path.splitext(os.path.basename(img_path))[0] + "_spikelet_grid.png"
+        out_path = os.path.join(out_dir, out_name)
+        fig.savefig(out_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"[spikelet_grid] Saved -> {out_path}")
+
 
 # -----------------------------
 # Detectron2 impl
@@ -1128,6 +1357,8 @@ def build_argparser():
     p.add_argument("--no_vis", action="store_true")
     p.add_argument("--no_excel", action="store_true")
     p.add_argument("--no_scatter", action="store_true")
+    p.add_argument("--spikelet_grid", action="store_true",
+                   help="Generate Nx4 spikelet visualization grid (GT vs Pred points/density).")
 
     return p
 
@@ -1159,6 +1390,7 @@ def main():
         vis=not args.no_vis,
         excel=not args.no_excel,
         draw_scatter=not args.no_scatter,
+        spikelet_grid=args.spikelet_grid,
         out_dir=args.out_dir
     )
 
