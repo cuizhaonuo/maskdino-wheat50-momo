@@ -1,0 +1,28 @@
+MODEL:
+  META_ARCHITECTURE: "GeneralizedRCNN"
+  RPN:
+    PRE_NMS_TOPK_TEST: 6000
+    POST_NMS_TOPK_TEST: 1000
+  ROI_HEADS:
+    NAME: "Res5ROIHeads"
+    NUM_CLASSES: 2
+
+DATASETS:
+  TRAIN: ("maize_rice_coco_train",)
+  TEST: ("maize_rice_coco_val",)
+
+# 400 images / 16 ims_per_batch = 25 iters per epoch
+# 25 * 200 epoch = 5000 iters
+# 25 * 100 epoch = 2500 iters
+SOLVER:
+  IMS_PER_BATCH: 4 # 16
+  BASE_LR: 0.0001
+  STEPS: (2000, 2300)
+  MAX_ITER: 2500
+  AMP:
+    ENABLED: True
+TEST:
+  EVAL_PERIOD: 50
+INPUT:
+  MIN_SIZE_TRAIN: (640, 672, 704, 736, 768, 800)
+VERSION: 2
