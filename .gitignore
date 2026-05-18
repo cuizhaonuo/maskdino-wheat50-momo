@@ -51,3 +51,13 @@ _darcs
 /projects/*/datasets
 /models
 /snippet
+
+# Git backup
+.git_backup/
+**/.git_backup/
+
+# detectron2 build/cache
+detectron2/build/
+detectron2/**/*.so
+detectron2/**/*.egg-info/
+detectron2/**/__pycache__/
