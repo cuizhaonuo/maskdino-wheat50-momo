@@ -20,30 +20,75 @@ from pycocotools import mask as coco_mask
 __all__ = ["COCOInstanceNewBaselineDatasetMapper", "generate_density_map", "visualize_dataset_dict", "visualize_density_maps_grid"]
 
 
-def generate_density_map(points, image_size, sigma=3.0):
+def generate_density_map(
+    points,
+    image_size=(256, 256),
+    sigma=1.5,
+    src_image_size=(1024, 1024),
+):
     """
     Generate a normalized density map from point annotations using Gaussian kernels.
 
-    Each valid point contributes 1.0 to the density-map integral.
-    Therefore:
-        density_map.sum() ~= number of valid points
+    Important:
+        points are annotated in the original image coordinate system, e.g. 1024x1024.
+        This function will scale points to the target density-map coordinate system.
+
+    Args:
+        points:
+            Point annotations in original image coordinates.
+            Format:
+                [[x1, y1], [x2, y2], ...]
+                or torch.Tensor / np.ndarray with shape [N, 2]
+
+        image_size:
+            Target density map size as (H, W), e.g. (256, 256).
+
+        sigma:
+            Gaussian sigma in target density-map pixels.
+            Since points are scaled from 1024 to 256, do not use the old sigma=3 directly.
+            Recommended first value: 1.5.
+
+        src_image_size:
+            Original image size as (H, W), e.g. (1024, 1024).
+
+    Returns:
+        density_map:
+            np.ndarray with shape [H, W], dtype float32.
+            Each valid point contributes integral 1.0.
+            Therefore:
+                density_map.sum() ~= number of valid points.
     """
     H, W = int(image_size[0]), int(image_size[1])
+    src_H, src_W = int(src_image_size[0]), int(src_image_size[1])
+
+    if H <= 0 or W <= 0:
+        raise ValueError(f"Invalid image_size: {image_size}")
+
+    if src_H <= 0 or src_W <= 0:
+        raise ValueError(f"Invalid src_image_size: {src_image_size}")
+
+    density_map = np.zeros((H, W), dtype=np.float32)
 
     # ---- Normalize input to (N, 2) np.ndarray ----
+    if points is None:
+        return density_map
+
     if isinstance(points, list) and len(points) > 0:
         if torch.is_tensor(points[0]):
-            valid_tensors = [p for p in points if p.numel() > 0]
+            valid_tensors = [p for p in points if p is not None and p.numel() > 0]
             if len(valid_tensors) == 0:
-                return np.zeros((H, W), dtype=np.float32)
+                return density_map
             points = torch.cat(valid_tensors, dim=0).detach().cpu().numpy()
+
         elif isinstance(points[0], np.ndarray):
-            valid_arrays = [p for p in points if len(p) > 0]
+            valid_arrays = [p for p in points if p is not None and len(p) > 0]
             if len(valid_arrays) == 0:
-                return np.zeros((H, W), dtype=np.float32)
+                return density_map
             points = np.concatenate(valid_arrays, axis=0)
+
         else:
             points = np.array(points, dtype=np.float32)
+
     else:
         if torch.is_tensor(points):
             points = points.detach().cpu().numpy()
@@ -53,26 +98,44 @@ def generate_density_map(points, image_size, sigma=3.0):
     points = points.reshape(-1, 2).astype(np.float32)
 
     if len(points) == 0:
-        return np.zeros((H, W), dtype=np.float32)
+        return density_map
 
-    # ---- Keep only points inside image bounds ----
-    valid = (
-        (points[:, 0] >= 0) &
-        (points[:, 0] < W) &
-        (points[:, 1] >= 0) &
-        (points[:, 1] < H)
+    # ---- Keep only points inside original image bounds ----
+    valid_src = (
+        (points[:, 0] >= 0)
+        & (points[:, 0] < src_W)
+        & (points[:, 1] >= 0)
+        & (points[:, 1] < src_H)
     )
-    points = points[valid]
+    points = points[valid_src]
 
     if len(points) == 0:
-        return np.zeros((H, W), dtype=np.float32)
+        return density_map
+
+    # ---- Scale points from source image coordinates to target density-map coordinates ----
+    points_scaled = points.copy()
+    points_scaled[:, 0] = points_scaled[:, 0] * float(W) / float(src_W)
+    points_scaled[:, 1] = points_scaled[:, 1] * float(H) / float(src_H)
+
+    # ---- Keep only points inside target density-map bounds after scaling ----
+    valid_tgt = (
+        (points_scaled[:, 0] >= 0)
+        & (points_scaled[:, 0] < W)
+        & (points_scaled[:, 1] >= 0)
+        & (points_scaled[:, 1] < H)
+    )
+    points_scaled = points_scaled[valid_tgt]
+
+    if len(points_scaled) == 0:
+        return density_map
 
     # ---- Determine sigma ----
-    if sigma == "adaptive" and len(points) >= 3:
+    if sigma == "adaptive" and len(points_scaled) >= 3:
         try:
             from scipy.spatial import KDTree
-            tree = KDTree(points)
-            distances, _ = tree.query(points, k=min(4, len(points)))
+
+            tree = KDTree(points_scaled)
+            distances, _ = tree.query(points_scaled, k=min(4, len(points_scaled)))
 
             if distances.ndim > 1 and distances.shape[1] > 1:
                 avg_dist = distances[:, 1:].mean()
@@ -80,18 +143,20 @@ def generate_density_map(points, image_size, sigma=3.0):
                 avg_dist = distances.mean()
 
             sigma = max(float(avg_dist) * 0.3, 1.0)
+
         except ImportError:
-            sigma = 3.0
+            sigma = 1.5
+
     elif isinstance(sigma, str):
-        sigma = 3.0
+        sigma = 1.5
 
     sigma = float(sigma)
 
     if sigma <= 0:
-        return np.zeros((H, W), dtype=np.float32)
+        return density_map
 
     # ---- Generate Gaussian kernel ----
-    ksize = int(6 * sigma)
+    ksize = int(np.ceil(6 * sigma))
     if ksize % 2 == 0:
         ksize += 1
 
@@ -102,46 +167,50 @@ def generate_density_map(points, image_size, sigma=3.0):
     gx = np.exp(-(ax ** 2) / (2 * sigma ** 2))
     kernel_2d = np.outer(gx, gx).astype(np.float32)
 
-    # Normalize the full kernel first.
-    kernel_sum = kernel_2d.sum()
+    kernel_sum = float(kernel_2d.sum())
     if kernel_sum <= 0:
-        return np.zeros((H, W), dtype=np.float32)
+        return density_map
 
     kernel_2d /= kernel_sum
 
     # ---- Add normalized Gaussians to density map ----
-    density_map = np.zeros((H, W), dtype=np.float32)
+    for x_f, y_f in points_scaled:
+        # Use floor + clip instead of round.
+        # This avoids x=255.9 becoming 256 after rounding.
+        x0 = int(np.floor(float(x_f)))
+        y0 = int(np.floor(float(y_f)))
 
-    for x0_f, y0_f in points:
-        x0, y0 = int(round(float(x0_f))), int(round(float(y0_f)))
+        x0 = min(max(x0, 0), W - 1)
+        y0 = min(max(y0, 0), H - 1)
 
         x_min = x0 - half
         x_max = x0 + half + 1
         y_min = y0 - half
         y_max = y0 + half + 1
 
-        # Kernel crop coordinates
+        # Kernel crop coordinates.
         kx_min = max(0, -x_min)
         kx_max = ksize - max(0, x_max - W)
         ky_min = max(0, -y_min)
         ky_max = ksize - max(0, y_max - H)
 
-        # Image crop coordinates
+        # Image crop coordinates.
         x_min = max(0, x_min)
         x_max = min(W, x_max)
         y_min = max(0, y_min)
         y_max = min(H, y_max)
 
-        if x_min < x_max and y_min < y_max:
-            patch = kernel_2d[ky_min:ky_max, kx_min:kx_max]
+        if x_min >= x_max or y_min >= y_max:
+            continue
 
-            # Important:
-            # Re-normalize the visible patch so that boundary points
-            # still contribute exactly 1.0.
-            patch_sum = patch.sum()
+        patch = kernel_2d[ky_min:ky_max, kx_min:kx_max]
+        patch_sum = float(patch.sum())
 
-            if patch_sum > 0:
-                density_map[y_min:y_max, x_min:x_max] += patch / patch_sum
+        if patch_sum <= 0:
+            continue
+
+        # Re-normalize visible patch so boundary points still contribute exactly 1.0.
+        density_map[y_min:y_max, x_min:x_max] += patch / patch_sum
 
     return density_map.astype(np.float32)
 
@@ -286,22 +355,49 @@ class COCOInstanceNewBaselineDatasetMapper:
         if not self.is_train:
             # ---- Keep GT annotations for evaluation ----
             if "annotations" in dataset_dict:
-                annos = [
+                # Remove crowd annotations
+                annos_raw = [
                     obj for obj in dataset_dict.pop("annotations")
                     if obj.get("iscrowd", 0) == 0
                 ]
-                H_orig, W_orig = dataset_dict["height"], dataset_dict["width"]
 
-                instances = utils.annotations_to_instances(annos, (H_orig, W_orig))
-                if not instances.has('gt_masks'):
+                # Apply the same test-time transforms to annotations.
+                # Important:
+                # The image has already been transformed by:
+                #     image, transforms = T.apply_transform_gens(self.tfm_gens, image)
+                # Therefore boxes / masks / points must be transformed to the same image_shape.
+                annos = [
+                    utils.transform_instance_annotations(obj, transforms, image_shape)
+                    for obj in annos_raw
+                ]
+
+                # Transform points manually because Detectron2 does not know custom "points".
+                for anno in annos:
+                    if "points" in anno and len(anno["points"]) > 0:
+                        points = np.array(anno["points"], dtype=np.float32)
+                        points = transforms.apply_coords(points)
+
+                        # Filter out-of-bounds points after resize / crop.
+                        inside = (points >= np.array([0, 0])) & (points < np.array(image_shape[::-1]))
+                        inside = inside.all(axis=1)
+                        points = points[inside]
+
+                        anno["points"] = points.tolist()
+
+                # Convert annotations to Instances under transformed image size.
+                instances = utils.annotations_to_instances(annos, image_shape)
+
+                if not instances.has("gt_masks"):
                     instances.gt_masks = PolygonMasks([])
+
+                # Recompute boxes from masks, consistent with training branch.
                 instances.gt_boxes = instances.gt_masks.get_bounding_boxes()
 
-                # Filter empty instances
+                # Filter empty instances after transform.
                 instances, keep = utils.filter_empty_instances(instances, return_mask=True)
                 kept_annos = [anno for anno, k in zip(annos, keep.tolist()) if k]
 
-                # Attach points
+                # Attach transformed points to Instances after filtering.
                 gt_points = [
                     torch.as_tensor(anno["points"], dtype=torch.float32)
                     if "points" in anno and len(anno["points"]) > 0
@@ -310,29 +406,62 @@ class COCOInstanceNewBaselineDatasetMapper:
                 ]
                 instances.gt_points = gt_points
 
-                # Convert polygon masks to BitMasks
+                # Convert polygon masks to tensor masks.
                 h, w = instances.image_size
-                if hasattr(instances, 'gt_masks') and len(instances.gt_masks) > 0:
+                if hasattr(instances, "gt_masks"):
                     gt_masks = instances.gt_masks
-                    if hasattr(gt_masks, 'polygons'):
+                    if hasattr(gt_masks, "polygons"):
                         gt_masks = convert_coco_poly_to_mask(gt_masks.polygons, h, w)
                     instances.gt_masks = gt_masks
 
-                # Generate density maps at original image resolution
+                # ---- Generate density maps from points (per instance) ----
+                density_h, density_w = 256, 256
+
                 if len(instances) == 0:
-                    instances.gt_density_maps = torch.zeros((0, h, w), dtype=torch.float32)
+                    instances.gt_density_maps = torch.zeros(
+                        (0, density_h, density_w),
+                        dtype=torch.float32,
+                    )
+                    instances.gt_density_counts = torch.zeros(
+                        (0,),
+                        dtype=torch.float32,
+                    )
+                    instances.gt_has_density = torch.zeros(
+                        (0,),
+                        dtype=torch.bool,
+                    )
                 else:
-                    density_maps = [
-                        torch.as_tensor(
-                            generate_density_map(
-                                pts.cpu().numpy() if torch.is_tensor(pts) else pts,
-                                (h, w),
-                            ),
-                            dtype=torch.float32,
+                    density_maps = []
+                    density_counts = []
+                    has_density = []
+
+                    for pts in instances.gt_points:
+                        pts_np = pts.cpu().numpy() if torch.is_tensor(pts) else pts
+
+                        density = generate_density_map(
+                            points=pts_np,
+                            image_size=(density_h, density_w),
+                            sigma=1.5,
+                            src_image_size=(h, w),
                         )
-                        for pts in instances.gt_points
-                    ]
+
+                        density_tensor = torch.as_tensor(density, dtype=torch.float32)
+                        count = float(density_tensor.sum().item())
+
+                        density_maps.append(density_tensor)
+                        density_counts.append(count)
+                        has_density.append(count > 0)
+
                     instances.gt_density_maps = torch.stack(density_maps, dim=0)
+                    instances.gt_density_counts = torch.tensor(
+                        density_counts,
+                        dtype=torch.float32,
+                    )
+                    instances.gt_has_density = torch.tensor(
+                        has_density,
+                        dtype=torch.bool,
+                    )
+                # ---------------------------------------------------------
 
                 dataset_dict["instances"] = instances
 
@@ -397,20 +526,37 @@ class COCOInstanceNewBaselineDatasetMapper:
                 instances.gt_masks = gt_masks
 
             # ---- Generate density maps from points (per instance) ----
+            density_h, density_w = 256, 256
+
             if len(instances) == 0:
-                instances.gt_density_maps = torch.zeros((0, h, w), dtype=torch.float32)
+                instances.gt_density_maps = torch.zeros((0, density_h, density_w), dtype=torch.float32)
+                instances.gt_density_counts = torch.zeros((0,), dtype=torch.float32)
+                instances.gt_has_density = torch.zeros((0,), dtype=torch.bool)
             else:
-                density_maps = [
-                    torch.as_tensor(
-                        generate_density_map(
-                            pts.cpu().numpy() if torch.is_tensor(pts) else pts,
-                            (h, w),
-                        ),
-                        dtype=torch.float32,
+                density_maps = []
+                density_counts = []
+                has_density = []
+
+                for pts in instances.gt_points:
+                    pts_np = pts.cpu().numpy() if torch.is_tensor(pts) else pts
+
+                    density = generate_density_map(
+                        points=pts_np,
+                        image_size=(density_h, density_w),
+                        sigma=1.5,
+                        src_image_size=(h, w),
                     )
-                    for pts in instances.gt_points
-                ]
+
+                    density_tensor = torch.as_tensor(density, dtype=torch.float32)
+                    count = float(density_tensor.sum().item())
+
+                    density_maps.append(density_tensor)
+                    density_counts.append(count)
+                    has_density.append(count > 0)
+
                 instances.gt_density_maps = torch.stack(density_maps, dim=0)
+                instances.gt_density_counts = torch.tensor(density_counts, dtype=torch.float32)
+                instances.gt_has_density = torch.tensor(has_density, dtype=torch.bool)
             # ---------------------------------------------------------
 
             dataset_dict["instances"] = instances

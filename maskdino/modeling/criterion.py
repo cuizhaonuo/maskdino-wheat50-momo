@@ -339,12 +339,11 @@ class SetCriterion(nn.Module):
         target_density = target_density[tgt_idx]
 
         if target_density.shape[-2:] != src_density.shape[-2:]:
-            target_density = F.interpolate(
-                target_density[:, None],
-                size=src_density.shape[-2:],
-                mode="bilinear",
-                align_corners=False,
-            ).squeeze(1)
+            raise ValueError(
+                f"Density target size {target_density.shape[-2:]} does not match "
+                f"prediction size {src_density.shape[-2:]}. "
+                "Generate GT density directly at prediction resolution."
+            )
 
         valid = target_density.flatten(1).sum(dim=1) > 0
         if valid.any():
@@ -407,7 +406,7 @@ class SetCriterion(nn.Module):
             'labels': self.loss_labels_ce if self.semantic_ce_loss else self.loss_labels,
             'masks': self.loss_masks,
             'boxes': self.loss_boxes_panoptic if self.panoptic_on else self.loss_boxes,
-            'density': self.loss_sampling_density,
+            'density': self.loss_density,
         }
         assert loss in loss_map, f"do you really want to compute {loss} loss?"
         return loss_map[loss](outputs, targets, indices, num_masks)
