@@ -21,10 +21,10 @@ __all__ = ["COCOInstanceNewBaselineDatasetMapper", "generate_density_map", "visu
 
 
 def generate_density_map(
-    points,
-    image_size=(256, 256),
-    sigma=1.5,
-    src_image_size=(1024, 1024),
+        points,
+        image_size=(256, 256),
+        sigma=1.5,
+        src_image_size=(1024, 1024),
 ):
     """
     Generate a normalized density map from point annotations using Gaussian kernels.
@@ -102,10 +102,10 @@ def generate_density_map(
 
     # ---- Keep only points inside original image bounds ----
     valid_src = (
-        (points[:, 0] >= 0)
-        & (points[:, 0] < src_W)
-        & (points[:, 1] >= 0)
-        & (points[:, 1] < src_H)
+            (points[:, 0] >= 0)
+            & (points[:, 0] < src_W)
+            & (points[:, 1] >= 0)
+            & (points[:, 1] < src_H)
     )
     points = points[valid_src]
 
@@ -119,10 +119,10 @@ def generate_density_map(
 
     # ---- Keep only points inside target density-map bounds after scaling ----
     valid_tgt = (
-        (points_scaled[:, 0] >= 0)
-        & (points_scaled[:, 0] < W)
-        & (points_scaled[:, 1] >= 0)
-        & (points_scaled[:, 1] < H)
+            (points_scaled[:, 0] >= 0)
+            & (points_scaled[:, 0] < W)
+            & (points_scaled[:, 1] >= 0)
+            & (points_scaled[:, 1] < H)
     )
     points_scaled = points_scaled[valid_tgt]
 
@@ -289,11 +289,11 @@ class COCOInstanceNewBaselineDatasetMapper:
 
     @configurable
     def __init__(
-        self,
-        is_train=True,
-        *,
-        tfm_gens,
-        image_format,
+            self,
+            is_train=True,
+            *,
+            tfm_gens,
+            image_format,
     ):
         """
         NOTE: this interface is experimental.
@@ -310,7 +310,7 @@ class COCOInstanceNewBaselineDatasetMapper:
 
         self.img_format = image_format
         self.is_train = is_train
-    
+
     @classmethod
     def from_config(cls, cfg, is_train=True):
         # Build augmentation
@@ -684,4 +684,3 @@ def visualize_density_maps_grid(dataset_dict, grid_size=3, min_sum=1e-6, cmap="m
 
     fig.tight_layout()
     return fig
-

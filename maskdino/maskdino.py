@@ -380,8 +380,9 @@ class MaskDINO(nn.Module):
                 target_dict["points"] = targets_per_image.gt_points
             if hasattr(targets_per_image, "gt_density_maps"):
                 gt_density_maps = targets_per_image.gt_density_maps
+                density_h, density_w = gt_density_maps.shape[-2:]
                 padded_density_maps = torch.zeros(
-                    (gt_density_maps.shape[0], h_pad, w_pad),
+                    (gt_density_maps.shape[0], density_h, density_w),
                     dtype=gt_density_maps.dtype,
                     device=gt_density_maps.device,
                 )
