@@ -73,6 +73,16 @@ def add_maskdino_config(cfg):
 
     cfg.MODEL.MaskDINO.EVAL_FLAG = 1
 
+    # ===== 小穗点回归（逐实例点预测）配置 =====
+    # 每个实例 query 预测的小穗点数量上限（数据集中单穗最多 23 个小穗，50 余量充足）
+    cfg.MODEL.MaskDINO.NUM_POINTS = 50
+    # 点损失权重
+    cfg.MODEL.MaskDINO.POINT_COORD_WEIGHT = 5.0   # 点坐标 L1 回归损失
+    cfg.MODEL.MaskDINO.POINT_CLASS_WEIGHT = 2.0   # 点存在性 focal 分类损失
+    # 内层匈牙利匹配的代价权重
+    cfg.MODEL.MaskDINO.COST_POINT_COORD_WEIGHT = 5.0
+    cfg.MODEL.MaskDINO.COST_POINT_CLASS_WEIGHT = 2.0
+
     # MSDeformAttn encoder configs
     cfg.MODEL.SEM_SEG_HEAD.DEFORMABLE_TRANSFORMER_ENCODER_IN_FEATURES = ["res3", "res4", "res5"]
     cfg.MODEL.SEM_SEG_HEAD.DEFORMABLE_TRANSFORMER_ENCODER_N_POINTS = 4
@@ -95,6 +105,8 @@ def add_maskdino_config(cfg):
     cfg.MODEL.MaskDINO.TEST.SEM_SEG_POSTPROCESSING_BEFORE_INFERENCE = False
     cfg.MODEL.MaskDINO.TEST.PANO_TRANSFORM_EVAL = True
     cfg.MODEL.MaskDINO.TEST.PANO_TEMPERATURE = 0.06
+    # 小穗点存在性置信度阈值（sigmoid 后 > 该值的点才输出）
+    cfg.MODEL.MaskDINO.TEST.POINT_THRESHOLD = 0.35
     # cfg.MODEL.MaskDINO.TEST.EVAL_FLAG = 1
 
     # Sometimes `backbone.size_divisibility` is set to 0 for some backbone (e.g. ResNet)

@@ -13,6 +13,7 @@ import logging
 import torch
 import torch.nn.functional as F
 from torch import nn
+from scipy.optimize import linear_sum_assignment
 
 from detectron2.utils.comm import get_world_size
 from detectron2.projects.point_rend.point_features import (
@@ -131,7 +132,8 @@ class SetCriterion(nn.Module):
     """
 
     def __init__(self, num_classes, matcher, weight_dict, eos_coef, losses,
-                 num_points, oversample_ratio, importance_sample_ratio,dn="no",dn_losses=[], panoptic_on=False, semantic_ce_loss=False):
+                 num_points, oversample_ratio, importance_sample_ratio,dn="no",dn_losses=[], panoptic_on=False, semantic_ce_loss=False,
+                 num_spikelet_points=50, point_cost_coord=5.0, point_cost_class=2.0):
         """Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
@@ -160,6 +162,11 @@ class SetCriterion(nn.Module):
 
         self.panoptic_on = panoptic_on
         self.semantic_ce_loss = semantic_ce_loss
+
+        # 小穗点回归（内层集合预测）参数
+        self.num_spikelet_points = num_spikelet_points   # 每实例预测点上限 P
+        self.point_cost_coord = point_cost_coord         # 内层匹配坐标代价权重
+        self.point_cost_class = point_cost_class         # 内层匹配存在性代价权重
 
     def loss_labels_ce(self, outputs, targets, indices, num_masks):
         """Classification loss (NLL)
@@ -300,6 +307,102 @@ class SetCriterion(nn.Module):
         del target_masks
         return losses
 
+    @torch.no_grad()
+    def _inner_point_match(self, pred_rel, pred_logit, gt_rel):
+        """逐实例内层匈牙利匹配：把 P 个预测点匹配到 Ni 个 GT 小穗。
+        Args:
+            pred_rel:   [P, 2]  预测点（框相对归一化坐标）
+            pred_logit: [P, 1]  预测点存在性 logit
+            gt_rel:     [Ni, 2] GT 小穗（框相对归一化坐标）
+        Returns:
+            (row_ind, col_ind): 匹配的预测点索引与 GT 索引（长度均为 min(P, Ni)=Ni）
+        """
+        Ni = gt_rel.shape[0]
+        if Ni == 0:
+            empty = torch.zeros(0, dtype=torch.int64, device=pred_rel.device)
+            return empty, empty
+        alpha, gamma = self.focal_alpha, 2.0
+        # AMP 下统一用 float32 计算代价，避免 half 精度的 cdist / log 问题
+        pred_rel = pred_rel.float()
+        gt_rel = gt_rel.float()
+        prob = pred_logit.float().sigmoid()               # [P,1]
+        neg_cost = (1 - alpha) * (prob ** gamma) * (-(1 - prob + 1e-8).log())
+        pos_cost = alpha * ((1 - prob) ** gamma) * (-(prob + 1e-8).log())
+        cost_class = (pos_cost - neg_cost)                # [P,1]，与 GT 无关，作为每个预测点的偏置
+        cost_coord = torch.cdist(pred_rel, gt_rel, p=1)   # [P, Ni]
+        C = self.point_cost_coord * cost_coord + self.point_cost_class * cost_class  # [P, Ni]
+        C = C.cpu()
+        row_ind, col_ind = linear_sum_assignment(C)
+        row_ind = torch.as_tensor(row_ind, dtype=torch.int64, device=pred_rel.device)
+        col_ind = torch.as_tensor(col_ind, dtype=torch.int64, device=pred_rel.device)
+        return row_ind, col_ind
+
+    def loss_points(self, outputs, targets, indices, num_masks):
+        """逐实例小穗点损失：对每个外层匹配到的实例，做内层匈牙利匹配后计算
+        点坐标 L1 损失 + 点存在性 focal 损失。
+        - 点坐标采用"实例框相对归一化"[0,1]：用匹配到的 GT 框把 GT 小穗换算到框相对坐标。
+        - wheat 实例（无小穗，Ni=0）：无坐标损失，P 个点全部监督为不存在（背景）。
+        """
+        assert 'pred_point_coords' in outputs and 'pred_point_logits' in outputs
+        pred_coords = outputs['pred_point_coords']   # [B, Q, P, 2]
+        pred_logits = outputs['pred_point_logits']   # [B, Q, P, 1]
+        device = pred_coords.device
+        alpha, gamma = self.focal_alpha, 2.0
+
+        coord_loss = torch.zeros([], device=device)
+        cls_loss = torch.zeros([], device=device)
+        num_pos = 0  # 总匹配小穗数，用于归一化
+
+        for b, (src_idx, tgt_idx) in enumerate(indices):
+            if src_idx.numel() == 0:
+                continue
+            boxes_b = targets[b]['boxes']      # [Ng, 4] cxcywh 图像归一化
+            points_b = targets[b]['points']    # list[Tensor[Ni,2]] 图像归一化
+            for q_i, g_j in zip(src_idx.tolist(), tgt_idx.tolist()):
+                # AMP 下预测为 half，GT 为 float32；统一转 float32 避免 dtype 不匹配
+                pred_rel = pred_coords[b, q_i].float()     # [P,2]
+                pred_lg = pred_logits[b, q_i].float()      # [P,1]
+                gt_pts_img = points_b[g_j].to(device).float()   # [Ni,2] 图像归一化
+                Ni = gt_pts_img.shape[0]
+
+                # GT 框（cxcywh 归一化）-> 左上角 (x0,y0) 与宽高 (w,h)
+                cx, cy, bw, bh = boxes_b[g_j].float()
+                x0 = cx - bw / 2
+                y0 = cy - bh / 2
+                wh = torch.stack([bw, bh]).clamp(min=1e-6)
+                if Ni > 0:
+                    gt_rel = ((gt_pts_img - torch.stack([x0, y0])) / wh).clamp(0.0, 1.0)  # [Ni,2]
+                else:
+                    gt_rel = gt_pts_img.new_zeros((0, 2))
+
+                row_ind, col_ind = self._inner_point_match(pred_rel, pred_lg, gt_rel)
+
+                # 存在性目标：匹配上的预测点为 1，其余为 0
+                tgt_exist = torch.zeros((self.num_spikelet_points, 1), device=device, dtype=pred_lg.dtype)
+                if row_ind.numel() > 0:
+                    tgt_exist[row_ind] = 1.0
+                    # 坐标 L1 损失（仅匹配点）
+                    coord_loss = coord_loss + F.l1_loss(
+                        pred_rel[row_ind], gt_rel[col_ind], reduction='sum')
+
+                # 存在性 focal 损失（全部 P 个点）
+                prob = pred_lg.sigmoid()
+                ce = F.binary_cross_entropy_with_logits(pred_lg, tgt_exist, reduction='none')
+                p_t = prob * tgt_exist + (1 - prob) * (1 - tgt_exist)
+                focal = ce * ((1 - p_t) ** gamma)
+                alpha_t = alpha * tgt_exist + (1 - alpha) * (1 - tgt_exist)
+                focal = alpha_t * focal
+                cls_loss = cls_loss + focal.sum()
+
+                num_pos += Ni
+
+        denom = max(num_pos, 1)
+        losses = {
+            'loss_point_coord': coord_loss / denom,
+            'loss_point_cls': cls_loss / denom,
+        }
+        return losses
+
     def prep_for_dn(self,mask_dict):
         output_known_lbs_bboxes = mask_dict['output_known_lbs_bboxes']
 
@@ -328,6 +431,7 @@ class SetCriterion(nn.Module):
             'labels': self.loss_labels_ce if self.semantic_ce_loss else self.loss_labels,
             'masks': self.loss_masks,
             'boxes': self.loss_boxes_panoptic if self.panoptic_on else self.loss_boxes,
+            'points': self.loss_points,
         }
         assert loss in loss_map, f"do you really want to compute {loss} loss?"
         return loss_map[loss](outputs, targets, indices, num_masks)

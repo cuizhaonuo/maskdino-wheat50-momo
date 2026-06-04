@@ -160,11 +160,35 @@ class COCOInstanceNewBaselineDatasetMapper:
                 # Let's always keep mask
                 anno.pop("keypoints", None)
 
+            # 只保留非 crowd 的标注，points 处理与 annos 严格同序
+            raw_annos = [
+                obj for obj in dataset_dict.pop("annotations")
+                if obj.get("iscrowd", 0) == 0
+            ]
+
+            # 先把每个实例的小穗 points（绝对像素 [x,y] 列表）按相同的几何增广变换到当前图像坐标系，
+            # 并过滤掉增广（缩放/裁剪/翻转）后落到图像外的点。transform_instance_annotations 不处理
+            # 自定义的 points 字段，因此这里单独用 transforms.apply_coords 处理。
+            h_img, w_img = image_shape  # 增广后的图像尺寸 (h, w)
+            points_per_anno = []
+            for obj in raw_annos:
+                pts = obj.get("points", None)
+                if pts is None or len(pts) == 0:
+                    coords = np.zeros((0, 2), dtype=np.float32)
+                else:
+                    coords = np.asarray(pts, dtype=np.float64).reshape(-1, 2)
+                    coords = transforms.apply_coords(coords)
+                    inside = (
+                        (coords[:, 0] >= 0) & (coords[:, 0] < w_img)
+                        & (coords[:, 1] >= 0) & (coords[:, 1] < h_img)
+                    )
+                    coords = coords[inside].astype(np.float32)
+                points_per_anno.append(torch.as_tensor(coords, dtype=torch.float32))
+
             # USER: Implement additional transformations if you have other types of data
             annos = [
                 utils.transform_instance_annotations(obj, transforms, image_shape)
-                for obj in dataset_dict.pop("annotations")
-                if obj.get("iscrowd", 0) == 0
+                for obj in raw_annos
             ]
             # NOTE: does not support BitMask due to augmentation
             # Current BitMask cannot handle empty objects
@@ -178,13 +202,24 @@ class COCOInstanceNewBaselineDatasetMapper:
                 instances.gt_masks = PolygonMasks([])
             instances.gt_boxes = instances.gt_masks.get_bounding_boxes()
             # Need to filter empty instances first (due to augmentation)
-            instances = utils.filter_empty_instances(instances)
+            # 手动计算 keep 掩码（与 detectron2.filter_empty_instances 默认行为一致：by_box & by_mask），
+            # 以便把 points_per_anno 按同一掩码过滤，保持与实例严格对齐。
+            keep = instances.gt_boxes.nonempty()
+            if instances.has('gt_masks'):
+                keep = keep & instances.gt_masks.nonempty()
+            instances = instances[keep]
+            kept_idx = keep.nonzero().squeeze(1).tolist()
+            gt_points = [points_per_anno[i] for i in kept_idx]
             # Generate masks from polygon
             h, w = instances.image_size
             if hasattr(instances, 'gt_masks'):
                 gt_masks = instances.gt_masks
                 gt_masks = convert_coco_poly_to_mask(gt_masks.polygons, h, w)
                 instances.gt_masks = gt_masks
+
+            # 把对齐过滤后的小穗点挂为自定义 list 字段（每实例 Tensor[Ni,2]，绝对像素坐标）。
+            # wheat（无小穗）实例为 Tensor[0,2]。
+            instances.gt_points = gt_points
 
             dataset_dict["instances"] = instances
 

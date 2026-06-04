@@ -53,6 +53,7 @@ class MaskDINO(nn.Module):
         focus_on_box: bool = False,
         transform_eval: bool = False,
         semantic_ce_loss: bool = False,
+        point_threshold: float = 0.35,
     ):
         """
         Args:
@@ -107,6 +108,9 @@ class MaskDINO(nn.Module):
         self.focus_on_box = focus_on_box
         self.transform_eval = transform_eval
         self.semantic_ce_loss = semantic_ce_loss
+        # 小穗点推理：存在性阈值 + 带小穗的类别（wheat_2 的连续 id=1，只有该类输出点）
+        self.point_threshold = point_threshold
+        self.spikelet_class_id = 1
 
         if not self.semantic_on:
             assert self.sem_seg_postprocess_before_inference
@@ -133,6 +137,9 @@ class MaskDINO(nn.Module):
         box_weight = cfg.MODEL.MaskDINO.BOX_WEIGHT  #
         cost_giou_weight = cfg.MODEL.MaskDINO.COST_GIOU_WEIGHT
         giou_weight = cfg.MODEL.MaskDINO.GIOU_WEIGHT  #
+        # 小穗点损失权重
+        point_coord_weight = cfg.MODEL.MaskDINO.POINT_COORD_WEIGHT
+        point_cls_weight = cfg.MODEL.MaskDINO.POINT_CLASS_WEIGHT
         # building matcher
         matcher = HungarianMatcher(
             cost_class=cost_class_weight,
@@ -146,6 +153,8 @@ class MaskDINO(nn.Module):
         weight_dict = {"loss_ce": class_weight}
         weight_dict.update({"loss_mask": mask_weight, "loss_dice": dice_weight})
         weight_dict.update({"loss_bbox":box_weight,"loss_giou":giou_weight})
+        # 小穗点损失（随 _interm / _{i} 深监督自动带上；dn 不计算点损失，其 _dn 权重存在但不会被产生，无害）
+        weight_dict.update({"loss_point_coord": point_coord_weight, "loss_point_cls": point_cls_weight})
         # two stage is the query selection scheme
         if cfg.MODEL.MaskDINO.TWO_STAGE:
             interm_weight_dict = {}
@@ -168,9 +177,9 @@ class MaskDINO(nn.Module):
                 aux_weight_dict.update({k + f"_{i}": v for k, v in weight_dict.items()})
             weight_dict.update(aux_weight_dict)
         if cfg.MODEL.MaskDINO.BOX_LOSS:
-            losses = ["labels", "masks","boxes"]
+            losses = ["labels", "masks","boxes","points"]
         else:
-            losses = ["labels", "masks"]
+            losses = ["labels", "masks","points"]
         # building criterion
         criterion = SetCriterion(
             sem_seg_head.num_classes,
@@ -185,6 +194,9 @@ class MaskDINO(nn.Module):
             dn_losses=dn_losses,
             panoptic_on=cfg.MODEL.MaskDINO.PANO_BOX_LOSS,
             semantic_ce_loss=cfg.MODEL.MaskDINO.TEST.SEMANTIC_ON and cfg.MODEL.MaskDINO.SEMANTIC_CE_LOSS and not cfg.MODEL.MaskDINO.TEST.PANOPTIC_ON,
+            num_spikelet_points=cfg.MODEL.MaskDINO.NUM_POINTS,
+            point_cost_coord=cfg.MODEL.MaskDINO.COST_POINT_COORD_WEIGHT,
+            point_cost_class=cfg.MODEL.MaskDINO.COST_POINT_CLASS_WEIGHT,
         )
 
         return {
@@ -212,7 +224,8 @@ class MaskDINO(nn.Module):
             "focus_on_box": cfg.MODEL.MaskDINO.TEST.TEST_FOUCUS_ON_BOX,
             "transform_eval": cfg.MODEL.MaskDINO.TEST.PANO_TRANSFORM_EVAL,
             "pano_temp": cfg.MODEL.MaskDINO.TEST.PANO_TEMPERATURE,
-            "semantic_ce_loss": cfg.MODEL.MaskDINO.TEST.SEMANTIC_ON and cfg.MODEL.MaskDINO.SEMANTIC_CE_LOSS and not cfg.MODEL.MaskDINO.TEST.PANOPTIC_ON
+            "semantic_ce_loss": cfg.MODEL.MaskDINO.TEST.SEMANTIC_ON and cfg.MODEL.MaskDINO.SEMANTIC_CE_LOSS and not cfg.MODEL.MaskDINO.TEST.PANOPTIC_ON,
+            "point_threshold": cfg.MODEL.MaskDINO.TEST.POINT_THRESHOLD,
         }
 
     @property
@@ -288,6 +301,9 @@ class MaskDINO(nn.Module):
             mask_cls_results = outputs["pred_logits"]
             mask_pred_results = outputs["pred_masks"]
             mask_box_results = outputs["pred_boxes"]
+            # 小穗点预测（框相对归一化 [0,1]）
+            point_coord_results = outputs["pred_point_coords"]   # [B, Q, P, 2]
+            point_logit_results = outputs["pred_point_logits"]   # [B, Q, P, 1]
             # upsample masks
             mask_pred_results = F.interpolate(
                 mask_pred_results,
@@ -299,8 +315,8 @@ class MaskDINO(nn.Module):
             del outputs
 
             processed_results = []
-            for mask_cls_result, mask_pred_result, mask_box_result, input_per_image, image_size in zip(
-                mask_cls_results, mask_pred_results, mask_box_results, batched_inputs, images.image_sizes
+            for mask_cls_result, mask_pred_result, mask_box_result, point_coord_result, point_logit_result, input_per_image, image_size in zip(
+                mask_cls_results, mask_pred_results, mask_box_results, point_coord_results, point_logit_results, batched_inputs, images.image_sizes
             ):  # image_size is augmented size, not divisible to 32
                 height = input_per_image.get("height", image_size[0])  # real size
                 width = input_per_image.get("width", image_size[1])
@@ -335,7 +351,7 @@ class MaskDINO(nn.Module):
                     width = new_size[1]/image_size[1]*width
                     mask_box_result = self.box_postprocess(mask_box_result, height, width)
 
-                    instance_r = retry_if_cuda_oom(self.instance_inference)(mask_cls_result, mask_pred_result, mask_box_result)
+                    instance_r = retry_if_cuda_oom(self.instance_inference)(mask_cls_result, mask_pred_result, mask_box_result, point_coord_result, point_logit_result)
                     processed_results[-1]["instances"] = instance_r
 
             return processed_results
@@ -351,11 +367,15 @@ class MaskDINO(nn.Module):
             gt_masks = targets_per_image.gt_masks
             padded_masks = torch.zeros((gt_masks.shape[0], h_pad, w_pad), dtype=gt_masks.dtype, device=gt_masks.device)
             padded_masks[:, : gt_masks.shape[1], : gt_masks.shape[2]] = gt_masks
+            # 小穗点：从绝对像素 [x,y] 转成图像归一化 [0,1]（与 boxes 同一 (w,h)，便于框相对换算）
+            wh = torch.as_tensor([w, h], dtype=torch.float, device=self.device)
+            gt_points = [p.to(self.device).float() / wh for p in targets_per_image.gt_points]
             new_targets.append(
                 {
                     "labels": targets_per_image.gt_classes,
                     "masks": padded_masks,
-                    "boxes":box_ops.box_xyxy_to_cxcywh(targets_per_image.gt_boxes.tensor)/image_size_xyxy
+                    "boxes":box_ops.box_xyxy_to_cxcywh(targets_per_image.gt_boxes.tensor)/image_size_xyxy,
+                    "points": gt_points,
                 }
             )
         return new_targets
@@ -372,11 +392,14 @@ class MaskDINO(nn.Module):
             gt_masks = targets_per_image.gt_masks
             padded_masks = torch.zeros((gt_masks.shape[0], h_pad, w_pad), dtype=gt_masks.dtype, device=gt_masks.device)
             padded_masks[:, : gt_masks.shape[1], : gt_masks.shape[2]] = gt_masks
+            wh = torch.as_tensor([w, h], dtype=torch.float, device=self.device)
+            gt_points = [p.to(self.device).float() / wh for p in targets_per_image.gt_points]
             new_targets.append(
                 {
                     "labels": targets_per_image.gt_classes,
                     "masks": padded_masks,
-                    "boxes": box_ops.box_xyxy_to_cxcywh(targets_per_image.gt_boxes.tensor) / image_size_xyxy
+                    "boxes": box_ops.box_xyxy_to_cxcywh(targets_per_image.gt_boxes.tensor) / image_size_xyxy,
+                    "points": gt_points,
                 }
             )
         return new_targets
@@ -462,7 +485,7 @@ class MaskDINO(nn.Module):
 
             return panoptic_seg, segments_info
 
-    def instance_inference(self, mask_cls, mask_pred, mask_box_result):
+    def instance_inference(self, mask_cls, mask_pred, mask_box_result, point_coords=None, point_logits=None):
         # mask_pred is already processed to have the same shape as original input
         image_size = mask_pred.shape[-2:]
         scores = mask_cls.sigmoid()  # [100, 80]
@@ -472,6 +495,10 @@ class MaskDINO(nn.Module):
         labels_per_image = labels[topk_indices]
         topk_indices = topk_indices // self.sem_seg_head.num_classes
         mask_pred = mask_pred[topk_indices]
+        # 同步按 topk 选出每个实例的小穗点预测
+        if point_coords is not None:
+            point_coords = point_coords[topk_indices]   # [K, P, 2] 框相对 [0,1]
+            point_logits = point_logits[topk_indices]   # [K, P, 1]
         # if this is panoptic segmentation, we only keep the "thing" classes
         if self.panoptic_on:
             keep = torch.zeros_like(scores_per_image).bool()
@@ -480,6 +507,9 @@ class MaskDINO(nn.Module):
             scores_per_image = scores_per_image[keep]
             labels_per_image = labels_per_image[keep]
             mask_pred = mask_pred[keep]
+            if point_coords is not None:
+                point_coords = point_coords[keep]
+                point_logits = point_logits[keep]
         result = Instances(image_size)
         # mask (before sigmoid)
         result.pred_masks = (mask_pred > 0).float()
@@ -497,6 +527,29 @@ class MaskDINO(nn.Module):
             mask_scores_per_image = 1.0
         result.scores = scores_per_image * mask_scores_per_image
         result.pred_classes = labels_per_image
+
+        # ===== 小穗点：把框相对坐标还原到图像像素，仅对 wheat_2 实例输出 =====
+        if point_coords is not None:
+            spikelet_points = []
+            spikelet_counts = []
+            boxes_xyxy = mask_box_result  # [K, 4] 像素 xyxy
+            for k in range(len(result)):
+                if int(labels_per_image[k].item()) == self.spikelet_class_id:
+                    x0, y0, x1, y1 = boxes_xyxy[k]
+                    bw = (x1 - x0).clamp(min=0)
+                    bh = (y1 - y0).clamp(min=0)
+                    score_k = point_logits[k].sigmoid().squeeze(-1)   # [P]
+                    keep_pt = score_k > self.point_threshold
+                    rel = point_coords[k][keep_pt]                    # [Ki, 2] 框相对
+                    xy = torch.stack([x0, y0]) + rel * torch.stack([bw, bh])  # [Ki, 2] 像素
+                    spikelet_points.append(xy)
+                    spikelet_counts.append(int(keep_pt.sum().item()))
+                else:
+                    # wheat 实例不输出任何小穗点
+                    spikelet_points.append(point_coords.new_zeros((0, 2)))
+                    spikelet_counts.append(0)
+            result.pred_spikelet_points = spikelet_points
+            result.pred_spikelet_counts = torch.as_tensor(spikelet_counts, device=self.device, dtype=torch.int64)
         return result
 
     def box_postprocess(self, out_bbox, img_h, img_w):
