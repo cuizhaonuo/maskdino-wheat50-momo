@@ -19,10 +19,23 @@ from pycocotools import mask as coco_mask
 
 __all__ = ["COCOInstanceNewBaselineDatasetMapper", "generate_density_map", "visualize_dataset_dict", "visualize_density_maps_grid"]
 
+# ---------------------------------------------------------------------------
+#  Debug switch — set to True to enable density-map sanity checks.
+# ---------------------------------------------------------------------------
+_DEBUG_DENSITY = False
 
-def generate_density_map(points, image_size, sigma=3.0):
+
+def generate_density_map(points, image_size=(256, 256), sigma=3.0, src_image_size=None):
     """
     Generate a normalized density map from point annotations using Gaussian kernels.
+
+    Args:
+        points: (N, 2) array-like of point coordinates in source-image space.
+        image_size: (H, W) target density-map resolution.
+        sigma: Gaussian sigma in target pixels (float or "adaptive").
+        src_image_size: (H_src, W_src) source image size.
+            When provided, points are scaled from src_image_size → image_size
+            before density-map generation.
 
     Each valid point contributes 1.0 to the density-map integral.
     Therefore:
@@ -55,7 +68,14 @@ def generate_density_map(points, image_size, sigma=3.0):
     if len(points) == 0:
         return np.zeros((H, W), dtype=np.float32)
 
-    # ---- Keep only points inside image bounds ----
+    # ---- Scale points from source-image coordinates → density-map coordinates ----
+    if src_image_size is not None:
+        src_h, src_w = float(src_image_size[0]), float(src_image_size[1])
+        if src_h > 0 and src_w > 0:
+            points[:, 0] = points[:, 0] * (W / src_w)
+            points[:, 1] = points[:, 1] * (H / src_h)
+
+    # ---- Keep only points inside density-map bounds ----
     valid = (
         (points[:, 0] >= 0) &
         (points[:, 0] < W) &
@@ -144,6 +164,116 @@ def generate_density_map(points, image_size, sigma=3.0):
                 density_map[y_min:y_max, x_min:x_max] += patch / patch_sum
 
     return density_map.astype(np.float32)
+
+
+def _debug_check_density(instances):
+    """Manually-enabled sanity checks for gt_density_* fields (only when _DEBUG_DENSITY=True)."""
+    if not _DEBUG_DENSITY:
+        return
+
+    num_gt = len(instances)
+    logger = logging.getLogger(__name__)
+
+    # ---- shape checks ----
+    expected_shape = (num_gt, 256, 256)
+    actual_shape = tuple(instances.gt_density_maps.shape)
+    if actual_shape != expected_shape:
+        logger.warning(
+            f"[DENSITY DEBUG] gt_density_maps.shape={actual_shape}, expected={expected_shape}"
+        )
+    else:
+        logger.info(f"[DENSITY DEBUG] gt_density_maps.shape OK: {actual_shape}")
+
+    if tuple(instances.gt_density_counts.shape) != (num_gt,):
+        logger.warning(
+            f"[DENSITY DEBUG] gt_density_counts.shape={instances.gt_density_counts.shape}, expected=({num_gt},)"
+        )
+    else:
+        logger.info(f"[DENSITY DEBUG] gt_density_counts.shape OK: ({num_gt},)")
+
+    if tuple(instances.gt_has_density.shape) != (num_gt,):
+        logger.warning(
+            f"[DENSITY DEBUG] gt_has_density.shape={instances.gt_has_density.shape}, expected=({num_gt},)"
+        )
+    else:
+        logger.info(f"[DENSITY DEBUG] gt_has_density.shape OK: ({num_gt},)")
+
+    # ---- content checks ----
+    density_sums = instances.gt_density_maps.sum(dim=(1, 2))
+    counts = instances.gt_density_counts
+    diff = (density_sums - counts).abs()
+    if diff.max() > 0.5:
+        logger.warning(
+            f"[DENSITY DEBUG] density_map.sum vs gt_density_counts mismatch: "
+            f"max_diff={diff.max().item():.4f}"
+        )
+    else:
+        logger.info(f"[DENSITY DEBUG] density_map.sum ~= gt_density_counts OK (max_diff={diff.max().item():.4f})")
+
+    for i in range(num_gt):
+        has_den = instances.gt_has_density[i].item()
+        cnt = instances.gt_density_counts[i].item()
+        dsum = instances.gt_density_maps[i].sum().item()
+        if has_den and cnt <= 0:
+            logger.warning(
+                f"[DENSITY DEBUG] instance {i}: gt_has_density=True but gt_density_counts={cnt}"
+            )
+        if not has_den and cnt > 0:
+            logger.warning(
+                f"[DENSITY DEBUG] instance {i}: gt_has_density=False but gt_density_counts={cnt}"
+            )
+        if not has_den and dsum > 0.01:
+            logger.warning(
+                f"[DENSITY DEBUG] instance {i}: gt_has_density=False but density_map.sum={dsum:.4f}"
+            )
+
+
+def _build_density_fields(instances, src_h, src_w):
+    """
+    Populate instances.gt_density_maps (256x256), instances.gt_density_counts,
+    and instances.gt_has_density from already-attached instances.gt_points.
+
+    Args:
+        instances: Instances object with gt_points already set.
+        src_h, src_w: height / width of the image coordinate system
+                       that gt_points lives in.
+    """
+    DENSITY_H, DENSITY_W = 256, 256
+
+    if len(instances) == 0:
+        instances.gt_density_maps = torch.zeros((0, DENSITY_H, DENSITY_W), dtype=torch.float32)
+        instances.gt_density_counts = torch.zeros((0,), dtype=torch.float32)
+        instances.gt_has_density = torch.zeros((0,), dtype=torch.bool)
+        return
+
+    gt_points = instances.gt_points
+    density_maps = []
+    density_counts = []
+    has_density = []
+
+    for pts in gt_points:
+        # Normalise to np (N,2)
+        pts_arr = pts.cpu().numpy() if torch.is_tensor(pts) else np.array(pts, dtype=np.float32)
+        pts_arr = pts_arr.reshape(-1, 2).astype(np.float32)
+
+        # Valid point count (points that survived transform filtering)
+        n_pts = len(pts_arr) if pts_arr.shape[0] > 0 and pts_arr.shape[1] >= 2 else 0
+
+        dmap = generate_density_map(
+            pts_arr,
+            image_size=(DENSITY_H, DENSITY_W),
+            sigma=3.0,
+            src_image_size=(src_h, src_w),
+        )
+        density_maps.append(torch.as_tensor(dmap, dtype=torch.float32))
+        density_counts.append(float(n_pts))
+        has_density.append(n_pts > 0)
+
+    instances.gt_density_maps = torch.stack(density_maps, dim=0)             # [num_gt, 256, 256]
+    instances.gt_density_counts = torch.tensor(density_counts, dtype=torch.float32)  # [num_gt]
+    instances.gt_has_density = torch.tensor(has_density, dtype=torch.bool)           # [num_gt]
+
+    _debug_check_density(instances)
 
 
 def convert_coco_poly_to_mask(segmentations, height, width):
@@ -241,7 +371,7 @@ class COCOInstanceNewBaselineDatasetMapper:
 
         self.img_format = image_format
         self.is_train = is_train
-    
+
     @classmethod
     def from_config(cls, cfg, is_train=True):
         # Build augmentation
@@ -283,25 +413,44 @@ class COCOInstanceNewBaselineDatasetMapper:
         dataset_dict["image"] = torch.as_tensor(np.ascontiguousarray(image.transpose(2, 0, 1)))
         dataset_dict["padding_mask"] = torch.as_tensor(np.ascontiguousarray(padding_mask))
 
+        # =====================================================================
+        #  Validation / inference branch
+        # =====================================================================
         if not self.is_train:
-            # ---- Keep GT annotations for evaluation ----
             if "annotations" in dataset_dict:
+                # ---- Pop keypoints (unused) and transform annotations through augmentations ----
+                for anno in dataset_dict["annotations"]:
+                    anno.pop("keypoints", None)
+
                 annos = [
-                    obj for obj in dataset_dict.pop("annotations")
+                    utils.transform_instance_annotations(obj, transforms, image_shape)
+                    for obj in dataset_dict.pop("annotations")
                     if obj.get("iscrowd", 0) == 0
                 ]
-                H_orig, W_orig = dataset_dict["height"], dataset_dict["width"]
 
-                instances = utils.annotations_to_instances(annos, (H_orig, W_orig))
+                # ---- Transform points (spikelet positions) through the same transforms ----
+                for anno in annos:
+                    if "points" in anno and len(anno["points"]) > 0:
+                        points = np.array(anno["points"], dtype=np.float32)
+                        points = transforms.apply_coords(points)
+                        # Filter out-of-bounds points after crop/resize/flip
+                        inside = (points >= np.array([0, 0])) & (points < np.array(image_shape[::-1]))
+                        inside = inside.all(axis=1)
+                        points = points[inside]
+                        anno["points"] = points.tolist()
+
+                # ---- Build Instances in *transformed* coordinates (matches image_shape) ----
+                instances = utils.annotations_to_instances(annos, image_shape)
+
                 if not instances.has('gt_masks'):
                     instances.gt_masks = PolygonMasks([])
                 instances.gt_boxes = instances.gt_masks.get_bounding_boxes()
 
-                # Filter empty instances
+                # Filter empty instances and keep annotation order consistent
                 instances, keep = utils.filter_empty_instances(instances, return_mask=True)
                 kept_annos = [anno for anno, k in zip(annos, keep.tolist()) if k]
 
-                # Attach points
+                # ---- Attach transformed points (aligned with kept instances) ----
                 gt_points = [
                     torch.as_tensor(anno["points"], dtype=torch.float32)
                     if "points" in anno and len(anno["points"]) > 0
@@ -318,26 +467,16 @@ class COCOInstanceNewBaselineDatasetMapper:
                         gt_masks = convert_coco_poly_to_mask(gt_masks.polygons, h, w)
                     instances.gt_masks = gt_masks
 
-                # Generate density maps at original image resolution
-                if len(instances) == 0:
-                    instances.gt_density_maps = torch.zeros((0, h, w), dtype=torch.float32)
-                else:
-                    density_maps = [
-                        torch.as_tensor(
-                            generate_density_map(
-                                pts.cpu().numpy() if torch.is_tensor(pts) else pts,
-                                (h, w),
-                            ),
-                            dtype=torch.float32,
-                        )
-                        for pts in instances.gt_points
-                    ]
-                    instances.gt_density_maps = torch.stack(density_maps, dim=0)
+                # ---- Generate density maps at fixed 256x256 (per instance) ----
+                _build_density_fields(instances, h, w)
 
                 dataset_dict["instances"] = instances
 
             return dataset_dict
 
+        # =====================================================================
+        #  Training branch
+        # =====================================================================
         if "annotations" in dataset_dict:
             # USER: Modify this if you want to keep them for some reason.
             for anno in dataset_dict["annotations"]:
@@ -396,21 +535,8 @@ class COCOInstanceNewBaselineDatasetMapper:
                 gt_masks = convert_coco_poly_to_mask(gt_masks.polygons, h, w)
                 instances.gt_masks = gt_masks
 
-            # ---- Generate density maps from points (per instance) ----
-            if len(instances) == 0:
-                instances.gt_density_maps = torch.zeros((0, h, w), dtype=torch.float32)
-            else:
-                density_maps = [
-                    torch.as_tensor(
-                        generate_density_map(
-                            pts.cpu().numpy() if torch.is_tensor(pts) else pts,
-                            (h, w),
-                        ),
-                        dtype=torch.float32,
-                    )
-                    for pts in instances.gt_points
-                ]
-                instances.gt_density_maps = torch.stack(density_maps, dim=0)
+            # ---- Generate density maps at fixed 256x256 (per instance) ----
+            _build_density_fields(instances, h, w)
             # ---------------------------------------------------------
 
             dataset_dict["instances"] = instances
@@ -538,4 +664,3 @@ def visualize_density_maps_grid(dataset_dict, grid_size=3, min_sum=1e-6, cmap="m
 
     fig.tight_layout()
     return fig
-
