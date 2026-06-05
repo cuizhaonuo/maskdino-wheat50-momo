@@ -51,3 +51,7 @@ _darcs
 /projects/*/datasets
 /models
 /snippet
+
+# project-specific (added)
+output_v2/
+detectron2/
