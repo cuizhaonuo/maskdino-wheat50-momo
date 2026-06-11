@@ -461,6 +461,176 @@ class SegInferenceTemplate:
                     ))
         return proposals
 
+    # ====== Tile-level COCO export (crop big images -> 1024 tiles -> COCO test set) ======
+    def _tile_origins(self, H: int, W: int, tile: int, overlap: int) -> Tuple[List[int], List[int]]:
+        """Top-left origins for a sliding window; the last window is shifted inward
+        so every tile is exactly `tile x tile` (no padding) when the image >= tile."""
+        stride = max(1, tile - overlap)
+        ys = list(range(0, max(1, H - tile + 1), stride))
+        if ys[-1] != max(0, H - tile):
+            ys.append(max(0, H - tile))
+        xs = list(range(0, max(1, W - tile + 1), stride))
+        if xs[-1] != max(0, W - tile):
+            xs.append(max(0, W - tile))
+        return ys, xs
+
+    def _tile_proposals(self, tile_img: np.ndarray) -> List[DetProposal]:
+        """Run the model on a single already-cropped tile and return proposals in
+        TILE-LOCAL coordinates (mask cropped to bbox; top/left are tile-local)."""
+        th, tw = tile_img.shape[:2]
+        proposals: List[DetProposal] = []
+        for ins in self.infer_tile(tile_img):
+            score = float(ins["score"])
+            if score < self.search.base_keep_score:
+                continue
+            bbox = np.array(ins["bbox"], dtype=float)
+            mask = ins["mask"].astype(bool)
+            x1t = max(0, min(tw, int(math.floor(bbox[0]))))
+            y1t = max(0, min(th, int(math.floor(bbox[1]))))
+            x2t = max(0, min(tw, int(math.ceil(bbox[2]))))
+            y2t = max(0, min(th, int(math.ceil(bbox[3]))))
+            if x2t <= x1t or y2t <= y1t:
+                continue
+            mask_crop = mask[y1t:y2t, x1t:x2t]
+            area = int(mask_crop.sum())
+            if area <= 0:
+                continue
+            proposals.append(DetProposal(
+                bbox=np.array([x1t, y1t, x2t, y2t], dtype=float),
+                score=score,
+                label=int(ins.get("label", 0)),
+                mask=mask_crop,
+                top=int(y1t),
+                left=int(x1t),
+                area=area,
+            ))
+        return proposals
+
+    def _dets_to_coco_anns(self, dets: List[DetProposal], image_id: int,
+                           start_ann_id: int, label_to_catid: Dict[int, int]) -> Tuple[List[Dict[str, Any]], int]:
+        """Convert tile-local detections into COCO annotation dicts (polygon segmentation)."""
+        anns: List[Dict[str, Any]] = []
+        aid = start_ann_id
+        for d in dets:
+            m8 = (d.mask.astype(np.uint8) * 255)
+            contours, _ = cv2.findContours(m8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            segmentation = []
+            for c in contours:
+                if len(c) < 3:
+                    continue
+                poly = []
+                for p in c:
+                    poly.extend([float(d.left + p[0][0]), float(d.top + p[0][1])])
+                if len(poly) >= 6:
+                    segmentation.append(poly)
+            if not segmentation:
+                continue
+            x1, y1, x2, y2 = [float(v) for v in d.bbox]
+            anns.append({
+                "id": aid,
+                "image_id": image_id,
+                "category_id": int(label_to_catid.get(int(d.label), int(d.label) + 1)),
+                "segmentation": segmentation,
+                "area": float(d.area),
+                "bbox": [x1, y1, x2 - x1, y2 - y1],
+                "iscrowd": 0,
+            })
+            aid += 1
+        return anns, aid
+
+    @staticmethod
+    def _touches_border(det: DetProposal, tile: int, margin: int) -> bool:
+        """该实例的 bbox 是否贴住 tile 边界（即被滑窗截断、不完整）。"""
+        x1, y1, x2, y2 = det.bbox
+        return (x1 <= margin or y1 <= margin or
+                x2 >= tile - margin or y2 >= tile - margin)
+
+    def export_coco_tiles(self, image_paths: List[str], tile: int, overlap: int,
+                          score_thr: float, nms_iou_thr: float, iou_type: IOUType,
+                          select_label: int, num_select: int,
+                          out_images_dir: str, out_json: str,
+                          categories: List[Dict[str, Any]], label_to_catid: Dict[int, int],
+                          border_margin: int = 2) -> Tuple[int, int]:
+        """
+        Crop each big image into `tile x tile` windows (stride = tile - overlap), run the
+        model on every tile, keep tiles that contain at least one instance of `select_label`
+        (contiguous class id), and write the best `num_select` tiles as a COCO
+        instance-segmentation test set:
+          - tiles  -> out_images_dir
+          - GT json (model predictions as pseudo-labels) -> out_json
+
+        选择优先级（关键）：被滑窗截断的 wheat_2（bbox 贴 tile 边界，`border_margin` 容差）
+        会拉低该 tile 的优先级。排序为：截断的目标实例数从少到多 -> 完整目标实例数从多到少
+        -> 总实例数从多到少 -> 文件名。这样 Top-N 会优先选「没有 wheat_2 被截断」的图。
+        """
+        import json
+        ensure_dir(out_images_dir)
+        ensure_dir(os.path.dirname(out_json))
+        print("==> Loading model ..."); self.load_model()
+
+        candidates: List[Dict[str, Any]] = []
+        for img_path in tqdm(image_paths, desc="Big images"):
+            img = cv2.imread(img_path)
+            if img is None:
+                print(f"[skip] cannot read {img_path}"); continue
+            H, W = img.shape[:2]
+            stem = os.path.splitext(os.path.basename(img_path))[0]
+            ys, xs = self._tile_origins(H, W, tile, overlap)
+            for y0 in ys:
+                for x0 in xs:
+                    crop = img[y0:y0 + tile, x0:x0 + tile]
+                    if crop.shape[0] != tile or crop.shape[1] != tile:
+                        padded = np.full((tile, tile, 3), self.sw.pad_value, dtype=np.uint8)
+                        padded[:crop.shape[0], :crop.shape[1]] = crop
+                        crop = padded
+                    props = self._tile_proposals(crop)
+                    dets = self._apply_thresh_nms(props, score_thr, nms_iou_thr, iou_type)
+                    sel_dets = [d for d in dets if int(d.label) == select_label]
+                    n_sel = len(sel_dets)
+                    if n_sel > 0:
+                        n_trunc = sum(1 for d in sel_dets
+                                      if self._touches_border(d, tile, border_margin))
+                        candidates.append({
+                            "n_sel": n_sel,
+                            "n_trunc": n_trunc,            # 被截断的 wheat_2 数
+                            "n_complete": n_sel - n_trunc, # 完整的 wheat_2 数
+                            "n_tot": len(dets),
+                            "name": f"{stem}__x{x0}_y{y0}_w{tile}_h{tile}.jpg",
+                            "crop": crop.copy(),
+                            "dets": dets,
+                        })
+        n_clean = sum(1 for c in candidates if c["n_trunc"] == 0)
+        print(f"[info] tiles containing target class (label={select_label}): {len(candidates)} "
+              f"(其中 wheat_2 无截断的: {n_clean})")
+
+        # 优先无截断 -> 完整目标实例更多 -> 总实例更多 -> 文件名（次序确定，便于复现）
+        candidates.sort(key=lambda c: (c["n_trunc"], -c["n_complete"], -c["n_tot"], c["name"]))
+        selected = candidates[:num_select]
+        n_sel_clean = sum(1 for c in selected if c["n_trunc"] == 0)
+        print(f"[info] selecting {len(selected)} tiles (requested {num_select}); "
+              f"其中 wheat_2 无截断的: {n_sel_clean}")
+        if len(selected) < num_select:
+            print(f"[WARN] only {len(selected)} tiles contain the target class; "
+                  f"fewer than the requested {num_select}.")
+        if n_sel_clean < num_select:
+            print(f"[WARN] 只有 {n_clean} 张图的 wheat_2 完全无截断，"
+                  f"被选中的 {len(selected)} 张里有 {len(selected) - n_sel_clean} 张仍含截断的 wheat_2。")
+
+        images, annotations, ann_id = [], [], 1
+        for img_id, c in enumerate(selected, start=1):
+            cv2.imwrite(os.path.join(out_images_dir, c["name"]), c["crop"])
+            images.append({"id": img_id, "file_name": c["name"], "width": tile, "height": tile})
+            anns, ann_id = self._dets_to_coco_anns(c["dets"], img_id, ann_id, label_to_catid)
+            annotations.extend(anns)
+
+        coco = {"info": {}, "licenses": [], "images": images,
+                "annotations": annotations, "categories": categories}
+        with open(out_json, "w", encoding="utf-8") as f:
+            json.dump(coco, f)
+        print(f"[Saved] {len(images)} tiles -> {out_images_dir}")
+        print(f"[Saved] COCO annotations ({len(annotations)} anns) -> {out_json}")
+        return len(images), len(annotations)
+
     def _grid_search(self, val_cache: Dict[str, List[DetProposal]],
                          val_gt_counts: Dict[str, int]) -> Tuple[Dict[str, Any], int]:
             score_list = linspace_inclusive(*self.search.score_thr_range)

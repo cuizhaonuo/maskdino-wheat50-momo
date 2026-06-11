@@ -12,6 +12,11 @@ register_coco_instances(
     "/public/home/zncui/datasets/wheat50/coco_2cat/annotations/instances_val2017.json",
     "/public/home/zncui/datasets/wheat50/coco_2cat/val2017"
 )
+register_coco_instances(
+    "wheat_cat2_coco_test", {},
+    "/public/home/zncui/datasets/wheat50/coco_2cat/annotations/instances_test2017.json",
+    "/public/home/zncui/datasets/wheat50/coco_2cat/test2017"
+)
 
 MetadataCatalog.get("wheat_cat2_coco_train").set(
     thing_classes=["wheat", "wheat_2"],
@@ -20,6 +25,12 @@ MetadataCatalog.get("wheat_cat2_coco_train").set(
     thing_dataset_id_to_contiguous_id={1: 0, 2: 1}
 )
 MetadataCatalog.get("wheat_cat2_coco_val").set(
+    thing_classes=["wheat", "wheat_2"],
+    thing_colors=[(255, 0, 0), (0, 0, 255)],
+    evaluator_type="coco",
+    thing_dataset_id_to_contiguous_id={1: 0, 2: 1}
+)
+MetadataCatalog.get("wheat_cat2_coco_test").set(
     thing_classes=["wheat", "wheat_2"],
     thing_colors=[(255, 0, 0), (0, 0, 255)],
     evaluator_type="coco",
