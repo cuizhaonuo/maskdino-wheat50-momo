@@ -91,6 +91,9 @@ class COCOInstanceNewBaselineDatasetMapper:
         *,
         tfm_gens,
         image_format,
+        demote_border_truncated=False,
+        demote_from_to=(1, 0),
+        demote_border_margin=2,
     ):
         """
         NOTE: this interface is experimental.
@@ -99,6 +102,9 @@ class COCOInstanceNewBaselineDatasetMapper:
             augmentations: a list of augmentations or deterministic transforms to apply
             tfm_gens: data augmentation
             image_format: an image format supported by :func:`detection_utils.read_image`.
+            demote_border_truncated: 增强后 mask 贴住 crop 边界的实例是否降级类别
+            demote_from_to: (源 contiguous 类别 id, 目标 id)
+            demote_border_margin: 贴边判定容差（像素）
         """
         self.tfm_gens = tfm_gens
         logging.getLogger(__name__).info(
@@ -107,7 +113,10 @@ class COCOInstanceNewBaselineDatasetMapper:
 
         self.img_format = image_format
         self.is_train = is_train
-    
+        self.demote_border_truncated = demote_border_truncated
+        self.demote_from_to = tuple(demote_from_to)
+        self.demote_border_margin = int(demote_border_margin)
+
     @classmethod
     def from_config(cls, cfg, is_train=True):
         # Build augmentation
@@ -117,6 +126,9 @@ class COCOInstanceNewBaselineDatasetMapper:
             "is_train": is_train,
             "tfm_gens": tfm_gens,
             "image_format": cfg.INPUT.FORMAT,
+            "demote_border_truncated": cfg.INPUT.DEMOTE_BORDER_TRUNCATED,
+            "demote_from_to": cfg.INPUT.DEMOTE_FROM_TO,
+            "demote_border_margin": cfg.INPUT.DEMOTE_BORDER_MARGIN,
         }
         return ret
 
@@ -185,6 +197,17 @@ class COCOInstanceNewBaselineDatasetMapper:
                 gt_masks = instances.gt_masks
                 gt_masks = convert_coco_poly_to_mask(gt_masks.polygons, h, w)
                 instances.gt_masks = gt_masks
+
+            # 被 ResizeScale+FixedSizeCrop 切到 crop 边界的实例已不完整，
+            # 按标注规则（截断的穗子归 wheat）降级其类别
+            if self.demote_border_truncated and len(instances) > 0 and hasattr(instances, 'gt_masks'):
+                src, dst = self.demote_from_to
+                m = self.demote_border_margin
+                masks = instances.gt_masks.bool()
+                touches = (masks[:, :m, :].any(dim=(1, 2)) | masks[:, -m:, :].any(dim=(1, 2)) |
+                           masks[:, :, :m].any(dim=(1, 2)) | masks[:, :, -m:].any(dim=(1, 2)))
+                demote = touches & (instances.gt_classes == src)
+                instances.gt_classes[demote] = dst
 
             dataset_dict["instances"] = instances
 

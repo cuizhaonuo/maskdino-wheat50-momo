@@ -116,6 +116,12 @@ def add_maskdino_config(cfg):
     cfg.INPUT.MIN_SCALE = 0.1
     cfg.INPUT.MAX_SCALE = 2.0
 
+    # 增强（缩放+裁剪）后若实例 mask 贴住 crop 边界，将其类别降级
+    # （wheat_2 被截断后不再"完整"，应按标注规则归入 wheat）
+    cfg.INPUT.DEMOTE_BORDER_TRUNCATED = False
+    cfg.INPUT.DEMOTE_FROM_TO = (1, 0)  # (源 contiguous 类别 id, 目标 id)
+    cfg.INPUT.DEMOTE_BORDER_MARGIN = 2  # 贴边判定容差（像素）
+
     # point loss configs
     # Number of points sampled during training for a mask point head.
     cfg.MODEL.MaskDINO.TRAIN_NUM_POINTS = 112 * 112

@@ -91,6 +91,8 @@ INPUT:
   MAX_SCALE: 2.0
   FORMAT: "RGB"
   DATASET_MAPPER_NAME: "coco_instance_lsj"
+  # 增强后被 crop 边界截断的 wheat_2 降级为 wheat（与标注规则一致）
+  DEMOTE_BORDER_TRUNCATED: True
 
 #  EVAL_FLAG: 1
 DATALOADER:
