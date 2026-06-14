@@ -68,7 +68,7 @@ from detectron2.engine import (
 import weakref
 
 # 注册数据集
-from data_register import wheat_data, maize_rice_data, xinxiang_data, gwhd2021_data
+from data_register import wheat_data, maize_rice_data, xinxiang_data, gwhd2021_data, wheat50_data
 
 class Trainer(DefaultTrainer):
     """
