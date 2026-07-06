@@ -70,6 +70,60 @@ import weakref
 # 注册数据集
 from data_register import wheat_data, maize_rice_data, xinxiang_data, gwhd2021_data, wheat_data_cat1_quality, wheat_data_cat2, wheat_data_cat3
 
+import types
+
+# 小穗点头的参数名子串（decoder 中的 point_coord_embed / point_class_embed）。
+_POINT_HEAD_KEYS = ("point_coord_embed", "point_class_embed")
+
+
+def freeze_all_but_point_head(model):
+    """两阶段迁移的 Stage2：冻结除小穗点头以外的全部参数，只训练点头。
+
+    - 除 point_coord_embed / point_class_embed 外的参数 requires_grad=False，
+      因此 build_optimizer 会自动只把点头参数加入优化器（它按 requires_grad 过滤）。
+    - 覆盖 model.train()：训练时把 trunk 强制拉回 eval（固定 BN 统计、关闭 dropout），
+      只让点头处于 train 模式，使前向与推理一致、与 Stage1 的匹配完全解耦。
+    """
+    trainable, frozen = 0, 0
+    for name, p in model.named_parameters():
+        if any(k in name for k in _POINT_HEAD_KEYS):
+            p.requires_grad_(True)
+            trainable += p.numel()
+        else:
+            p.requires_grad_(False)
+            frozen += p.numel()
+
+    # 收集点头子模块，train() 时只放开它们。
+    point_modules = [m for n, m in model.named_modules()
+                     if any(k in n for k in _POINT_HEAD_KEYS)]
+
+    def train(self, mode: bool = True):
+        # 先按常规递归设置 training 标志
+        torch.nn.Module.train(self, mode)
+        if mode:
+            # 训练模式下：整体 eval，再单独放开点头
+            for m in self.modules():
+                m.training = False
+            for pm in point_modules:
+                for sub in pm.modules():
+                    sub.training = True
+        return self
+
+    model.train = types.MethodType(train, model)
+    model.train()  # 立即应用：trunk eval，点头 train
+
+    logger = logging.getLogger("detectron2")
+    logger.info(
+        f"[FREEZE_EXCEPT_POINT_HEAD] 可训练参数 {trainable:,} | 冻结参数 {frozen:,} | "
+        f"点头模块数 {len(point_modules)}"
+    )
+    if trainable == 0:
+        raise RuntimeError(
+            "FREEZE_EXCEPT_POINT_HEAD=True 但未匹配到任何点头参数；"
+            f"请检查参数名是否包含 {_POINT_HEAD_KEYS}"
+        )
+    return model
+
 class Trainer(DefaultTrainer):
     """
     Extension of the Trainer class adapted to MaskFormer.
@@ -83,6 +137,10 @@ class Trainer(DefaultTrainer):
         cfg = DefaultTrainer.auto_scale_workers(cfg, comm.get_world_size())
 
         model = self.build_model(cfg)
+        # Stage2：只训练小穗点头时，先冻结其余参数（必须在 build_optimizer 之前，
+        # 因为优化器按 requires_grad 过滤参数）。
+        if cfg.MODEL.MaskDINO.FREEZE_EXCEPT_POINT_HEAD:
+            freeze_all_but_point_head(model)
         optimizer = self.build_optimizer(cfg, model)
         data_loader = self.build_train_loader(cfg)
 

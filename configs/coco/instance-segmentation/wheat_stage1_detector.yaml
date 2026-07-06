@@ -1,0 +1,37 @@
+# ============================================================================
+# 两阶段迁移 · Stage1：训练检测/分类（含 mask/box）头
+#   数据：coco_2cat（无点大数据集，train=2092 图）
+#   目标：得到一个强检测器，尤其是 wheat vs wheat_2 的分类精度（点预测的门控）。
+#   点损失全部置 0（此阶段不训练点头，点头保持初始化即可）。
+# 用法：
+#   python train_net.py --num-gpus 1 \
+#     --config-file configs/coco/instance-segmentation/wheat_stage1_detector.yaml
+# ============================================================================
+_BASE_: maskdino_R50_bs16_50ep_3s_dowsample1_2048.yaml
+
+DATASETS:
+  TRAIN: ("wheat_cat2_nop_coco_train",)
+  TEST: ("wheat_cat2_nop_coco_val",)
+
+MODEL:
+  # 从 ImageNet R-50 预训练开始（继承自 Wheat base 的 WEIGHTS）。
+  MaskDINO:
+    # 关闭点损失与点匹配代价：此阶段只学检测/分类/mask/box。
+    POINT_COORD_WEIGHT: 0.0
+    POINT_CLASS_WEIGHT: 0.0
+    COST_POINT_COORD_WEIGHT: 0.0
+    COST_POINT_CLASS_WEIGHT: 0.0
+    FREEZE_EXCEPT_POINT_HEAD: False
+
+SOLVER:
+  # 2092 张 / IMS_PER_BATCH 4 ≈ 523 iter/epoch。以下按 ~50 epoch 估算，按需在 --opts 覆盖。
+  IMS_PER_BATCH: 4
+  MAX_ITER: 26000
+  STEPS: (20800, 24000)
+  WARMUP_ITERS: 1000
+  CHECKPOINT_PERIOD: 1000
+  BASE_LR: 0.0001
+  BACKBONE_MULTIPLIER: 0.1
+
+TEST:
+  EVAL_PERIOD: 1000

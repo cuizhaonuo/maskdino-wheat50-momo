@@ -1,0 +1,45 @@
+# ============================================================================
+# 两阶段迁移 · Stage2：只训练小穗点头（point_coord_embed / point_class_embed）
+#   数据：coco_2cat_with_points（带点小数据集，train=267 图，点集中在 wheat_2）
+#   冻结：backbone + pixel decoder + transformer decoder + cls/mask/box 头全部冻结，
+#         且训练时强制 eval（固定 BN/dropout），与推理一致、与 Stage1 匹配完全解耦。
+#   匹配：点匹配代价置 0，使外层匈牙利匹配与 Stage1 完全相同（只有点损失反传到点头）。
+# 用法（把 WEIGHTS 换成 Stage1 产出的 model_final.pth）：
+#   python train_net.py --num-gpus 1 \
+#     --config-file configs/coco/instance-segmentation/wheat_stage2_pointhead.yaml \
+#     MODEL.WEIGHTS output_v2/wheat_stage1_detector/model_final.pth \
+#     OUTPUT_DIR output_v2/wheat_stage2_pointhead
+# ============================================================================
+_BASE_: maskdino_R50_bs16_50ep_3s_dowsample1_2048.yaml
+
+DATASETS:
+  TRAIN: ("wheat_cat2_pts_coco_train",)
+  TEST: ("wheat_cat2_pts_coco_val",)
+
+MODEL:
+  # 用 Stage1 训好的检测器权重热启动（点头此时是初始化值，将在本阶段训练）。
+  WEIGHTS: "output_v2/wheat_stage1_detector/model_final.pth"
+  MaskDINO:
+    FREEZE_EXCEPT_POINT_HEAD: True
+    # 启用点损失
+    POINT_COORD_WEIGHT: 5.0
+    POINT_CLASS_WEIGHT: 2.0
+    # 点匹配代价置 0：匹配与 Stage1 一致，避免点头反馈扰动 query→实例的分配。
+    COST_POINT_COORD_WEIGHT: 0.0
+    COST_POINT_CLASS_WEIGHT: 0.0
+
+SOLVER:
+  # 267 张 / IMS_PER_BATCH 4 ≈ 67 iter/epoch。只训两个 MLP，收敛快；以下按 ~100 epoch 估算。
+  IMS_PER_BATCH: 4
+  MAX_ITER: 6700
+  STEPS: (5400, 6200)
+  WARMUP_ITERS: 500
+  CHECKPOINT_PERIOD: 670
+  BASE_LR: 0.0001
+  # 冻结 trunk 后 BACKBONE_MULTIPLIER 实际不生效（backbone 无可训练参数），保留无害。
+  BACKBONE_MULTIPLIER: 0.1
+
+TEST:
+  # 注意：COCOEvaluator 只评 mask/box AP（trunk 冻结，应与 Stage1 持平），不评小穗点。
+  # 点的精度需用专门脚本（如 myscripts 下的 seg_infer_reg 那套）单独评估。
+  EVAL_PERIOD: 670

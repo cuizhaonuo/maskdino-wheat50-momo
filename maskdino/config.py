@@ -82,6 +82,9 @@ def add_maskdino_config(cfg):
     # 内层匈牙利匹配的代价权重
     cfg.MODEL.MaskDINO.COST_POINT_COORD_WEIGHT = 5.0
     cfg.MODEL.MaskDINO.COST_POINT_CLASS_WEIGHT = 2.0
+    # 两阶段迁移：Stage2 冻结除小穗点头（point_coord_embed / point_class_embed）以外的全部参数，
+    # 只训练点头。冻结的 trunk 在训练时也强制保持 eval（固定 BN/dropout），与推理一致。
+    cfg.MODEL.MaskDINO.FREEZE_EXCEPT_POINT_HEAD = False
 
     # MSDeformAttn encoder configs
     cfg.MODEL.SEM_SEG_HEAD.DEFORMABLE_TRANSFORMER_ENCODER_IN_FEATURES = ["res3", "res4", "res5"]
