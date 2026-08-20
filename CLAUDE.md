@@ -38,8 +38,18 @@ python train_net.py --eval_only \
 # Sweep-evaluate every experiment subdir against a fixed test set
 bash eval_datasets.sh    # edit BASE_DIR / SAVE_ROOT / DATASETS.TEST inside first
 
-# Inference / counting on raw images (custom pipeline, not train_net.py)
-python myscripts/unified_wheat_infer.py
+# Inference / counting (custom pipelines, not train_net.py). Need PYTHONPATH=. from the repo root.
+# Sliding-window + global Mask-NMS counting on large images. Driven by a YAML run-config;
+# any key can be overridden on the CLI (argparse defaults < config file < explicit CLI flags).
+PYTHONPATH=. python myscripts/infer/seg_infer.py --config myscripts/infer/configs/coco_val2017.yaml
+PYTHONPATH=. python myscripts/infer/seg_infer.py --config <cfg.yaml> --split train2017 --limit 5
+# Or fully on the CLI. --source picks the data layout:
+#   yolo (<root>/images/<split>) | coco (<root>/<split> + annotations) | dir (plain image folder, infer only)
+PYTHONPATH=. python myscripts/infer/seg_infer.py --source coco \
+  --data_root /public/home/zncui/datasets/wheat50/coco_2cat --split val2017 --mode infer \
+  --model_config_rel <config.yaml> --checkpoint_rel <model_final.pth> --out_dir <out>
+# End-to-end spikelet-point regression on pre-cropped 1024x1024 tiles
+python myscripts/infer/seg_infer_reg.py --config_file <config.yaml> --weights <ckpt> --images <dir> --out_dir <out>
 
 # Upstream demo (single images, visualization)
 cd demo && python demo.py --config-file <config> --input img.jpg --opts MODEL.WEIGHTS <ckpt>
@@ -111,8 +121,17 @@ encoder (`modeling/pixel_decoder`, the `ops/` CUDA kernel lives here), and trans
   `model_final.pth` — the shape `eval_datasets.sh` and the eval command expect. Both are gitignored.
 - **Branches:** active line is `wheat50-model-v2` (main/PR base is `wheat50-model-v1`). Output dir and
   branch are versioned together (`output_v2`).
-- **`myscripts/`** is a grab-bag of data-prep and analysis tools (COCO↔YOLO conversion, RLE→polygon,
-  cropping to window size, point sampling, counting/metrics under `vis/` and `vis_process/`). These are
-  standalone scripts run directly, not wired into `train_net.py`.
+- **`myscripts/`** holds exactly two subdirs, no loose files:
+  - **`infer/`** — the two maintained inference entry points, `seg_infer.py` (sliding-window counting)
+    and `seg_infer_reg.py` (spikelet-point regression), plus `configs/` holding ready-to-run YAML
+    run-configs for `seg_infer.py --config` (flat keys, one per CLI flag; every run also drops an
+    `effective_config.yaml` into its `out_dir` that can be fed straight back via `--config`).
+    Both scripts need the repo root on `sys.path`: `seg_infer_reg.py` inserts it itself,
+    `seg_infer.py` does not, so run it with `PYTHONPATH=.`.
+  - **`backup/`** — everything else: a grab-bag of data-prep and analysis tools (COCO↔YOLO conversion,
+    RLE→polygon, cropping to window size, point sampling, counting/metrics under `vis/` and
+    `vis_process/`). Standalone scripts run directly, not wired into `train_net.py`. Note
+    `backup/coco_add_pseudo_labels.py` imports `seg_infer` across the split via an explicit
+    `myscripts/infer` `sys.path` insert — moving either file breaks that.
 - Files prefixed `备份` (Chinese for "backup", e.g. `备份coco_instance_new_baseline_dataset_mapper.py`)
   are dead backup copies — ignore them; edit the un-prefixed file.

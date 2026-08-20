@@ -23,7 +23,7 @@
 用法
 ----
 # 直接用训练好的点回归模型在 val 集推理 + 与 GT 对比
-python myscripts/seg_infer_reg.py \
+python myscripts/infer/seg_infer_reg.py \
   --config_file output_v2/wheat305_r50_cat2_point_reg_coord5.0_cls2.0/config.yaml \
   --weights     output_v2/wheat305_r50_cat2_point_reg_coord5.0_cls2.0/model_final.pth \
   --images      /public/home/zncui/datasets/wheat50/coco_2cat_with_points/val2017 \
@@ -31,7 +31,7 @@ python myscripts/seg_infer_reg.py \
   --out_dir     ./vis_spikelet_reg_val
 
 # 仅推理一个文件夹（无 GT）
-python myscripts/seg_infer_reg.py --images /path/to/imgs --out_dir ./vis_out
+python myscripts/infer/seg_infer_reg.py --images /path/to/imgs --out_dir ./vis_out
 """
 
 import os
@@ -42,8 +42,8 @@ import argparse
 import warnings
 from typing import List, Dict, Any, Optional, Tuple
 
-# 脚本位于 myscripts/，需把仓库根目录加入 sys.path 才能 import maskdino / 本地 detectron2
-_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# 脚本位于 myscripts/infer/，需把仓库根目录加入 sys.path 才能 import maskdino / 本地 detectron2
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 

@@ -27,10 +27,12 @@ import cv2
 import numpy as np
 from tqdm import tqdm
 
-# 让 `import seg_infer`（同目录）与 `import maskdino`（项目根）都可用
+# 本脚本在 myscripts/backup/，seg_infer.py 在 myscripts/infer/：
+# 让 `import seg_infer`（infer 目录）与 `import maskdino`（项目根）都可用
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-_PROJECT_ROOT = os.path.dirname(_THIS_DIR)
-sys.path.insert(0, _THIS_DIR)
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(_THIS_DIR))
+_INFER_DIR = os.path.join(_PROJECT_ROOT, "myscripts", "infer")
+sys.path.insert(0, _INFER_DIR)
 sys.path.insert(0, _PROJECT_ROOT)
 
 from seg_infer import (  # noqa: E402

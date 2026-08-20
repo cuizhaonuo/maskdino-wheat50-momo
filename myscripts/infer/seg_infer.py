@@ -7,9 +7,46 @@ Modes:
 - search: grid search (iou_type x score_thr x nms_iou_thr) on val then test with best
 - infer : skip search, directly use (iou_type, score_thr, nms_iou_thr) on a split (default: test)
 
+数据源（--source）：
+- yolo : <data_root>/images/<split>/ + <data_root>/labels/<split>/<stem>.txt   需要 --split
+- coco : <data_root>/<split>/ + <data_root>/annotations/instances_<split>.json  需要 --split（传子目录名，如 val2017）
+- dir  : <data_root>/ 下直接列图，无 GT，只支持 --mode infer                     不需要 --split
+
+配置文件（--config）
+--------------------
+参数多，推荐把常用组合写进 YAML，键名与 --xxx 一一对应（去掉 -- 前缀）。
+优先级：argparse 默认值 < 配置文件 < 命令行显式传入。不传 --config 时行为与纯命令行完全一致。
+
+  python myscripts/infer/seg_infer.py --config myscripts/infer/configs/coco_val2017.yaml
+  # 临时改两个参数，其余仍取自配置文件：
+  python myscripts/infer/seg_infer.py --config myscripts/infer/configs/coco_val2017.yaml \
+      --split train2017 --fix_score_thr 0.5
+
+现成配置见 myscripts/infer/configs/（coco_val2017 / yolo_guo_search / plain_dir）。
+每次运行会把合并后的最终配置写到 <out_dir>/effective_config.yaml，可直接拿它 --config 复现。
+
+用法（纯命令行）
+----------------
+# YOLO 大图：在 val 上网格搜参数，再用最优参数跑 test
+python myscripts/infer/seg_infer.py --source yolo \
+  --data_root /public/home/zncui/datasets/wheat-guo-dataset/yolo_wheat_big_image \
+  --mode search --search_split val --eval_split test \
+  --model_config_rel <cfg.yaml> --checkpoint_rel <model_final.pth> --out_dir ./vis_yolo
+
+# COCO 数据集：固定参数直接推理 val2017（GT 数从 instances_val2017.json 统计）
+python myscripts/infer/seg_infer.py --source coco \
+  --data_root /public/home/zncui/datasets/wheat50/coco_2cat --split val2017 --mode infer \
+  --model_config_rel <cfg.yaml> --checkpoint_rel <model_final.pth> --out_dir ./vis_coco_val
+
+# 普通图片文件夹（无标注）：只跑推理，不出散点图
+python myscripts/infer/seg_infer.py --source dir \
+  --data_root /path/to/images --mode infer \
+  --model_config_rel <cfg.yaml> --checkpoint_rel <model_final.pth> --out_dir ./vis_dir
+
 Template Method pattern:
 - SegInferenceTemplate: defines the workflow skeleton (run_search / run_infer_only)
 - Detectron2SegInference: concrete implementation using Detectron2
+- DataSource: 数据组织形式（yolo / coco / 普通目录）的策略，负责「图片列表」与「GT 实例数」
 
 Notes
 -----
@@ -23,14 +60,16 @@ import os
 import sys
 import math
 import glob
+import json
 import argparse
 import random
 from enum import Enum
 from dataclasses import dataclass
-from typing import List, Tuple, Dict, Any, Optional
+from typing import List, Tuple, Dict, Any, Optional, Iterable
 import torch  # noqa: E402
 
 import cv2
+import yaml
 import numpy as np
 from tqdm import tqdm
 import matplotlib.pyplot as plt
@@ -56,7 +95,17 @@ from detectron2 import model_zoo
 # -----------------------------
 @dataclass
 class DatasetConfig:
-    yolo_root: str
+    # 兼容旧调用（如 coco_add_pseudo_labels.py 的 DatasetConfig(yolo_root="")）：
+    # data_root 为空时自动回落到 yolo_root。
+    yolo_root: str = ""
+    source: str = "yolo"                     # yolo | coco | dir
+    data_root: str = ""                      # yolo/coco 根目录，或 dir 模式的图片目录
+    coco_ann: str = ""                       # 可选：显式指定标注 json，覆盖 annotations/instances_<split>.json
+    gt_cat_ids: Tuple[int, ...] = ()         # GT 计数的类别过滤，空 = 全算
+
+    @property
+    def root(self) -> str:
+        return self.data_root or self.yolo_root
 
 @dataclass
 class ModelConfig:
@@ -110,15 +159,23 @@ def yolo_label_path_for_image(img_path: str, yolo_root: str) -> str:
     name = os.path.splitext(os.path.basename(img_path))[0]
     return os.path.join(yolo_root, "labels", split, f"{name}.txt")
 
-def yolo_count_instances(label_path: str) -> int:
+def yolo_count_instances(label_path: str, cls_ids: Optional[Iterable[int]] = None) -> int:
+    """统计 YOLO txt 的实例数。cls_ids 非空时只统计首列类别在其中的行（默认 None = 全算）。"""
     if not os.path.exists(label_path):
         return 0
+    keep = set(cls_ids) if cls_ids else None
     c = 0
     with open(label_path, "r", encoding="utf-8") as f:
         for line in f:
             s = line.strip()
             if not s or s.startswith("#"):
                 continue
+            if keep is not None:
+                try:
+                    if int(float(s.split()[0])) not in keep:
+                        continue
+                except (ValueError, IndexError):
+                    continue
             c += 1
     return c
 
@@ -127,6 +184,155 @@ def linspace_inclusive(start: float, end: float, num: int) -> List[float]:
         return [start]
     step = (end - start) / (num - 1)
     return [start + i * step for i in range(num)]
+
+
+# -----------------------------
+# Data sources (yolo / coco / plain dir)
+# -----------------------------
+class DataSource:
+    """数据组织形式的策略：只负责「有哪些图」和「每张图的 GT 实例数」。
+
+    gt_count 返回 None 表示该数据源没有 GT —— 这是流程判断「无标注」的唯一信号
+    （CSV 少一列、跳过散点图、不允许 search）。
+    """
+    supports_search: bool = True
+
+    def images(self, split: str) -> List[str]:
+        raise NotImplementedError
+
+    def gt_count(self, img_path: str, split: str) -> Optional[int]:
+        raise NotImplementedError
+
+    def tag(self, split: str) -> str:
+        """输出文件名用的短标识。"""
+        return split
+
+    def finish(self):
+        """一个 split 跑完后的收尾（默认什么都不做）。"""
+        pass
+
+
+class YoloSource(DataSource):
+    """<root>/images/<split>/*.jpg + <root>/labels/<split>/<stem>.txt"""
+
+    def __init__(self, root: str, gt_cat_ids: Tuple[int, ...] = ()):
+        self.root = root
+        self.gt_cat_ids = tuple(gt_cat_ids)
+
+    def images(self, split: str) -> List[str]:
+        imgs_dir, _ = yolo_split_paths(self.root, split)
+        if not os.path.isdir(imgs_dir):
+            raise FileNotFoundError(f"[yolo] 图片目录不存在: {imgs_dir}")
+        return list_images_in_dir(imgs_dir)
+
+    def gt_count(self, img_path: str, split: str) -> Optional[int]:
+        return yolo_count_instances(yolo_label_path_for_image(img_path, self.root),
+                                    cls_ids=self.gt_cat_ids or None)
+
+
+class CocoSource(DataSource):
+    """<root>/<split>/*.jpg + <root>/annotations/instances_<split>.json
+
+    split 直接传子目录名（如 val2017），标注默认推导为 annotations/instances_<split>.json，
+    可用 coco_ann 显式覆盖（兼容 split_coco_points_todo.py 产出的 images/ + annotations/instances.json）。
+    """
+
+    def __init__(self, root: str, coco_ann: str = "", gt_cat_ids: Tuple[int, ...] = ()):
+        self.root = root
+        self.coco_ann = coco_ann
+        self.gt_cat_ids = set(gt_cat_ids)
+        self._counts: Dict[str, Dict[str, int]] = {}   # split -> {basename: count}
+        self._missing = 0
+
+    def _ann_path(self, split: str) -> str:
+        if self.coco_ann:
+            return self.coco_ann
+        return os.path.join(self.root, "annotations", f"instances_{split}.json")
+
+    def _counts_for(self, split: str) -> Dict[str, int]:
+        """懒加载并缓存：一个 split 的 json 只解析一次。"""
+        if split in self._counts:
+            return self._counts[split]
+
+        ann_path = self._ann_path(split)
+        if not os.path.isfile(ann_path):
+            raise FileNotFoundError(
+                f"[coco] 标注文件不存在: {ann_path}\n"
+                f"       split 需要传子目录名（如 val2017）；布局不标准时用 --coco_ann 显式指定。")
+        with open(ann_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        # json 里 file_name 可能带子路径，统一用 basename 匹配
+        id2name = {im["id"]: os.path.basename(im["file_name"]) for im in data.get("images", [])}
+        counts = {name: 0 for name in id2name.values()}
+        for a in data.get("annotations", []):
+            if int(a.get("iscrowd", 0)) == 1:
+                continue
+            if self.gt_cat_ids and int(a.get("category_id", -1)) not in self.gt_cat_ids:
+                continue
+            name = id2name.get(a.get("image_id"))
+            if name is None:
+                continue
+            counts[name] += 1
+
+        cat_note = f", 只统计 category_id={sorted(self.gt_cat_ids)}" if self.gt_cat_ids else ""
+        print(f"[coco] {ann_path} -> {len(counts)} images, {sum(counts.values())} instances{cat_note}")
+        self._counts[split] = counts
+        return counts
+
+    def images(self, split: str) -> List[str]:
+        imgs_dir = os.path.join(self.root, split)
+        if not os.path.isdir(imgs_dir):
+            raise FileNotFoundError(f"[coco] 图片目录不存在: {imgs_dir}")
+        return list_images_in_dir(imgs_dir)
+
+    def gt_count(self, img_path: str, split: str) -> Optional[int]:
+        counts = self._counts_for(split)
+        name = os.path.basename(img_path)
+        if name not in counts:
+            self._missing += 1
+            return 0
+        return counts[name]
+
+    def finish(self):
+        if self._missing:
+            print(f"[coco] WARNING: {self._missing} 张图在标注 json 中查不到，GT 计为 0")
+            self._missing = 0
+
+
+class PlainDirSource(DataSource):
+    """普通图片目录：只有图，没有 GT，因此不支持 search。"""
+    supports_search = False
+
+    def __init__(self, images_dir: str):
+        self.images_dir = images_dir
+
+    def images(self, split: str) -> List[str]:      # split 被忽略
+        if not os.path.isdir(self.images_dir):
+            raise FileNotFoundError(f"[dir] 图片目录不存在: {self.images_dir}")
+        return list_images_in_dir(self.images_dir)
+
+    def gt_count(self, img_path: str, split: str) -> Optional[int]:
+        return None
+
+    def tag(self, split: str) -> str:
+        return os.path.basename(self.images_dir.rstrip(os.sep)) or "images"
+
+
+def build_data_source(cfg: DatasetConfig) -> DataSource:
+    root = cfg.root
+    if not root:
+        raise ValueError("数据源根目录为空：请通过 --data_root（或旧的 --yolo_root）指定")
+    if not os.path.isdir(root):
+        raise FileNotFoundError(f"数据源根目录不存在: {root}")
+
+    if cfg.source == "yolo":
+        return YoloSource(root, cfg.gt_cat_ids)
+    if cfg.source == "coco":
+        return CocoSource(root, cfg.coco_ann, cfg.gt_cat_ids)
+    if cfg.source == "dir":
+        return PlainDirSource(root)
+    raise ValueError(f"未知的 --source: {cfg.source}（可选 yolo / coco / dir）")
 
 
 # -----------------------------
@@ -304,64 +510,89 @@ class SegInferenceTemplate:
         self.search = search
         self.outputs = outputs
         self.model = None  # backend-specific predictor
+        # 数据源延迟到 run_search / run_infer_only 才构建：只用 load_model/infer_tile 的调用方
+        # （如 coco_add_pseudo_labels.py）传的是空 root，不该在这里就因目录校验失败。
+        self.source: Optional[DataSource] = None
+        self.limit: int = 0   # >0 时每个 split 只处理前 N 张（冒烟测试用）
 
     # hooks
     def load_model(self): raise NotImplementedError
     def infer_tile(self, tile_img: np.ndarray) -> List[Dict[str, Any]]: raise NotImplementedError
 
+    def _images_for(self, split: str) -> List[str]:
+        images = self.source.images(split)
+        if self.limit and self.limit > 0:
+            images = images[:self.limit]
+            print(f"[limit] 只处理前 {len(images)} 张图")
+        if not images:
+            raise FileNotFoundError(f"没有找到任何图片（split={split!r}）")
+        return images
+
     # ====== Modes ======
-    def run_search(self):
-        """Grid-search on val, then test with best params."""
+    def run_search(self, search_split: str = "val", eval_split: str = "test"):
+        """Grid-search on search_split, then run eval_split with the best params."""
         ensure_dir(self.outputs.out_dir)
         random.seed(0); np.random.seed(0)
+        self.source = build_data_source(self.dataset)
+        if not self.source.supports_search:
+            raise SystemExit("普通目录没有 GT，无法网格搜参数，请用 --mode infer")
         print("==> Loading model ..."); self.load_model()
 
-        print("==> Collecting raw proposals on VAL ...")
-        val_imgs_dir, _ = yolo_split_paths(self.dataset.yolo_root, "val")
-        val_images = list_images_in_dir(val_imgs_dir)
+        tag = self.source.tag(search_split)
+        print(f"==> Collecting raw proposals on {tag.upper()} ...")
+        search_images = self._images_for(search_split)
         val_cache, val_gt_counts = {}, {}
-        for img_path in tqdm(val_images, desc="VAL images"):
+        for img_path in tqdm(search_images, desc=f"{tag.upper()} images"):
             val_cache[img_path] = self._proposals_for_image(img_path)
-            val_gt_counts[img_path] = yolo_count_instances(yolo_label_path_for_image(img_path, self.dataset.yolo_root))
+            val_gt_counts[img_path] = self.source.gt_count(img_path, search_split)
+        self.source.finish()
 
-        print("==> Grid searching best parameters on VAL ...")
+        print(f"==> Grid searching best parameters on {tag.upper()} ...")
         best_cfg, best_sum_diff = self._grid_search(val_cache, val_gt_counts)
-        print(f"[Best on VAL] iou_type={best_cfg['iou_type'].value}, "
-              f"score_thr={best_cfg['score_thr']:.4f}, nms_iou_thr={best_cfg['nms_iou_thr']:.4f}, "
-              f"sum|GT-Pred|={best_sum_diff}")
+        summary = (f"[Best on {tag.upper()}] iou_type={best_cfg['iou_type'].value}, "
+                   f"score_thr={best_cfg['score_thr']:.4f}, nms_iou_thr={best_cfg['nms_iou_thr']:.4f}, "
+                   f"sum|GT-Pred|={best_sum_diff}")
+        print(summary)
 
         # 将 print 输出保存到文件
-        with open(os.path.join(self.outputs.out_dir, "best_params_on_val.txt"), "w", encoding="utf-8") as f:
-            f.write(f"[Best on VAL] iou_type={best_cfg['iou_type'].value}, "
-                    f"score_thr={best_cfg['score_thr']:.4f}, nms_iou_thr={best_cfg['nms_iou_thr']:.4f}, "
-                    f"sum|GT-Pred|={best_sum_diff}\n")
+        with open(os.path.join(self.outputs.out_dir, f"best_params_on_{tag}.txt"), "w", encoding="utf-8") as f:
+            f.write(summary + "\n")
 
-        print("==> Running TEST with best parameters ...")
-        self._run_on_split("test", best_cfg['iou_type'], best_cfg['score_thr'], best_cfg['nms_iou_thr'])
+        print(f"==> Running {self.source.tag(eval_split).upper()} with best parameters ...")
+        self._run_on_split(eval_split, best_cfg['iou_type'], best_cfg['score_thr'], best_cfg['nms_iou_thr'])
 
     def run_infer_only(self, split: str, iou_type: IOUType, score_thr: float, nms_iou_thr: float):
-        """Direct inference with fixed params on a chosen split (test/val/train)."""
+        """Direct inference with fixed params on a chosen split (普通目录时 split 被忽略)."""
         ensure_dir(self.outputs.out_dir)
         random.seed(0); np.random.seed(0)
+        self.source = build_data_source(self.dataset)
         print("==> Loading model ..."); self.load_model()
-        print(f"==> Running {split.upper()} with fixed params: "
+        print(f"==> Running {self.source.tag(split).upper()} with fixed params: "
               f"iou_type={iou_type.value}, score_thr={score_thr}, nms_iou_thr={nms_iou_thr}")
         self._run_on_split(split, iou_type, score_thr, nms_iou_thr)
 
     # ====== shared helpers ======
     def _run_on_split(self, split: str, iou_type: IOUType, score_thr: float, nms_iou_thr: float):
-        imgs_dir, _ = yolo_split_paths(self.dataset.yolo_root, split)
-        images = list_images_in_dir(imgs_dir)
+        tag = self.source.tag(split)
+        images = self._images_for(split)
 
-        rows = [("filename", "ins_counts", "pred_counts")]
+        rows: List[Tuple] = []
+        header_written = False
         xs, ys = [], []
-        for idx, img_path in enumerate(tqdm(images, desc=f"{split.upper()} images", total=len(images)), 1):
+        for idx, img_path in enumerate(tqdm(images, desc=f"{tag.upper()} images", total=len(images)), 1):
             proposals = self._proposals_for_image(img_path)
             final_dets = self._apply_thresh_nms(proposals, score_thr, nms_iou_thr, iou_type)
             pred_count = len(final_dets)
-            gt_count = yolo_count_instances(yolo_label_path_for_image(img_path, self.dataset.yolo_root))
-            rows.append((os.path.basename(img_path), gt_count, pred_count))
-            xs.append(gt_count); ys.append(pred_count)
+            gt_count = self.source.gt_count(img_path, split)
+            if not header_written:
+                rows.append(("filename", "ins_counts", "pred_counts") if gt_count is not None
+                            else ("filename", "pred_counts"))
+                header_written = True
+            if gt_count is None:
+                rows.append((os.path.basename(img_path), pred_count))
+            else:
+                rows.append((os.path.basename(img_path), gt_count, pred_count))
+                xs.append(gt_count); ys.append(pred_count)
             save_coco = False
             if save_coco:
                 img_id = idx * 100000
@@ -370,10 +601,12 @@ class SegInferenceTemplate:
             if self.outputs.vis:
                 self._visualize_and_save(img_path, final_dets, self.outputs.out_dir)
 
+        self.source.finish()
+
         if self.outputs.excel:
-            csv_path = os.path.join(self.outputs.out_dir, f"{split}_pred_vs_gt.csv")
+            csv_path = os.path.join(self.outputs.out_dir, f"{tag}_pred_vs_gt.csv")
             with open(csv_path, "w", encoding="utf-8") as f:
-                for r in rows: f.write(f"{r[0]},{r[1]},{r[2]}\n")
+                for r in rows: f.write(",".join(str(v) for v in r) + "\n")
             print(f"[Saved] CSV -> {csv_path}")
             # def diff_count(csv_path, out_dir):
             #     import pandas as pd
@@ -392,11 +625,15 @@ class SegInferenceTemplate:
             #         f.write(f"百分比: {percentage:.2f}%\n")
             # diff_count(csv_path, self.outputs.out_dir)
 
-        if self.outputs.draw_scatter and xs:
-            self._draw_scatter(xs, ys, os.path.join(self.outputs.out_dir, f"scatter_{split}.png"))
-            print(f"[Saved] Scatter -> {os.path.join(self.outputs.out_dir, f'scatter_{split}.png')}")
+        if self.outputs.draw_scatter:
+            if xs:
+                scatter_path = os.path.join(self.outputs.out_dir, f"scatter_{tag}.png")
+                self._draw_scatter(xs, ys, scatter_path)
+                print(f"[Saved] Scatter -> {scatter_path}")
+            else:
+                print("[skip] 无 GT，跳过散点图")
 
-        print(f"{split.upper()} finished.")
+        print(f"{tag.upper()} finished.")
 
     def _proposals_for_image(self, img_path: str) -> List[DetProposal]:
         img = cv2.imread(img_path)
@@ -793,16 +1030,29 @@ class Detectron2SegInference(SegInferenceTemplate):
 # -----------------------------
 # CLI
 # -----------------------------
-def build_argparser():
+def build_argparser(suppress_defaults: bool = False):
     p = argparse.ArgumentParser(description="Wheat Segmentation (Template Method) on Detectron2 with search/infer modes")
+
+    # Config file
+    p.add_argument("--config", "-c", type=str, default="",
+                   help="YAML 配置文件；键名与 --xxx 一一对应。命令行显式传入的参数覆盖它")
 
     # Modes
     p.add_argument("--mode", choices=["search", "infer"], default="search",
                    help="search: grid search on val then test; infer: direct inference with fixed params")
 
     # Dataset
+    p.add_argument("--source", choices=["yolo", "coco", "dir"], default="yolo",
+                   help="数据组织形式：yolo=<root>/images/<split>；coco=<root>/<split>+annotations；dir=直接列图（无 GT，仅 infer）")
+    p.add_argument("--data_root", type=str, default="",
+                   help="yolo/coco 的数据集根目录，或 dir 模式下的图片目录")
     p.add_argument("--yolo_root", type=str,
-                   default="/public/home/zncui/datasets/wheat-guo-dataset/yolo_wheat_big_image")
+                   default="/public/home/zncui/datasets/wheat-guo-dataset/yolo_wheat_big_image",
+                   help="[deprecated] --data_root 的旧名字，未指定 --data_root 时生效")
+    p.add_argument("--coco_ann", type=str, default="",
+                   help="coco 模式下显式指定标注 json，覆盖 <root>/annotations/instances_<split>.json")
+    p.add_argument("--gt_cat_ids", type=int, nargs="*", default=[],
+                   help="GT 计数只统计这些类别（coco 用 category_id，yolo 用 txt 首列）；不填 = 全算")
 
     # Model (兼容：本地相对路径 / 模型动物园别名 / detectron2:// / http URL)
     p.add_argument("--project_root", type=str,
@@ -820,6 +1070,10 @@ def build_argparser():
     p.add_argument("--overlap", type=int, default=256)
 
     # Search space (used only in --mode search)
+    p.add_argument("--search_split", type=str, default="val",
+                   help="[mode=search] 在哪个子目录上搜参数（coco 传子目录名，如 val2017）")
+    p.add_argument("--eval_split", type=str, default="test",
+                   help="[mode=search] 用最优参数在哪个子目录上跑最终评测")
     p.add_argument("--score_start", type=float, default=0.1)
     p.add_argument("--score_end", type=float, default=0.6)
     p.add_argument("--score_num", type=int, default=6)
@@ -830,7 +1084,10 @@ def build_argparser():
     p.add_argument("--base_keep_score", type=float, default=0.01)
 
     # Infer-only fixed params
-    p.add_argument("--infer_split", choices=["test", "val", "train"], default="test")
+    p.add_argument("--split", type=str, default="",
+                   help="[mode=infer] 推理的子目录名（yolo: val/test/train；coco: val2017 等）；dir 模式不需要")
+    p.add_argument("--infer_split", type=str, default="test",
+                   help="[deprecated] --split 的旧名字，未指定 --split 时生效")
     p.add_argument("--fix_iou_type", choices=["IOU", "IOU_Min"], default="IOU_Min")
     p.add_argument("--fix_score_thr", type=float, default=0.4)
     p.add_argument("--fix_nms_iou_thr", type=float, default=0.372)
@@ -840,14 +1097,143 @@ def build_argparser():
     p.add_argument("--no_vis", action="store_true")
     p.add_argument("--no_excel", action="store_true")
     p.add_argument("--no_scatter", action="store_true")
+    p.add_argument("--limit", type=int, default=0,
+                   help=">0 时每个 split 只处理前 N 张图（冒烟测试用）")
+
+    if suppress_defaults:
+        # 探测模式：默认值全换成 SUPPRESS，解析结果里只剩用户显式传入的参数。
+        # 不能用 p.set_defaults()：它同时写 parser._defaults，而那份会被原样塞进
+        # Namespace（每个键都变成字面量 '==SUPPRESS=='），反而分不清传没传。
+        for a in p._actions:
+            a.default = argparse.SUPPRESS
 
     return p
 
 
-def main():
-    args = build_argparser().parse_args()
+# -----------------------------
+# Run config (YAML) —— 优先级：argparse 默认值 < 配置文件 < 命令行显式传入
+# -----------------------------
+def _cli_provided_keys(argv: List[str]) -> set:
+    """返回用户在命令行上**显式传过**的参数名集合。
 
-    dataset = DatasetConfig(yolo_root=args.yolo_root)
+    不能用「值 != argparse 默认值」来判断：显式传一个恰好等于默认值的值会被误判成没传，
+    于是被配置文件反向覆盖。这里用一个默认值全为 SUPPRESS 的同构 parser 解析一遍，
+    Namespace 里出现的键就是显式传过的。
+    """
+    return set(vars(build_argparser(suppress_defaults=True).parse_args(argv)))
+
+
+def load_run_config(path: str) -> Dict[str, Any]:
+    if not os.path.isfile(path):
+        raise SystemExit(f"配置文件不存在: {path}")
+    with open(path, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise SystemExit(f"配置文件顶层必须是 key: value 映射（键名与 --xxx 一一对应）: {path}")
+    return data
+
+
+def _arg_types() -> Dict[str, Any]:
+    """dest -> argparse 声明的 type，用于把 YAML 里写成字符串的值归一化。"""
+    return {a.dest: a.type for a in build_argparser()._actions if a.type is not None}
+
+
+def merge_run_config(args: argparse.Namespace, cfg: Dict[str, Any], provided: set) -> List[str]:
+    """把配置文件合并进 args（跳过命令行已显式指定的键），返回真正生效的配置文件键名。"""
+    known = set(vars(args))
+    unknown = sorted(set(cfg) - known)
+    if unknown:
+        raise SystemExit(f"配置文件里有未知项: {unknown}\n"
+                         f"键名需与命令行参数一一对应（去掉 -- 前缀），可用项见 --help")
+
+    types = _arg_types()
+    applied: List[str] = []
+    for k, v in cfg.items():
+        if k in provided:          # 命令行显式传入的优先，配置文件不覆盖
+            continue
+        t = types.get(k)
+        if t is not None and v is not None:
+            try:
+                v = [t(x) for x in v] if isinstance(v, list) else t(v)
+            except (TypeError, ValueError) as e:
+                raise SystemExit(f"配置项 {k}: {v!r} 无法转成 {getattr(t, '__name__', t)}: {e}")
+        setattr(args, k, v)
+        applied.append(k)
+    return applied
+
+
+def dump_effective_config(args: argparse.Namespace, provided: set, from_cfg: List[str]):
+    """把合并后的最终配置写到 <out_dir>/effective_config.yaml，可直接 --config 喂回去复现。"""
+    effective = {k: v for k, v in sorted(vars(args).items()) if k != "config"}
+    cli_keys = sorted(k for k in provided if k in effective)
+
+    lines = ["# 本次运行的最终配置（可直接 --config 复现）"]
+    if cli_keys:
+        lines.append(f"# [cli]    命令行显式覆盖: {', '.join(cli_keys)}")
+    if from_cfg:
+        lines.append(f"# [config] 来自 {args.config}: {', '.join(sorted(from_cfg))}")
+    lines.append("# 其余为脚本默认值")
+
+    ensure_dir(args.out_dir)
+    out_path = os.path.join(args.out_dir, "effective_config.yaml")
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+        yaml.safe_dump(effective, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+    print(f"[Saved] Effective config -> {out_path}")
+
+
+def _resolve_splits(args) -> Tuple[str, str, str]:
+    """校验数据源/split 参数，返回 (infer_split, search_split, eval_split)。"""
+    # --yolo_root 带默认值，非 yolo 源忘记 --data_root 会静默落到那个默认路径上，这里挡住
+    if args.source != "yolo" and not args.data_root:
+        raise SystemExit(f"--source {args.source} 必须用 --data_root 指定数据目录")
+
+    infer_split = args.split or args.infer_split
+
+    if args.source == "dir":
+        if args.mode == "search":
+            raise SystemExit("普通目录（--source dir）没有 GT，无法网格搜参数，请用 --mode infer")
+        if args.split:
+            print(f"[warn] --source dir 不需要子目录，已忽略 --split {args.split!r}")
+        return "", "", ""
+
+    if args.mode == "infer":
+        if not infer_split:
+            raise SystemExit(f"--source {args.source} 需要用 --split 指定推理子目录"
+                             f"（yolo 如 test，coco 如 val2017）")
+        return infer_split, "", ""
+
+    if not args.search_split or not args.eval_split:
+        raise SystemExit(f"--source {args.source} 的 search 模式需要 --search_split 与 --eval_split")
+    return "", args.search_split, args.eval_split
+
+
+def main():
+    argv = sys.argv[1:]
+    args = build_argparser().parse_args(argv)      # argparse 默认值 + 命令行
+    provided = _cli_provided_keys(argv)            # 其中哪些是用户显式传的
+
+    from_cfg: List[str] = []
+    if args.config:
+        cfg = load_run_config(args.config)
+        from_cfg = merge_run_config(args, cfg, provided)
+        overridden = sorted(set(cfg) & provided)
+        print(f"[config] {args.config} -> 生效 {len(from_cfg)} 项"
+              + (f"；被命令行覆盖: {', '.join(overridden)}" if overridden else ""))
+
+    # 校验必须在合并之后：配置文件里的 split / data_root 要先生效
+    infer_split, search_split, eval_split = _resolve_splits(args)
+    dump_effective_config(args, provided, from_cfg)
+
+    dataset = DatasetConfig(
+        yolo_root=args.yolo_root,
+        source=args.source,
+        data_root=args.data_root,
+        coco_ann=args.coco_ann,
+        gt_cat_ids=tuple(args.gt_cat_ids),
+    )
     model = ModelConfig(
         project_root=args.project_root,
         config_rel=args.model_config_rel,
@@ -870,12 +1256,13 @@ def main():
     )
 
     runner = Detectron2SegInference(dataset, model, sw, search, outputs)
+    runner.limit = args.limit
 
     if args.mode == "search":
-        runner.run_search()
+        runner.run_search(search_split=search_split, eval_split=eval_split)
     else:
         runner.run_infer_only(
-            split=args.infer_split,
+            split=infer_split,
             iou_type=IOUType(args.fix_iou_type),
             score_thr=args.fix_score_thr,
             nms_iou_thr=args.fix_nms_iou_thr

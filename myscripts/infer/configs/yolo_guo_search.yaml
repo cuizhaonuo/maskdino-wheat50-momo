@@ -1,0 +1,40 @@
+# YOLO 大图网格搜参数：在 val 上搜 (iou_type, score_thr, nms_iou_thr)，再用最优参数跑 test
+# 跑法（仓库根目录）：
+#   PYTHONPATH=. python myscripts/infer/seg_infer.py --config myscripts/infer/configs/yolo_guo_search.yaml
+# 想先小跑验证：加 --limit 3 --score_num 2 --nms_num 2
+
+mode: search
+
+# 数据源：<data_root>/images/<split>/ + <data_root>/labels/<split>/<stem>.txt
+source: yolo
+data_root: /public/home/zncui/datasets/wheat-guo-dataset/yolo_wheat_big_image
+search_split: val
+eval_split: test
+
+# 模型
+model_config_rel: output_v2/wheat_stage1_detector_v2_cosine/config.yaml
+checkpoint_rel:   output_v2/wheat_stage1_detector_v2_cosine/model_final.pth
+project_root: .
+device: cuda:0
+imports: [maskdino]
+
+# 滑窗（郭数据集是 ~3000x3000 的大图）
+tile: 800
+overlap: 256
+
+# 搜索空间：score_thr 与 nms_iou_thr 各自在 [start, end] 上均匀取 num 个点
+iou_types: [IOU, IOU_Min]
+score_start: 0.1
+score_end: 0.6
+score_num: 6
+nms_start: 0.1
+nms_end: 0.6
+nms_num: 12
+base_keep_score: 0.01
+
+# 输出
+out_dir: ./vis_yolo_guo_search
+no_vis: false
+no_excel: false
+no_scatter: false
+limit: 0

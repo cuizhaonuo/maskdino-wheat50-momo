@@ -1,0 +1,37 @@
+# 普通图片文件夹推理（没有标注）：只出可视化 + 每图预测数
+# 跑法（仓库根目录）：
+#   PYTHONPATH=. python myscripts/infer/seg_infer.py --config myscripts/infer/configs/plain_dir.yaml \
+#     --data_root /你的/图片目录 --out_dir ./vis_out
+#
+# 注意：普通目录没有 GT，只能 mode: infer（search 需要 GT 才能算 sum|GT-Pred|），
+# 且不会生成散点图，CSV 只有 filename,pred_counts 两列。
+
+mode: infer
+
+# 数据源：直接列 <data_root> 下的图片，不需要 split
+source: dir
+data_root: /public/home/zncui/datasets/wheat50/images_for_test/images
+
+# 模型
+model_config_rel: output_v2/wheat_stage1_detector_v2_cosine/config.yaml
+checkpoint_rel:   output_v2/wheat_stage1_detector_v2_cosine/model_final.pth
+project_root: .
+device: cuda:0
+imports: [maskdino]
+
+# 滑窗
+tile: 800
+overlap: 256
+
+# 固定阈值（没有 GT 就没法搜，只能沿用别处搜好的参数）
+fix_iou_type: IOU_Min
+fix_score_thr: 0.4
+fix_nms_iou_thr: 0.372
+base_keep_score: 0.01
+
+# 输出
+out_dir: ./vis_plain_dir
+no_vis: false
+no_excel: false
+no_scatter: true
+limit: 0

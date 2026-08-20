@@ -1,0 +1,36 @@
+# COCO 数据集固定参数推理：coco_2cat 的 val2017
+# 跑法（仓库根目录）：
+#   PYTHONPATH=. python myscripts/infer/seg_infer.py --config myscripts/infer/configs/coco_val2017.yaml
+# 任何一项都能被命令行临时覆盖，例如 --split train2017 --fix_score_thr 0.5 --limit 5
+
+mode: infer
+
+# 数据源：<data_root>/<split>/ + <data_root>/annotations/instances_<split>.json
+source: coco
+data_root: /public/home/zncui/datasets/wheat50/coco_2cat
+split: val2017
+# gt_cat_ids: [1]        # 只按 wheat 统计 GT；不填 = 全算
+
+# 模型
+model_config_rel: output_v2/wheat_stage1_detector_v2_cosine/config.yaml
+checkpoint_rel:   output_v2/wheat_stage1_detector_v2_cosine/model_final.pth
+project_root: .
+device: cuda:0
+imports: [maskdino]
+
+# 滑窗（val2017 是 1024x1024 的小图，tile 800 会切成 4 块）
+tile: 800
+overlap: 256
+
+# infer 模式的固定阈值
+fix_iou_type: IOU_Min
+fix_score_thr: 0.4
+fix_nms_iou_thr: 0.372
+base_keep_score: 0.01
+
+# 输出
+out_dir: ./vis_coco_val
+no_vis: false
+no_excel: false
+no_scatter: false
+limit: 0
