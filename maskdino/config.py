@@ -110,6 +110,17 @@ def add_maskdino_config(cfg):
     cfg.MODEL.MaskDINO.TEST.PANO_TEMPERATURE = 0.06
     # 小穗点存在性置信度阈值（sigmoid 后 > 该值的点才输出）
     cfg.MODEL.MaskDINO.TEST.POINT_THRESHOLD = 0.35
+    # 评估时是否额外加挂小穗点评估器（SpikeletPointEvaluator，见 maskdino/evaluation/）
+    cfg.MODEL.MaskDINO.TEST.SPIKELET_EVAL = False
+    # 点匹配的距离阈值（原图像素，多档一起报）。GT 实测同穗内小穗最近邻间距中位 16px，
+    # 故 8px 已是不产生歧义匹配的上限。
+    cfg.MODEL.MaskDINO.TEST.SPIKELET_EVAL_SIGMAS = [3.0, 5.0, 8.0]
+    # 只有分数不低于该阈值的 wheat_2 预测实例才参与点评估。0.4 是 Stage1 检测器在带点 val 上
+    # 实例配对 F1 的峰值（recall 0.76 / precision 0.76）；取 0.5 会让 recall 掉到 0.53，
+    # 相当于先丢掉一半 GT 穗，点级 recall 也就被封顶了。
+    cfg.MODEL.MaskDINO.TEST.SPIKELET_EVAL_SCORE_THRESH = 0.4
+    # GT 穗与预测穗配对所需的最小 mask IoU
+    cfg.MODEL.MaskDINO.TEST.SPIKELET_EVAL_IOU_THRESH = 0.5
     # cfg.MODEL.MaskDINO.TEST.EVAL_FLAG = 1
 
     # Sometimes `backbone.size_divisibility` is set to 0 for some backbone (e.g. ResNet)

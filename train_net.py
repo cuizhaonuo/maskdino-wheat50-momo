@@ -49,6 +49,7 @@ from maskdino import (
     COCOInstanceNewBaselineDatasetMapper,
     COCOPanopticNewBaselineDatasetMapper,
     InstanceSegEvaluator,
+    SpikeletPointEvaluator,
     MaskFormerSemanticDatasetMapper,
     SemanticSegmentorWithTTA,
     add_maskdino_config,
@@ -70,7 +71,6 @@ import weakref
 # 注册数据集
 from data_register import wheat_data, maize_rice_data, xinxiang_data, gwhd2021_data, wheat_data_cat1_quality, wheat_data_cat2, wheat_data_cat3
 
-import types
 
 # 小穗点头的参数名子串（decoder 中的 point_coord_embed / point_class_embed）。
 _POINT_HEAD_KEYS = ("point_coord_embed", "point_class_embed")
@@ -79,10 +79,15 @@ _POINT_HEAD_KEYS = ("point_coord_embed", "point_class_embed")
 def freeze_all_but_point_head(model):
     """两阶段迁移的 Stage2：冻结除小穗点头以外的全部参数，只训练点头。
 
-    - 除 point_coord_embed / point_class_embed 外的参数 requires_grad=False，
-      因此 build_optimizer 会自动只把点头参数加入优化器（它按 requires_grad 过滤）。
-    - 覆盖 model.train()：训练时把 trunk 强制拉回 eval（固定 BN 统计、关闭 dropout），
-      只让点头处于 train 模式，使前向与推理一致、与 Stage1 的匹配完全解耦。
+    除 point_coord_embed / point_class_embed 外的参数 requires_grad=False，
+    因此 build_optimizer 会自动只把点头参数加入优化器（它按 requires_grad 过滤）。
+
+    注意：这里【不能】再去改各模块的 training 标志把 trunk 拉成 eval。本模型里
+    training 标志同时承担了语义分支的开关：maskdino.py 的 forward 靠它选训练/推理分支，
+    maskdino_decoder.py 靠它决定是否做 DN、以及是否给非最后一层算 mask 预测。把它置 False
+    会让 AMPTrainer 的 `assert model.training` 直接失败，或让 aux 的 mask 损失拿到 None。
+    而"固定 BN/dropout"这个初衷本就无需处理：backbone 是 FrozenBN、pixel decoder 是 GN、
+    MaskDINO.DROPOUT=0.0，没有任何对 train/eval 敏感的层。
     """
     trainable, frozen = 0, 0
     for name, p in model.named_parameters():
@@ -93,29 +98,9 @@ def freeze_all_but_point_head(model):
             p.requires_grad_(False)
             frozen += p.numel()
 
-    # 收集点头子模块，train() 时只放开它们。
-    point_modules = [m for n, m in model.named_modules()
-                     if any(k in n for k in _POINT_HEAD_KEYS)]
-
-    def train(self, mode: bool = True):
-        # 先按常规递归设置 training 标志
-        torch.nn.Module.train(self, mode)
-        if mode:
-            # 训练模式下：整体 eval，再单独放开点头
-            for m in self.modules():
-                m.training = False
-            for pm in point_modules:
-                for sub in pm.modules():
-                    sub.training = True
-        return self
-
-    model.train = types.MethodType(train, model)
-    model.train()  # 立即应用：trunk eval，点头 train
-
     logger = logging.getLogger("detectron2")
     logger.info(
-        f"[FREEZE_EXCEPT_POINT_HEAD] 可训练参数 {trainable:,} | 冻结参数 {frozen:,} | "
-        f"点头模块数 {len(point_modules)}"
+        f"[FREEZE_EXCEPT_POINT_HEAD] 可训练参数 {trainable:,} | 冻结参数 {frozen:,}"
     )
     if trainable == 0:
         raise RuntimeError(
@@ -209,6 +194,17 @@ class Trainer(DefaultTrainer):
         # instance segmentation
         if evaluator_type == "coco":
             evaluator_list.append(COCOEvaluator(dataset_name, output_dir=output_folder))
+            # Stage2：额外评估每个 wheat_2 实例内部的小穗点定位与计数（COCOEvaluator 不评这个）
+            if cfg.MODEL.MaskDINO.TEST.SPIKELET_EVAL:
+                evaluator_list.append(
+                    SpikeletPointEvaluator(
+                        dataset_name,
+                        output_dir=output_folder,
+                        sigmas=cfg.MODEL.MaskDINO.TEST.SPIKELET_EVAL_SIGMAS,
+                        score_thresh=cfg.MODEL.MaskDINO.TEST.SPIKELET_EVAL_SCORE_THRESH,
+                        iou_thresh=cfg.MODEL.MaskDINO.TEST.SPIKELET_EVAL_IOU_THRESH,
+                    )
+                )
         # panoptic segmentation
         if evaluator_type in [
             "coco_panoptic_seg",
