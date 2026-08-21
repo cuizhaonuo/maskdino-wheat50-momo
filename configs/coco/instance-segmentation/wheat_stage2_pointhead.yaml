@@ -26,9 +26,13 @@ MODEL:
     # 启用点损失
     POINT_COORD_WEIGHT: 5.0
     POINT_CLASS_WEIGHT: 2.0
-    # 点匹配代价置 0：匹配与 Stage1 一致，避免点头反馈扰动 query→实例的分配。
-    COST_POINT_COORD_WEIGHT: 0.0
-    COST_POINT_CLASS_WEIGHT: 0.0
+    # 内层点匹配代价（把 P 个预测点匹配到该穗的 GT 小穗）。
+    # 注意不能置 0：cost 全零会让 linear_sum_assignment 退化成恒等分配，
+    # 即第 k 个预测点槽被硬指派给标注顺序的第 k 个 GT 小穗、与距离无关，
+    # 坐标头因此塌陷到穗中轴线（见 experiments-bank/experiments/exp-2026-08-20-stage2-baseline.md）。
+    # 这两项只作用于内层；外层 query→实例的匹配走 matcher.py，本就不含点项。
+    COST_POINT_COORD_WEIGHT: 5.0
+    COST_POINT_CLASS_WEIGHT: 2.0
     TEST:
       # 加挂小穗点评估器：点级 P/R/F1（σ 为原图像素）+ 每穗/整图计数误差。
       SPIKELET_EVAL: True
