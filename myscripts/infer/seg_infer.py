@@ -114,6 +114,8 @@ class ModelConfig:
     checkpoint_rel: str
     device: str = "cuda:0"
     imports: Tuple[str, ...] = tuple()
+    # 直接透传给 detectron2 cfg 的覆盖项（KEY VALUE KEY VALUE ...），在所有其它设置之后生效
+    opts: Tuple[str, ...] = tuple()
 
 @dataclass
 class SlidingWindowConfig:
@@ -987,6 +989,14 @@ class Detectron2SegInference(SegInferenceTemplate):
         # keep low thresh to collect more raw proposals; we filter again later
         cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = float(max(0.0, min(self.search.base_keep_score, 0.9)))
 
+        # 2.5) --opts 覆盖项放在最后，可以改上面任何一项（含 WEIGHTS / DEVICE）
+        if self.model_cfg.opts:
+            opts = list(self.model_cfg.opts)
+            if len(opts) % 2 != 0:
+                raise SystemExit(f"--opts 必须是 KEY VALUE 成对出现，收到 {len(opts)} 个: {opts}")
+            cfg.merge_from_list(opts)
+            print("[opts]    -> " + ", ".join(f"{k}={v}" for k, v in zip(opts[::2], opts[1::2])))
+
         # 3) predictor
         self.model = DefaultPredictor(cfg)
 
@@ -1064,6 +1074,9 @@ def build_argparser(suppress_defaults: bool = False):
     p.add_argument("--device", type=str, default="cuda:0")
     p.add_argument("--imports", type=str, nargs="*", default=['maskdino'],
                    help="Optional modules to import before building cfg (e.g., maskdino)")
+    p.add_argument("--opts", type=str, nargs="*", default=[],
+                   help="覆盖 detectron2 cfg 的 KEY VALUE 对，在 model_config_rel 之后生效，"
+                        "例如 --opts TEST.DETECTIONS_PER_IMAGE 300 INPUT.MIN_SIZE_TEST 1024")
 
     # Sliding window
     p.add_argument("--tile", type=int, default=800)
@@ -1239,7 +1252,8 @@ def main():
         config_rel=args.model_config_rel,
         checkpoint_rel=args.checkpoint_rel if args.checkpoint_rel else "",
         device=args.device,
-        imports=tuple(args.imports)
+        imports=tuple(args.imports),
+        opts=tuple(str(o) for o in args.opts),
     )
     sw = SlidingWindowConfig(tile=args.tile, overlap=args.overlap, pad_value=(114, 114, 114))
     search = SearchSpace(

@@ -18,15 +18,33 @@ project_root: .
 device: cuda:0
 imports: [maskdino]
 
-# 滑窗（val2017 是 1024x1024 的小图，tile 800 会切成 4 块）
-tile: 800
-overlap: 256
+# 训练配置里的两个测试期默认值会压住这次评测，在这里覆盖掉
+# （与 coco_val2017_search.yaml 保持一致，否则搜出来的阈值换个推理设置就不适用了）：
+#   TEST.DETECTIONS_PER_IMAGE: 100 —— val2017 每图最多 88 个 GT 实例，
+#     整图单窗推理时 100 这个上限会直接封顶 recall。提到 300（= NUM_OBJECT_QUERIES）即不再是瓶颈。
+#   INPUT.MIN/MAX_SIZE_TEST: 800/1333 —— 会把 1024 的图缩到 800 再推理，
+#     和训练的 LSJ IMAGE_SIZE=1024 对不上，小目标先损失一档分辨率。
+opts: [TEST.DETECTIONS_PER_IMAGE, 300, INPUT.MIN_SIZE_TEST, 1024, INPUT.MAX_SIZE_TEST, 1024]
 
-# infer 模式的固定阈值
+# 滑窗：val2017 是 1024x1024，tile=1024 / overlap=0 即整图单窗（不切块）。
+# 与训练尺度一致，无 pad 边、无穗子被窗边切断后再靠 NMS 合并回来的问题。
+tile: 1024
+overlap: 0
+
+# infer 模式的固定阈值 —— 由 coco_val2017_search.yaml 在 val2017 上网格搜索得出
+# （330 点粗搜 + score 在 0.45~0.55 上 0.01 步长细化）：
+#   sum|GT-Pred| = 687 / 8631 = 7.96%，MAE 3.44 实例每图，R^2 0.90。
+# 注意：搜与评用的是同一批 val2017，这组数字偏乐观，不能当泛化性能引用。
+#
+# 只有 score_thr 是真正起作用的参数：0.45->814, 0.48->687, 0.50->690, 0.55->1056。
+# 而整图单窗下 query 之间本就少有重复，全局 Mask-NMS 几乎无事可做——固定 score=0.5 时
+# nms_iou_thr 从 0.10 扫到 0.80 只让 sum_diff 在 690~694 之间抖，IOU 与 IOU_Min 同样在
+# 噪声内（693 vs 690）。所以这两项的取值不必当真，改滑窗设置后需要重搜的也只有 score_thr。
 fix_iou_type: IOU_Min
-fix_score_thr: 0.4
-fix_nms_iou_thr: 0.372
-base_keep_score: 0.01
+fix_score_thr: 0.48
+fix_nms_iou_thr: 0.1
+# 粗筛：低于此分的 proposal 直接丢弃。设成 <= fix_score_thr 即可
+base_keep_score: 0.4
 
 # 输出
 out_dir: ./vis_coco_val

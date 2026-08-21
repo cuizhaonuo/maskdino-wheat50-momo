@@ -1,0 +1,59 @@
+# COCO 网格搜参数：在 coco_2cat 的 val2017 上搜 (iou_type, score_thr, nms_iou_thr)
+# 跑法（仓库根目录）：
+#   PYTHONPATH=. python myscripts/infer/seg_infer.py --config myscripts/infer/configs/coco_val2017_search.yaml
+# 先小跑验证：加 --limit 5 --score_num 2 --nms_num 2 --no_vis
+#
+# 与 coco_val2017.yaml（固定参数 infer）的区别只有：mode=search + 搜索空间，
+# 数据源与模型完全一致，搜出来的最优值可以直接填回那份配置的 fix_* 三项。
+
+mode: search
+
+# 数据源：<data_root>/<split>/ + <data_root>/annotations/instances_<split>.json
+source: coco
+data_root: /public/home/zncui/datasets/wheat50/coco_2cat
+# 只有 val2017 一份带标注的评测数据，搜与评用同一个 split（自搜自评）。
+# 注意：这样选出的参数在同一批图上报告，数字偏乐观，不能当泛化性能引用。
+search_split: val2017
+eval_split: val2017
+# gt_cat_ids 留空 = wheat(1) + wheat_2(2) 全算。已核对两类实例互不重叠
+# （613 个 wheat_2 无一与 wheat 框 IoU>0.5），不会重复计数；
+# 而预测端的 Mask-NMS 本来就是跨类别做的，两边口径因此一致。
+
+# 模型
+model_config_rel: output_v2/wheat_stage1_detector_v2_cosine/config.yaml
+checkpoint_rel:   output_v2/wheat_stage1_detector_v2_cosine/model_final.pth
+project_root: .
+device: cuda:0
+imports: [maskdino]
+
+# 训练配置里的两个测试期默认值会压住这次评测，在这里覆盖掉：
+#   TEST.DETECTIONS_PER_IMAGE: 100 —— val2017 每图最多 88 个 GT 实例，
+#     整图单窗推理时 100 这个上限会直接封顶 recall，网格再怎么搜也补不回来。
+#     提到 300（= MODEL.MaskDINO.NUM_OBJECT_QUERIES）即不再是瓶颈。
+#   INPUT.MIN/MAX_SIZE_TEST: 800/1333 —— 会把 1024 的图缩到 800 再推理，
+#     和训练的 LSJ IMAGE_SIZE=1024 对不上，小目标先损失一档分辨率。
+opts: [TEST.DETECTIONS_PER_IMAGE, 300, INPUT.MIN_SIZE_TEST, 1024, INPUT.MAX_SIZE_TEST, 1024]
+
+# 滑窗：val2017 是 1024x1024，tile=1024 / overlap=0 即整图单窗（不切块）。
+# 与训练尺度一致，无 pad 边、无穗子被窗边切断后再靠 NMS 合并回来的问题。
+tile: 1024
+overlap: 0
+
+# 搜索空间：score_thr 与 nms_iou_thr 各自在 [start, end] 上均匀取 num 个点
+iou_types: [IOU, IOU_Min]
+score_start: 0.1
+score_end: 0.6
+score_num: 11
+nms_start: 0.1
+nms_end: 0.8
+nms_num: 15
+# 粗筛：低于此分的 proposal 不进缓存。设成 <= score_start 即可，
+# 调高能显著减少每个网格点上 Mask-NMS 的 O(n^2) 开销。
+base_keep_score: 0.1
+
+# 输出
+out_dir: ./output_v2/vis_coco_val2017_search
+no_vis: false
+no_excel: false
+no_scatter: false
+limit: 0
