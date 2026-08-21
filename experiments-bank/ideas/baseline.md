@@ -15,13 +15,17 @@
 | 冻结 | `FREEZE_EXCEPT_POINT_HEAD: True` → 可训练 170,134 / 冻结 52,017,990 |
 | 点头 | `NUM_POINTS: 50`，坐标为**实例框相对**归一化 [0,1] |
 | 点损失权重 | `POINT_COORD_WEIGHT: 5.0`（L1）、`POINT_CLASS_WEIGHT: 2.0`（focal α=.25 γ=2） |
-| 内层匹配代价 | `COST_POINT_COORD_WEIGHT: 0.0`、`COST_POINT_CLASS_WEIGHT: 0.0` |
+| 内层匹配代价 | `COST_POINT_COORD_WEIGHT: 0.0`、`COST_POINT_CLASS_WEIGHT: 0.0` ⚠ 见下 |
 | 检测部分 | `NUM_OBJECT_QUERIES: 300`，`DEC_LAYERS: 9`，`DN: seg`，`TWO_STAGE: True` |
 | SOLVER | `IMS_PER_BATCH: 4`，`MAX_ITER: 8000`，`STEPS: (6400, 7400)`，`WARMUP_ITERS: 500`，`BASE_LR: 1e-4`，**WarmupMultiStepLR**，AMP on |
 | 测试分辨率 | `MIN_SIZE_TEST = MAX_SIZE_TEST = 1024`（val 图原生 1024²，不缩放） |
 | 评估周期 | `EVAL_PERIOD: 800`，`CHECKPOINT_PERIOD: 800` |
 
 ⚠ 输出目录名里的 `_cosine` 来自 Stage1 权重的名字，**Stage2 本身用的是 MultiStep 不是 cosine**。
+
+⚠ 上表记录的是 **baseline 那次 run 的配置快照**。其中 `COST_POINT_*: 0.0` 已被证明是个
+bug（内层匹配退化成恒等分配，见 [inner-match-cost](inner-match-cost.md)），
+配置文件里现已改为 5.0 / 2.0。除此之外各项仍与当前配置一致。
 
 ## 数据
 
