@@ -26,6 +26,16 @@ MODEL:
     # 启用点损失
     POINT_COORD_WEIGHT: 5.0
     POINT_CLASS_WEIGHT: 2.0
+    # 检测各项的【损失】权重置 0，使 total_loss 只由点损失构成、可直接当收敛曲线读。
+    # trunk 已全部冻结，这些损失对点头的梯度本来就恒为 0，置 0 不改变任何参数更新；
+    # 但它们仍会被计算（criterion 无条件遍历 losses 列表），所以并不省算力。
+    # 只动损失权重，COST_* 一律保持原值 —— 外层匈牙利匹配仍要靠 cls/mask/dice/box/giou
+    # 把 query 正确分配给 GT 实例，点损失完全建立在这个分配之上。
+    CLASS_WEIGHT: 0.0
+    MASK_WEIGHT: 0.0
+    DICE_WEIGHT: 0.0
+    BOX_WEIGHT: 0.0
+    GIOU_WEIGHT: 0.0
     # 内层点匹配代价（把 P 个预测点匹配到该穗的 GT 小穗）。
     # 注意不能置 0：cost 全零会让 linear_sum_assignment 退化成恒等分配，
     # 即第 k 个预测点槽被硬指派给标注顺序的第 k 个 GT 小穗、与距离无关，
