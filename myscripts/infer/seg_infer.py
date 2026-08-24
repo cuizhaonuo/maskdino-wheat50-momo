@@ -101,7 +101,11 @@ class DatasetConfig:
     source: str = "yolo"                     # yolo | coco | dir
     data_root: str = ""                      # yolo/coco 根目录，或 dir 模式的图片目录
     coco_ann: str = ""                       # 可选：显式指定标注 json，覆盖 annotations/instances_<split>.json
-    gt_cat_ids: Tuple[int, ...] = ()         # GT 计数的类别过滤，空 = 全算
+    gt_cat_ids: Tuple[int, ...] = ()         # GT 计数的类别过滤（COCO category_id），空 = 全算
+    # 预测端的类别过滤，与 gt_cat_ids 对称。用的是**模型输出的连续 label**（0-based），
+    # 不是 COCO category_id —— coco_2cat 的映射是 {1: 0, 2: 1}，即 0=wheat, 1=wheat_2。
+    # 只统计某一类时两边都要设，否则 GT 与 Pred 口径不一致，sum|GT-Pred| 没有意义。
+    pred_labels: Tuple[int, ...] = ()        # 空 = 全算
 
     @property
     def root(self) -> str:
@@ -643,6 +647,7 @@ class SegInferenceTemplate:
         H, W = img.shape[:2]
         tile, overlap = self.sw.tile, self.sw.overlap
         stride = max(1, tile - overlap); padv = self.sw.pad_value
+        keep_labels = set(self.dataset.pred_labels) or None
 
         proposals: List[DetProposal] = []
 
@@ -663,6 +668,8 @@ class SegInferenceTemplate:
                 for ins in insts:
                     score = float(ins["score"])
                     if score < self.search.base_keep_score:
+                        continue
+                    if keep_labels is not None and int(ins.get("label", 0)) not in keep_labels:
                         continue
                     bbox = np.array(ins["bbox"], dtype=float)
                     mask = np.logical_and(ins["mask"].astype(bool), valid_mask)
@@ -1063,6 +1070,10 @@ def build_argparser(suppress_defaults: bool = False):
                    help="coco 模式下显式指定标注 json，覆盖 <root>/annotations/instances_<split>.json")
     p.add_argument("--gt_cat_ids", type=int, nargs="*", default=[],
                    help="GT 计数只统计这些类别（coco 用 category_id，yolo 用 txt 首列）；不填 = 全算")
+    p.add_argument("--pred_labels", type=int, nargs="*", default=[],
+                   help="预测端只保留这些类别的实例，与 --gt_cat_ids 对称。注意这里是模型输出的"
+                        "连续 label（0-based），不是 COCO category_id：coco_2cat 的映射为 "
+                        "{1:0, 2:1}，即 0=wheat, 1=wheat_2。不填 = 全算")
 
     # Model (兼容：本地相对路径 / 模型动物园别名 / detectron2:// / http URL)
     p.add_argument("--project_root", type=str,
@@ -1246,6 +1257,7 @@ def main():
         data_root=args.data_root,
         coco_ann=args.coco_ann,
         gt_cat_ids=tuple(args.gt_cat_ids),
+        pred_labels=tuple(args.pred_labels),
     )
     model = ModelConfig(
         project_root=args.project_root,

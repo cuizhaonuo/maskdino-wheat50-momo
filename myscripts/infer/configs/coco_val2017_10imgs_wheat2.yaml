@@ -1,0 +1,50 @@
+# 10 张图的 wheat_2 专项推理（固定参数版，参数由 coco_val2017_10imgs_wheat2_search.yaml 搜出）
+# 跑法（仓库根目录）：
+#   PYTHONPATH=. python myscripts/infer/seg_infer.py \
+#     --config myscripts/infer/configs/coco_val2017_10imgs_wheat2.yaml
+#
+# 数据：coco_2cat/val2017 里 wheat_2 最多的 10 张（每张 6~8 个），已拷到
+# output_v2/eval_10imgs_wheat2/data/。GT 只算 wheat_2，合计 71 个。
+
+mode: infer
+
+source: coco
+data_root: /public/home/zncui/pycharm_project/maskdino-wheat50/output_v2/eval_10imgs_wheat2/data
+split: val2017
+# 两端都按类过滤，口径必须成对：category_id 2 = wheat_2，模型连续 label 1 = wheat_2（映射 {1:0, 2:1}）
+gt_cat_ids: [2]
+pred_labels: [1]
+
+model_config_rel: output_v2/wheat_stage1_detector_v2_cosine/config.yaml
+checkpoint_rel:   output_v2/wheat_stage1_detector_v2_cosine/model_final.pth
+project_root: .
+device: cuda:0
+imports: [maskdino]
+
+opts: [TEST.DETECTIONS_PER_IMAGE, 300, INPUT.MIN_SIZE_TEST, 1024, INPUT.MAX_SIZE_TEST, 1024]
+
+tile: 1024
+overlap: 0
+
+# 288 组网格（score 0.30~0.65 步长 0.01 x nms {0.1,0.3,0.5,0.7} x {IOU, IOU_Min}）的结论：
+#
+# 1) nms_iou_thr 与 iou_type 完全不起作用 —— 36 个 score 点上，8 种组合的 sum_diff 一字不差。
+#    整图单窗（tile=1024/overlap=0）本就没有跨窗重复，再叠加只保留 wheat_2 后每图仅 ~8 个实例，
+#    全局 Mask-NMS 无事可做。这比 200 张全类别那轮（690~694 的抖动）更彻底。
+#    所以这两项写多少都一样，保留只为与其它配置同构。
+#
+# 2) 只有 score_thr 有效，且最优区是一段平台而非一个点（nms=0.1/IOU 下的 sum|GT-Pred|）：
+#      0.30 -> 29   0.40 -> 13   0.44 -> 10   0.48 -> 11   0.55 -> 18   0.65 -> 42
+#      0.42~0.50 全在 10~12 之间，0.46 的 11 与 0.47 的 10 已是非单调噪声。
+#    取 0.45 = 平台中心，而非网格报出的 0.44 —— 10 张图 / 71 个实例分辨不了 0.01 的差别。
+#    另：这与 200 张全类别那轮搜出的 0.48 基本吻合。
+fix_iou_type: IOU
+fix_score_thr: 0.45
+fix_nms_iou_thr: 0.1
+base_keep_score: 0.30
+
+out_dir: ./output_v2/eval_10imgs_wheat2/infer_out
+no_vis: false
+no_excel: false
+no_scatter: false
+limit: 0

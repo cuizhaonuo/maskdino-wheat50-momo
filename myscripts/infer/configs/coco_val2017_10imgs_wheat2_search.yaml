@@ -1,0 +1,57 @@
+# 10 张图的 wheat_2 专项网格搜参数
+# 跑法（仓库根目录）：
+#   PYTHONPATH=. python myscripts/infer/seg_infer.py \
+#     --config myscripts/infer/configs/coco_val2017_10imgs_wheat2_search.yaml
+#
+# 数据：从 coco_2cat/val2017 的 200 张里挑出 wheat_2 最多的 10 张（每张 6~8 个），
+# 已拷成独立的 COCO 目录 output_v2/eval_10imgs_wheat2/data/。
+# GT 合计 483 wheat + 71 wheat_2 = 554。
+#
+# **口径**：这轮只评 wheat_2，所以 GT 与预测两端都按类过滤：
+#   gt_cat_ids: [2]   —— COCO category_id，2 = wheat_2
+#   pred_labels: [1]  —— 模型输出的连续 label，映射 {1:0, 2:1} 故 1 = wheat_2
+# 两者必须成对设置，只设一边会让 sum|GT-Pred| 退化成「预测总数 - 71」，
+# 搜索会把 score_thr 一路推到上界。
+
+mode: search
+
+source: coco
+data_root: /public/home/zncui/pycharm_project/maskdino-wheat50/output_v2/eval_10imgs_wheat2/data
+search_split: val2017
+eval_split: val2017
+gt_cat_ids: [2]
+pred_labels: [1]
+
+# 模型
+model_config_rel: output_v2/wheat_stage1_detector_v2_cosine/config.yaml
+checkpoint_rel:   output_v2/wheat_stage1_detector_v2_cosine/model_final.pth
+project_root: .
+device: cuda:0
+imports: [maskdino]
+
+# 与 coco_val2017_search.yaml 一致，否则阈值不可比：
+#   TEST.DETECTIONS_PER_IMAGE 100 -> 300（= NUM_OBJECT_QUERIES），不让上限封顶 recall
+#   INPUT.MIN/MAX_SIZE_TEST 800/1333 -> 1024/1024，与训练的 LSJ IMAGE_SIZE 对齐
+opts: [TEST.DETECTIONS_PER_IMAGE, 300, INPUT.MIN_SIZE_TEST, 1024, INPUT.MAX_SIZE_TEST, 1024]
+
+# 图就是 1024x1024，tile=1024 / overlap=0 即整图单窗
+tile: 1024
+overlap: 0
+
+# 搜索空间：score 细搜（0.30~0.65 步长 0.01，36 点）x nms 粗扫 {0.1,0.3,0.5,0.7} x 2 种 IOU = 288 组。
+# 200 张那轮已证实只有 score_thr 真正起作用，nms/iou_type 保留粗扫只为复核这一结论。
+iou_types: [IOU, IOU_Min]
+score_start: 0.30
+score_end: 0.65
+score_num: 36
+nms_start: 0.1
+nms_end: 0.7
+nms_num: 4
+# 粗筛设成 = score_start：低于 0.30 的 proposal 永远用不上，不入缓存可省 O(n^2) NMS 开销
+base_keep_score: 0.30
+
+out_dir: ./output_v2/eval_10imgs_wheat2/search_out
+no_vis: false
+no_excel: false
+no_scatter: false
+limit: 0
