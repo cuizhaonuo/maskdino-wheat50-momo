@@ -48,6 +48,11 @@ _darcs
 /detectron2/model_zoo/configs
 /datasets/*
 !/datasets/*.*
+# Stage2 点头的可复现 10 图过拟合标注子集（图片仍不入库）
+!/datasets/wheat_cat2_pts_overfit10/
+!/datasets/wheat_cat2_pts_overfit10/README.md
+!/datasets/wheat_cat2_pts_overfit10/annotations/
+!/datasets/wheat_cat2_pts_overfit10/annotations/instances_overfit10.json
 /projects/*/datasets
 /models
 /snippet

@@ -1,4 +1,6 @@
 # 配置自己的数据集路径
+from pathlib import Path
+
 from detectron2.data import DatasetCatalog, MetadataCatalog
 from detectron2.data.datasets.coco import load_coco_json
 
@@ -70,3 +72,26 @@ for _tag, _ds in _STAGE_DATASETS.items():
             evaluator_type="coco",
             thing_dataset_id_to_contiguous_id={1: 0, 2: 1},
         )
+
+# ====== Stage2 debug：10 图过拟合子集 ======
+# 标注 JSON 放在仓库内便于复现；图片直接复用带点训练集，不重复拷贝 1024x1024 原图。
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+_OVERFIT10_JSON = _PROJECT_ROOT / "datasets/wheat_cat2_pts_overfit10/annotations/instances_overfit10.json"
+_OVERFIT10_IMAGE_ROOT = Path("/public/home/zncui/datasets/wheat50/coco_2cat_with_points/train2017")
+_OVERFIT10_NAME = "wheat_cat2_pts_coco_overfit10"
+
+DatasetCatalog.register(
+    _OVERFIT10_NAME,
+    lambda: load_coco_json(
+        str(_OVERFIT10_JSON),
+        str(_OVERFIT10_IMAGE_ROOT),
+        _OVERFIT10_NAME,
+        extra_annotation_keys=["points"],
+    ),
+)
+MetadataCatalog.get(_OVERFIT10_NAME).set(
+    thing_classes=["wheat", "wheat_2"],
+    thing_colors=[(255, 0, 0), (0, 0, 255)],
+    evaluator_type="coco",
+    thing_dataset_id_to_contiguous_id={1: 0, 2: 1},
+)
