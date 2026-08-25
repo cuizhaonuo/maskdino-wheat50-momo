@@ -16,6 +16,13 @@ B. 置信度分布图（DRAW_CONF_BARS，落在 CONF_OUT_DIR）
    **存在性头认为最可能存在的那 Ni 个点，是不是就是内层匹配挑中的那 Ni 个点。**
    两者一致时绿柱全部挤在左端；散开则说明存在性头和坐标头各说各话。
 
+C. 损失分解图（DRAW_LOSS_BARS，落在 LOSS_OUT_DIR）
+   一张堆叠条形图，每根柱子 = 一个 GT 实例对 total_loss 的贡献，按三种成分着色：
+   坐标 L1（只对匹配点求和）/ focal 正样本部分（匹配点）/ focal 负样本部分（未匹配点）。
+   数值口径完全对齐 loss_points：乘 weight_dict 权重、除以整个 batch 的 num_pos，
+   因此所有柱子之和 = 最后一层 decoder 的点损失对 total_loss 的贡献。图里同时打印
+   criterion.loss_points 的真实返回值做交叉校验。
+
 坐标口径与 loss_points 完全一致：预测点是"GT 框相对 [0,1]"，用 GT 框换算回原图像素；
 GT 点是图像归一化，直接乘 (W, H)。内层匹配不重新实现，直接调用
 `criterion._inner_point_match`，保证画的就是 loss 真正用的那组配对。
@@ -30,6 +37,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 import matplotlib
 
@@ -44,8 +52,10 @@ from myscripts.backup.vis_process.vis_match_debug import _CJK_FONT, _contour, _t
 ENABLED = True            # False 则 maybe_visualize_point_match 立即返回
 DRAW_POINT_PANELS = True  # A 图：GT 裁剪 + 预测点 / GT 点 / 匹配连线
 DRAW_CONF_BARS = True     # B 图：每个实例一个置信度条形图
+DRAW_LOSS_BARS = True     # C 图：每个实例的损失分解堆叠条形图
 OUT_DIR = "output_v2/vis_point_match"        # A 图输出目录，相对路径按仓库根解析
 CONF_OUT_DIR = "output_v2/vis_point_conf"    # B 图输出目录
+LOSS_OUT_DIR = "output_v2/vis_point_loss"    # C 图输出目录
 EVERY = 1                 # 每 N 次 criterion 调用画一次
 MAX_DUMP = 20             # 本进程最多画多少张图（按图片数计，不是文件数）
 NUM_IMAGES = 1            # 每个 batch 画前几张图
@@ -54,6 +64,7 @@ ONLY_WITH_POINTS = False  # True 则只画有 GT 小穗点的实例（即只画 
 BOX_MARGIN = 0.18         # A 图里 GT 框往外扩多少（占框宽高的比例）
 NCOLS = 6                 # panel 网格列数
 SORT_BY_CONF = True       # B 图柱子按置信度降序排（False 则按预测点槽位 0..P-1）
+SORT_BY_LOSS = True       # C 图柱子按总损失降序排（False 则与 A/B 图同序）
 INFER_THRESHOLD = 0.35    # B 图上的参考线，取 MaskDINO 推理用的 point_threshold 默认值
 IMAGE_FORMAT = "RGB"      # 与 cfg.INPUT.FORMAT 一致
 CLASS_NAMES = ["wheat", "wheat_2"]
@@ -72,6 +83,7 @@ _C_MATCH = "#22c55e"      # 匹配上的预测点：描边 / 连线 / 绿柱
 _C_UNMATCH = "#94a3b8"    # 未匹配的预测点（B 图柱子）
 _C_MASK = "#f59e0b"       # GT mask 轮廓
 _C_THR = "#ef4444"        # 推理阈值参考线
+_C_COORD = "#3b82f6"      # C 图：坐标 L1 成分
 
 
 def _resolve(d):
@@ -91,7 +103,7 @@ def _grid_shape(n):
 # --------------------------------------------------------------------------
 # 数据收集：两张图共用，内层匹配只做一遍
 # --------------------------------------------------------------------------
-def _collect_items(criterion, pred_coords, pred_pt_logits, targets, indices, b, W, H):
+def _collect_items(criterion, pred_coords, pred_pt_logits, targets, indices, b, W, H, denom):
     """整理第 b 张图每个 GT 实例的绘图数据。
 
     返回 (items, n_clamped_total)。items 已按"有小穗点优先、点多优先"排好序。
@@ -101,6 +113,9 @@ def _collect_items(criterion, pred_coords, pred_pt_logits, targets, indices, b, 
     points = targets[b]["points"]                # list[Tensor[Ni, 2]] 图像归一化
     labels = targets[b]["labels"].cpu().numpy()
     gt_masks = targets[b]["masks"].detach().to(torch.bool).cpu().numpy()
+    alpha, gamma = criterion.focal_alpha, 2.0
+    w_coord = criterion.weight_dict.get("loss_point_coord", 1.0)
+    w_cls = criterion.weight_dict.get("loss_point_cls", 1.0)
 
     items = []
     n_clamped_total = 0
@@ -151,6 +166,22 @@ def _collect_items(criterion, pred_coords, pred_pt_logits, targets, indices, b, 
         unmatched = np.setdiff1d(np.arange(conf.size), r)
         conf_u = float(np.median(conf[unmatched])) if unmatched.size else float("nan")
 
+        # 逐实例损失分解，口径逐行对齐 loss_points：
+        # focal 对全部 P 个点求和（按 tgt_exist 拆成正/负两块），L1 只对匹配点求和，
+        # 再乘 weight_dict 权重、除以整个 batch 的 num_pos。
+        tgt_exist = torch.zeros_like(pred_lg)
+        if row_ind.numel():
+            tgt_exist[row_ind] = 1.0
+        prob = pred_lg.sigmoid()
+        ce = F.binary_cross_entropy_with_logits(pred_lg, tgt_exist, reduction="none")
+        p_t = prob * tgt_exist + (1 - prob) * (1 - tgt_exist)
+        focal = ce * ((1 - p_t) ** gamma)
+        focal = (alpha * tgt_exist + (1 - alpha) * (1 - tgt_exist)) * focal
+        cls_pos = float(focal[row_ind].sum()) if row_ind.numel() else 0.0
+        cls_neg = float(focal.sum()) - cls_pos
+        coord_raw = (float(F.l1_loss(pred_rel[row_ind], gt_rel[col_ind], reduction="sum"))
+                     if row_ind.numel() else 0.0)
+
         items.append(dict(
             g=g_j, q=q_i, Ni=Ni, cls=int(labels[g_j]), n_clamped=n_clamped,
             box_px=(bx0, by0, bx0 + bpw, by0 + bph),
@@ -158,6 +189,9 @@ def _collect_items(criterion, pred_coords, pred_pt_logits, targets, indices, b, 
             gt_used_px=gt_used_px, row=r, col=c,
             l1=l1, dist_px=dist_px, conf_m=conf_m, conf_u=conf_u, hit=hit,
             n_over=int((conf > INFER_THRESHOLD).sum()),
+            loss_coord=w_coord * coord_raw / denom,
+            loss_cls_pos=w_cls * cls_pos / denom,
+            loss_cls_neg=w_cls * cls_neg / denom,
         ))
 
     # 有点的排前面，点多的优先
@@ -367,20 +401,117 @@ def _draw_conf_bars(items, shown, head_prefix, path):
 
 
 # --------------------------------------------------------------------------
+# C 图：逐实例损失分解
+# --------------------------------------------------------------------------
+def _draw_loss_bars(items, head_prefix, path, real=None):
+    """堆叠条形图：每根柱子 = 一个 GT 实例对 total_loss 的贡献，按三种成分着色。"""
+    tot_of = lambda d: d["loss_coord"] + d["loss_cls_pos"] + d["loss_cls_neg"]
+    its = sorted(items, key=lambda d: -tot_of(d)) if SORT_BY_LOSS else list(items)
+
+    x = np.arange(len(its))
+    coord = np.array([d["loss_coord"] for d in its])
+    cpos = np.array([d["loss_cls_pos"] for d in its])
+    cneg = np.array([d["loss_cls_neg"] for d in its])
+    tot = coord + cpos + cneg
+
+    fig_w = max(11.0, 0.34 * len(its) + 2.5)
+    fig, (ax0, ax1) = plt.subplots(
+        2, 1, figsize=(fig_w, 9.0), sharex=True,
+        gridspec_kw=dict(height_ratios=[2.3, 1.0], hspace=0.10))
+    fig.subplots_adjust(left=0.06, right=0.995, top=0.855, bottom=0.135)
+
+    specs = [(coord, _C_COORD, "坐标 L1（仅匹配点）"),
+             (cpos, _C_MATCH, "存在性 focal · 正样本（匹配点）"),
+             (cneg, _C_UNMATCH, "存在性 focal · 负样本（未匹配点）")]
+
+    bottom = np.zeros_like(tot)
+    for vals, color, label in specs:
+        ax0.bar(x, vals, bottom=bottom, width=0.82, color=color, label=label, linewidth=0)
+        bottom = bottom + vals
+    ax0.axhline(float(tot.mean()), color="#111827", ls=":", lw=1.0,
+                label=f"逐实例均值 {tot.mean():.4f}")
+    ax0.set_ylabel("对 total_loss 的贡献", fontsize=9)
+    ax0.grid(axis="y", alpha=0.25, lw=0.5)
+    ax0.set_axisbelow(True)
+    for side in ("top", "right"):
+        ax0.spines[side].set_visible(False)
+    ax0.legend(fontsize=8.5, ncol=4, loc="upper right", framealpha=0.9)
+
+    # 下面板：同序的成分占比，小损失实例的构成也看得清
+    share = np.maximum(tot, 1e-12)
+    bottom = np.zeros_like(tot)
+    for vals, color, _ in specs:
+        v = vals / share * 100.0
+        ax1.bar(x, v, bottom=bottom, width=0.82, color=color, linewidth=0)
+        bottom = bottom + v
+    ax1.set_ylim(0, 100)
+    ax1.set_yticks([0, 25, 50, 75, 100])
+    ax1.set_ylabel("成分占比 %", fontsize=9)
+    ax1.grid(axis="y", alpha=0.25, lw=0.5)
+    ax1.set_axisbelow(True)
+    for side in ("top", "right"):
+        ax1.spines[side].set_visible(False)
+
+    ax1.set_xlim(-0.7, len(its) - 0.3)
+    ax1.set_xticks(x)
+    ax1.set_xticklabels([f"g{d['g']}" for d in its], rotation=90, fontsize=6.5)
+    # 有小穗点的实例（wheat_2）用深色标签，无点的用浅灰，便于区分两类
+    for tick, d in zip(ax1.get_xticklabels(), its):
+        tick.set_color("#111827" if d["Ni"] else "#9ca3af")
+    ax1.set_xlabel("GT 实例（深色标签 = 有小穗点；浅灰 = 无小穗点）", fontsize=8.5)
+
+    with_pts = [d for d in items if d["Ni"]]
+    head = head_prefix + (
+        f"\n本图合计={tot.sum():.4f}"
+        f"   坐标={coord.sum():.4f} ({100 * coord.sum() / max(tot.sum(), 1e-12):.1f}%)"
+        f"   focal正={cpos.sum():.4f} ({100 * cpos.sum() / max(tot.sum(), 1e-12):.1f}%)"
+        f"   focal负={cneg.sum():.4f} ({100 * cneg.sum() / max(tot.sum(), 1e-12):.1f}%)")
+    if with_pts:
+        head += (f"\n有点实例贡献 {sum(tot_of(d) for d in with_pts):.4f}"
+                 f" / 无点实例 {sum(tot_of(d) for d in items if not d['Ni']):.4f}"
+                 f"   （无点实例只有 focal 负样本一项）")
+    if real is not None:
+        rc, rl, nb = real
+        head += (f"\n[交叉校验] criterion.loss_points 实际值 x 权重: "
+                 f"坐标={rc:.4f}  存在性={rl:.4f}  合计={rc + rl:.4f}")
+        if nb > 1:
+            head += f"  （batch 有 {nb} 张图，实际值是整个 batch 的，本图只画了其中一张）"
+    fig.suptitle(head, fontsize=9.5, y=0.985, va="top", linespacing=1.6)
+
+    fig.savefig(path, dpi=120)
+    plt.close(fig)
+
+
+# --------------------------------------------------------------------------
 def visualize_point_match(criterion, outputs, targets, indices, batched_inputs=None, *, tag=""):
     """画 batch 前 NUM_IMAGES 张图的逐实例点匹配，返回 (写出的路径列表, 处理的图片数)。"""
     if "pred_point_coords" not in outputs or "pred_point_logits" not in outputs:
         raise ValueError("outputs 里没有 pred_point_coords / pred_point_logits")
 
     out_dir, conf_dir = _resolve(OUT_DIR), _resolve(CONF_OUT_DIR)
+    loss_dir = _resolve(LOSS_OUT_DIR)
     if DRAW_POINT_PANELS:
         out_dir.mkdir(parents=True, exist_ok=True)
     if DRAW_CONF_BARS:
         conf_dir.mkdir(parents=True, exist_ok=True)
+    if DRAW_LOSS_BARS:
+        loss_dir.mkdir(parents=True, exist_ok=True)
 
     pred_coords = outputs["pred_point_coords"].detach().float()     # [B, Q, P, 2] 框相对
     pred_pt_logits = outputs["pred_point_logits"].detach().float()  # [B, Q, P, 1]
     P = pred_coords.shape[2]
+
+    # loss_points 的归一化分母 num_pos：整个 batch 里所有外层匹配实例的 GT 小穗点总数。
+    # 逐实例损失要除以它才能和真实 loss 数值对得上，所以必须跨图统计。
+    denom = max(sum(int(targets[bb]["points"][g].shape[0])
+                    for bb in range(len(indices))
+                    for g in indices[bb][1].tolist()), 1)
+    real = None
+    if DRAW_LOSS_BARS:
+        d = criterion.loss_points(outputs, targets, indices, 1)
+        real = (float(d["loss_point_coord"]) * criterion.weight_dict.get("loss_point_coord", 1.0),
+                float(d["loss_point_cls"]) * criterion.weight_dict.get("loss_point_cls", 1.0),
+                len(indices))
 
     written, n_imgs = [], 0
     for b in range(min(NUM_IMAGES, pred_coords.shape[0])):
@@ -397,7 +528,7 @@ def visualize_point_match(criterion, outputs, targets, indices, batched_inputs=N
         H, W = img.shape[:2]
 
         items, n_clamped = _collect_items(criterion, pred_coords, pred_pt_logits,
-                                          targets, indices, b, W, H)
+                                          targets, indices, b, W, H, denom)
         if not items:
             continue
         shown = items[:MAX_INSTANCES]
@@ -413,6 +544,12 @@ def visualize_point_match(criterion, outputs, targets, indices, batched_inputs=N
         if DRAW_CONF_BARS:
             path = conf_dir / f"{tag}_b{b}_{stem}_conf.png"
             _draw_conf_bars(items, shown, head_prefix, path)
+            written.append(path)
+        if DRAW_LOSS_BARS:
+            # C 图是一张总览，不受 MAX_INSTANCES 限制，画全部实例
+            path = loss_dir / f"{tag}_b{b}_{stem}_loss.png"
+            _draw_loss_bars(items, f"{tag}  {stem}   GT={len(items)}   P={P}   "
+                                   f"num_pos(batch)={denom}", path, real)
             written.append(path)
         n_imgs += 1
 
