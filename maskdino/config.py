@@ -82,6 +82,10 @@ def add_maskdino_config(cfg):
     # 内层匈牙利匹配的代价权重
     cfg.MODEL.MaskDINO.COST_POINT_COORD_WEIGHT = 5.0
     cfg.MODEL.MaskDINO.COST_POINT_CLASS_WEIGHT = 2.0
+    # True = 把 Ni 个 GT 小穗按几何规范序（沿主轴、自上而下）排序后用恒等分配
+    # （slot k 监督第 k 个），替代内层匈牙利匹配。存在性目标退化为单调前缀
+    # "slot k 存在 <=> k < Ni"。为 True 时 COST_POINT_* 不再生效。
+    cfg.MODEL.MaskDINO.POINT_CANONICAL_ORDER = False
     # 两阶段迁移：Stage2 冻结除小穗点头（point_coord_embed / point_class_embed）以外的全部参数，
     # 只训练点头。冻结的 trunk 在训练时也强制保持 eval（固定 BN/dropout），与推理一致。
     cfg.MODEL.MaskDINO.FREEZE_EXCEPT_POINT_HEAD = False

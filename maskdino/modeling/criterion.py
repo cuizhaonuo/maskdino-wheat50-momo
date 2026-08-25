@@ -144,7 +144,8 @@ class SetCriterion(nn.Module):
 
     def __init__(self, num_classes, matcher, weight_dict, eos_coef, losses,
                  num_points, oversample_ratio, importance_sample_ratio,dn="no",dn_losses=[], panoptic_on=False, semantic_ce_loss=False,
-                 num_spikelet_points=50, point_cost_coord=5.0, point_cost_class=2.0):
+                 num_spikelet_points=50, point_cost_coord=5.0, point_cost_class=2.0,
+                 point_canonical_order=False):
         """Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
@@ -178,6 +179,8 @@ class SetCriterion(nn.Module):
         self.num_spikelet_points = num_spikelet_points   # 每实例预测点上限 P
         self.point_cost_coord = point_cost_coord         # 内层匹配坐标代价权重
         self.point_cost_class = point_cost_class         # 内层匹配存在性代价权重
+        # True 时用几何规范序 + 恒等分配替代内层匈牙利匹配
+        self.point_canonical_order = point_canonical_order
 
     def loss_labels_ce(self, outputs, targets, indices, num_masks):
         """Classification loss (NLL)
@@ -318,8 +321,42 @@ class SetCriterion(nn.Module):
         del target_masks
         return losses
 
+    @staticmethod
+    def _canonical_order(gt_rel, wh=None):
+        """沿主轴投影排序，方向固定为图像"自上而下"(y+)，返回 [Ni] 排列下标。
+
+        wh: [2] 框的 (w, h)（图像归一化）。给出时先乘回去还原纵横比——框相对坐标把
+            长宽比归一化掉了（细长穗被拉成方形），定向判据必须在真实几何空间做。
+            训练输入是 FixedSizeCrop(1024,1024)，W==H，所以乘回 (bw,bh) 恰好还原到
+            各向同性空间；若将来改用非正方形输入，这里会差一个 W/H 的各向异性因子。
+
+        定向只用 v[1]>0、仅在恰好水平时用 x 兜底。不能用"比较 |v[0]| 与 |v[1]| 再定号"：
+        那个规则在水平翻转增广下会把所有偏水平的实例整体反序（x→-x 时 v=(a,-b) 变成
+        (a,b)，投影整体变号），等于把想要消除的方向不一致又以随机形式引回来。
+        纯 v[1]>0 规则对水平翻转是等变的。
+        """
+        Ni = gt_rel.shape[0]
+        if Ni <= 1:
+            return torch.arange(Ni, dtype=torch.int64, device=gt_rel.device)
+        pts = gt_rel.float()
+        if wh is not None:
+            pts = pts * wh.to(pts).view(1, 2)
+        c = pts - pts.mean(dim=0, keepdim=True)
+        sxx = (c[:, 0] * c[:, 0]).mean()
+        syy = (c[:, 1] * c[:, 1]).mean()
+        sxy = (c[:, 0] * c[:, 1]).mean()
+        # 2x2 对称阵主特征向量的闭式解。比 SVD 便宜，且点全重合时 atan2(0,0)=0
+        # 直接给出确定的 (1,0)，不会抛异常或出 NaN。
+        theta = 0.5 * torch.atan2(2.0 * sxy, sxx - syy)
+        v = torch.stack([torch.cos(theta), torch.sin(theta)])
+        if v[1].abs() > 1e-6:
+            v = v * torch.sign(v[1])
+        else:
+            v = v * torch.sign(v[0] + 1e-12)
+        return torch.argsort(c @ v, stable=True)
+
     @torch.no_grad()
-    def _inner_point_match(self, pred_rel, pred_logit, gt_rel):
+    def _inner_point_match(self, pred_rel, pred_logit, gt_rel, wh=None):
         """逐实例内层匈牙利匹配：把 P 个预测点匹配到 Ni 个 GT 小穗。
         Args:
             pred_rel:   [P, 2]  预测点（框相对归一化坐标）
@@ -332,6 +369,12 @@ class SetCriterion(nn.Module):
         if Ni == 0:
             empty = torch.zeros(0, dtype=torch.int64, device=pred_rel.device)
             return empty, empty
+        if self.point_canonical_order:
+            # 恒等分配：slot k 监督规范序下的第 k 个 GT 点。Ni > P 时只监督前 M 个。
+            M = min(pred_rel.shape[0], Ni)
+            order = self._canonical_order(gt_rel, wh)
+            row = torch.arange(M, dtype=torch.int64, device=gt_rel.device)
+            return row, order[:M]
         alpha, gamma = self.focal_alpha, 2.0
         # AMP 下统一用 float32 计算代价，避免 half 精度的 cdist / log 问题
         pred_rel = pred_rel.float()
@@ -386,7 +429,7 @@ class SetCriterion(nn.Module):
                 else:
                     gt_rel = gt_pts_img.new_zeros((0, 2))
 
-                row_ind, col_ind = self._inner_point_match(pred_rel, pred_lg, gt_rel)
+                row_ind, col_ind = self._inner_point_match(pred_rel, pred_lg, gt_rel, wh)
 
                 # 存在性目标：匹配上的预测点为 1，其余为 0
                 tgt_exist = torch.zeros((self.num_spikelet_points, 1), device=device, dtype=pred_lg.dtype)
