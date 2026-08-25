@@ -29,9 +29,11 @@ try:
     # 不要注释掉这两行 import —— 那样两个钩子会一起失效，且不易察觉。
     from myscripts.backup.vis_process.vis_match_debug import maybe_visualize_matching
     from myscripts.backup.vis_process.vis_point_match_debug import maybe_visualize_point_match
+    from myscripts.backup.vis_process.vis_slot_specialization import maybe_record_slot_stats
 except Exception:  # 仓库根不在 sys.path 等情况下静默降级，不影响训练
     maybe_visualize_matching = None
     maybe_visualize_point_match = None
+    maybe_record_slot_stats = None
 
 
 def sigmoid_focal_loss(inputs, targets, num_boxes, alpha: float = 0.25, gamma: float = 2):
@@ -487,6 +489,9 @@ class SetCriterion(nn.Module):
         # 逐实例小穗点的内层匹配可视化（复用 self._inner_point_match，与 loss 同一份配对）
         if maybe_visualize_point_match is not None:
             maybe_visualize_point_match(self, outputs, targets, indices, batched_inputs)
+        # 诊断实验：跨迭代累计 slot 匹配频率与标签抖动
+        if maybe_record_slot_stats is not None:
+            maybe_record_slot_stats(self, outputs, targets, indices, batched_inputs)
 
         # Compute all the requested losses
         losses = {}
