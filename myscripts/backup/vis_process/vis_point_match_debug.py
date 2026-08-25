@@ -1,12 +1,20 @@
 """逐实例小穗点（内层匹配）可视化：每个 GT 实例一个小图。
 
-配合 `SetCriterion.loss_points` 使用。每个 GT 实例画成一个 panel：
+配合 `SetCriterion.loss_points` 使用，一次收集数据、出两张图：
 
-  * 底图     GT 框往外扩 BOX_MARGIN 后的原图裁剪 + 该实例的 GT mask 轮廓
-  * 预测点   外层匹配到该实例的那个 query 的全部 P 个点，颜色深浅 = sigmoid(存在性 logit)
-  * GT 点    只有 wheat_2 有小穗点标注（wheat 的 Ni=0），画成白色方块
-  * 匹配对   内层匈牙利匹配上的预测点加绿色描边，并连线到它配到的 GT 点；
-             这条线的长度就是 loss_point_coord 在惩罚的 L1 残差
+A. 空间图（DRAW_POINT_PANELS，落在 OUT_DIR）
+   每个 GT 实例一个 panel：
+   * 底图     GT 框往外扩 BOX_MARGIN 后的原图裁剪 + 该实例的 GT mask 轮廓
+   * 预测点   外层匹配到该实例的那个 query 的全部 P 个点，颜色深浅 = sigmoid(存在性 logit)
+   * GT 点    只有 wheat_2 有小穗点标注（wheat 的 Ni=0），画成白色方块
+   * 匹配对   内层匈牙利匹配上的预测点加绿色描边，并连线到它配到的 GT 点；
+              这条线的长度就是 loss_point_coord 在惩罚的 L1 残差
+
+B. 置信度分布图（DRAW_CONF_BARS，落在 CONF_OUT_DIR）
+   每个 GT 实例一个条形图，一根柱子 = 一个预测点的存在性置信度，匹配上的柱子标绿。
+   SORT_BY_CONF 时按置信度降序排，于是可以直接读出关键问题：
+   **存在性头认为最可能存在的那 Ni 个点，是不是就是内层匹配挑中的那 Ni 个点。**
+   两者一致时绿柱全部挤在左端；散开则说明存在性头和坐标头各说各话。
 
 坐标口径与 loss_points 完全一致：预测点是"GT 框相对 [0,1]"，用 GT 框换算回原图像素；
 GT 点是图像归一化，直接乘 (W, H)。内层匹配不重新实现，直接调用
@@ -28,19 +36,25 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
 
 from myscripts.backup.vis_process.vis_match_debug import _CJK_FONT, _contour, _to_hwc_uint8  # noqa: F401
 
 # ============================ debug 开关 ============================
 ENABLED = True            # False 则 maybe_visualize_point_match 立即返回
-OUT_DIR = "output_v2/vis_point_match"   # 相对路径按仓库根解析，与 cwd 无关
+DRAW_POINT_PANELS = True  # A 图：GT 裁剪 + 预测点 / GT 点 / 匹配连线
+DRAW_CONF_BARS = True     # B 图：每个实例一个置信度条形图
+OUT_DIR = "output_v2/vis_point_match"        # A 图输出目录，相对路径按仓库根解析
+CONF_OUT_DIR = "output_v2/vis_point_conf"    # B 图输出目录
 EVERY = 1                 # 每 N 次 criterion 调用画一次
-MAX_DUMP = 20             # 本进程最多画多少张
+MAX_DUMP = 20             # 本进程最多画多少张图（按图片数计，不是文件数）
 NUM_IMAGES = 1            # 每个 batch 画前几张图
 MAX_INSTANCES = 24        # 每张图最多画多少个 GT panel（有点的排在前面）
 ONLY_WITH_POINTS = False  # True 则只画有 GT 小穗点的实例（即只画 wheat_2）
-BOX_MARGIN = 0.18         # GT 框往外扩多少（占框宽高的比例）
+BOX_MARGIN = 0.18         # A 图里 GT 框往外扩多少（占框宽高的比例）
 NCOLS = 6                 # panel 网格列数
+SORT_BY_CONF = True       # B 图柱子按置信度降序排（False 则按预测点槽位 0..P-1）
+INFER_THRESHOLD = 0.35    # B 图上的参考线，取 MaskDINO 推理用的 point_threshold 默认值
 IMAGE_FORMAT = "RGB"      # 与 cfg.INPUT.FORMAT 一致
 CLASS_NAMES = ["wheat", "wheat_2"]
 # ===================================================================
@@ -54,12 +68,107 @@ _STATE = {"calls": 0, "dumped": 0}
 
 _CMAP = "plasma"          # 预测点置信度色标
 _C_GT_PT = "#ffffff"      # GT 小穗点
-_C_MATCH = "#22c55e"      # 匹配上的预测点描边 + 连线
+_C_MATCH = "#22c55e"      # 匹配上的预测点：描边 / 连线 / 绿柱
+_C_UNMATCH = "#94a3b8"    # 未匹配的预测点（B 图柱子）
 _C_MASK = "#f59e0b"       # GT mask 轮廓
+_C_THR = "#ef4444"        # 推理阈值参考线
 
 
-def _panel(ax, img, gt_mask, box_px, gt_pts_px, gt_rel_used, pred_px, conf,
-           row_ind, col_ind, title, W, H):
+def _resolve(d):
+    d = Path(d)
+    return d if d.is_absolute() else _REPO_ROOT / d
+
+
+def _cls_name(cls):
+    return CLASS_NAMES[cls] if cls < len(CLASS_NAMES) else f"c{cls}"
+
+
+def _grid_shape(n):
+    ncols = min(NCOLS, n)
+    return ncols, int(np.ceil(n / ncols))
+
+
+# --------------------------------------------------------------------------
+# 数据收集：两张图共用，内层匹配只做一遍
+# --------------------------------------------------------------------------
+def _collect_items(criterion, pred_coords, pred_pt_logits, targets, indices, b, W, H):
+    """整理第 b 张图每个 GT 实例的绘图数据。
+
+    返回 (items, n_clamped_total)。items 已按"有小穗点优先、点多优先"排好序。
+    """
+    src_idx, tgt_idx = indices[b]
+    boxes = targets[b]["boxes"].float()          # [Ng, 4] cxcywh 图像归一化
+    points = targets[b]["points"]                # list[Tensor[Ni, 2]] 图像归一化
+    labels = targets[b]["labels"].cpu().numpy()
+    gt_masks = targets[b]["masks"].detach().to(torch.bool).cpu().numpy()
+
+    items = []
+    n_clamped_total = 0
+    for q_i, g_j in zip(src_idx.tolist(), tgt_idx.tolist()):
+        pred_rel = pred_coords[b, q_i]                        # [P, 2]
+        pred_lg = pred_pt_logits[b, q_i]                      # [P, 1]
+        gt_pts_img = points[g_j].to(pred_rel.device).float()  # [Ni, 2]
+        Ni = int(gt_pts_img.shape[0])
+        if ONLY_WITH_POINTS and Ni == 0:
+            continue
+
+        cx, cy, bw, bh = boxes[g_j].to(pred_rel.device)
+        x0, y0 = cx - bw / 2, cy - bh / 2
+        wh = torch.stack([bw, bh]).clamp(min=1e-6)
+        if Ni > 0:
+            gt_rel_raw = (gt_pts_img - torch.stack([x0, y0])) / wh
+            gt_rel = gt_rel_raw.clamp(0.0, 1.0)               # loss 用的就是 clamp 后的
+            n_clamped = int((gt_rel_raw != gt_rel).any(dim=1).sum())
+        else:
+            gt_rel = gt_pts_img.new_zeros((0, 2))
+            n_clamped = 0
+        n_clamped_total += n_clamped
+
+        row_ind, col_ind = criterion._inner_point_match(pred_rel, pred_lg, gt_rel)
+
+        # 框相对 -> 原图像素
+        bx0, by0 = float(x0) * W, float(y0) * H
+        bpw, bph = float(bw) * W, float(bh) * H
+        pred_np = pred_rel.cpu().numpy()
+        gt_np = gt_rel.cpu().numpy()
+        pred_px = pred_np * np.array([bpw, bph]) + np.array([bx0, by0])
+        # GT 点画在 loss 实际使用的（clamp 后）位置，与连线口径一致
+        gt_used_px = (gt_np * np.array([bpw, bph]) + np.array([bx0, by0])
+                      if Ni else np.zeros((0, 2)))
+        conf = pred_lg.sigmoid().squeeze(-1).cpu().numpy()
+        r = row_ind.cpu().numpy()
+        c = col_ind.cpu().numpy()
+
+        if r.size:
+            l1 = float(np.abs(pred_np[r] - gt_np[c]).sum(1).mean())
+            dist_px = float(np.linalg.norm(pred_px[r] - gt_used_px[c], axis=1).mean())
+            conf_m = float(np.median(conf[r]))
+            # 存在性头排前 Ni 的点里，有几个正是内层匹配挑中的
+            hit = int(np.intersect1d(np.argsort(-conf)[:Ni], r).size)
+        else:
+            l1 = dist_px = conf_m = float("nan")
+            hit = 0
+        unmatched = np.setdiff1d(np.arange(conf.size), r)
+        conf_u = float(np.median(conf[unmatched])) if unmatched.size else float("nan")
+
+        items.append(dict(
+            g=g_j, q=q_i, Ni=Ni, cls=int(labels[g_j]), n_clamped=n_clamped,
+            box_px=(bx0, by0, bx0 + bpw, by0 + bph),
+            mask=gt_masks[g_j], pred_px=pred_px, conf=conf,
+            gt_used_px=gt_used_px, row=r, col=c,
+            l1=l1, dist_px=dist_px, conf_m=conf_m, conf_u=conf_u, hit=hit,
+            n_over=int((conf > INFER_THRESHOLD).sum()),
+        ))
+
+    # 有点的排前面，点多的优先
+    items.sort(key=lambda d: (0 if d["Ni"] else 1, -d["Ni"]))
+    return items, n_clamped_total
+
+
+# --------------------------------------------------------------------------
+# A 图：空间分布
+# --------------------------------------------------------------------------
+def _panel(ax, img, gt_mask, box_px, gt_pts_px, pred_px, conf, row_ind, col_ind, title, W, H):
     """画一个 GT 实例的小图。所有坐标都是原图像素。"""
     bx0, by0, bx1, by1 = box_px
     mx = BOX_MARGIN * max(bx1 - bx0, 1.0)
@@ -77,10 +186,8 @@ def _panel(ax, img, gt_mask, box_px, gt_pts_px, gt_rel_used, pred_px, conf,
 
     # GT mask 轮廓（只取裁剪窗口那一块，避免整图 contour）
     if gt_mask is not None:
-        sub = gt_mask[cy0:cy1, cx0:cx1]
-        _contour(ax, sub, (cx0, cx1, cy1, cy0), _C_MASK, lw=1.0)
+        _contour(ax, gt_mask[cy0:cy1, cx0:cx1], (cx0, cx1, cy1, cy0), _C_MASK, lw=1.0)
 
-    # GT 框
     ax.plot([bx0, bx1, bx1, bx0, bx0], [by0, by0, by1, by1, by0],
             color=_C_MASK, lw=0.7, ls="--", alpha=0.8)
 
@@ -88,7 +195,6 @@ def _panel(ax, img, gt_mask, box_px, gt_pts_px, gt_rel_used, pred_px, conf,
     ax.scatter(pred_px[:, 0], pred_px[:, 1], c=conf, cmap=_CMAP, vmin=0.0, vmax=1.0,
                s=26, linewidths=0.4, edgecolors="#00000066", zorder=3)
 
-    # GT 小穗点
     if gt_pts_px.shape[0]:
         ax.scatter(gt_pts_px[:, 0], gt_pts_px[:, 1], marker="s", s=22,
                    facecolors="none", edgecolors=_C_GT_PT, linewidths=1.1, zorder=4)
@@ -97,7 +203,7 @@ def _panel(ax, img, gt_mask, box_px, gt_pts_px, gt_rel_used, pred_px, conf,
     for r, c in zip(row_ind, col_ind):
         ax.scatter(pred_px[r, 0], pred_px[r, 1], s=64, facecolors="none",
                    edgecolors=_C_MATCH, linewidths=1.1, zorder=5)
-        ax.plot([pred_px[r, 0], gt_rel_used[c, 0]], [pred_px[r, 1], gt_rel_used[c, 1]],
+        ax.plot([pred_px[r, 0], gt_pts_px[c, 0]], [pred_px[r, 1], gt_pts_px[c, 1]],
                 color=_C_MATCH, lw=0.9, alpha=0.9, zorder=4)
 
     ax.set_xlim(cx0, cx1)
@@ -107,28 +213,181 @@ def _panel(ax, img, gt_mask, box_px, gt_pts_px, gt_rel_used, pred_px, conf,
     ax.set_title(title, fontsize=6.5, linespacing=1.35)
 
 
-def visualize_point_match(criterion, outputs, targets, indices, batched_inputs=None, *,
-                          out_dir=OUT_DIR, tag=""):
-    """把 batch 前 NUM_IMAGES 张图的逐实例内层点匹配画成 PNG，返回写出的路径列表。"""
+def _draw_point_panels(img, items, shown, n_clamped_total, W, H, head_prefix, path):
+    ncols, nrows = _grid_shape(len(shown))
+    # 每个 panel 的标题有三行，行距要留够，否则会压到上一行的图上
+    fig_w = 2.5 * ncols + 1.2          # +1.2 给右侧 colorbar
+    fig_h = 3.4 * nrows + 2.0          # +2.0 给顶部 suptitle（两行）和底部图例
+    fig, axes = plt.subplots(nrows, ncols, figsize=(fig_w, fig_h), squeeze=False)
+    fig.subplots_adjust(left=0.015, right=1 - 1.05 / fig_w,
+                        top=1 - 1.45 / fig_h, bottom=0.55 / fig_h,
+                        wspace=0.10, hspace=0.55)
+
+    for ax in axes.ravel():
+        ax.axis("off")
+    for idx, it in enumerate(shown):
+        ax = axes[idx // ncols][idx % ncols]
+        ax.axis("on")
+        name = _cls_name(it["cls"])
+        if it["Ni"]:
+            t = (f"g{it['g']} q{it['q']} {name}  Ni={it['Ni']}\n"
+                 f"L1={it['l1']:.3f}  d={it['dist_px']:.1f}px\n"
+                 f"conf m={it['conf_m']:.2f} / u={it['conf_u']:.2f}")
+            if it["n_clamped"]:
+                t += f"  clamp={it['n_clamped']}"
+        else:
+            t = (f"g{it['g']} q{it['q']} {name}  Ni=0\n"
+                 f"(无小穗点，P 点全监督为不存在)\n"
+                 f"conf max={it['conf'].max():.2f} med={np.median(it['conf']):.2f}")
+        _panel(ax, img, it["mask"], it["box_px"], it["gt_used_px"],
+               it["pred_px"], it["conf"], it["row"], it["col"], t, W, H)
+
+    with_pts = [d for d in items if d["Ni"]]
+    head = head_prefix
+    if with_pts:
+        head += (f"\n匹配点平均 L1(框相对)={np.nanmean([d['l1'] for d in with_pts]):.3f}"
+                 f"   平均距离={np.nanmean([d['dist_px'] for d in with_pts]):.1f}px"
+                 f"   匹配点 conf 中位数={np.nanmedian([d['conf_m'] for d in with_pts]):.2f}"
+                 f"   未匹配点 conf 中位数={np.nanmedian([d['conf_u'] for d in with_pts]):.2f}")
+    if n_clamped_total:
+        head += f"   [GT 点被 clamp 到框内: {n_clamped_total}]"
+    fig.suptitle(head, fontsize=9.5, y=1 - 0.18 / fig_h, va="top", linespacing=1.6)
+
+    # colorbar 用独立 axes，不从 panel 里抢空间（否则会挤在网格中间）
+    sm = plt.cm.ScalarMappable(cmap=_CMAP, norm=plt.Normalize(0.0, 1.0))
+    cbar = fig.colorbar(sm, cax=fig.add_axes([1 - 0.75 / fig_w, 0.28, 0.10 / fig_w, 0.44]))
+    cbar.set_label("predicted point existence  sigmoid(logit)", fontsize=8)
+    cbar.ax.tick_params(labelsize=7)
+    fig.legend(
+        handles=[
+            Line2D([], [], marker="o", ls="", mfc="#bf5b17", mec="#00000066",
+                   label="predicted point (color = confidence)"),
+            Line2D([], [], marker="s", ls="", mfc="none", mec=_C_GT_PT,
+                   label="GT spikelet point"),
+            Line2D([], [], marker="o", ls="", ms=9, mfc="none", mec=_C_MATCH,
+                   label="inner-matched prediction (+ link = L1 residual)"),
+            Line2D([], [], color=_C_MASK, lw=1.2, label="GT mask / box"),
+        ],
+        loc="lower center", ncol=4, fontsize=8.5, frameon=False, bbox_to_anchor=(0.5, 0.004),
+    )
+    fig.savefig(path, dpi=120)
+    plt.close(fig)
+
+
+# --------------------------------------------------------------------------
+# B 图：置信度分布
+# --------------------------------------------------------------------------
+def _bar_panel(ax, it):
+    """一个 GT 实例的置信度条形图：一根柱子 = 一个预测点，匹配上的标绿。"""
+    conf = it["conf"]
+    matched = np.zeros(conf.size, bool)
+    matched[it["row"]] = True
+
+    if SORT_BY_CONF:
+        order = np.argsort(-conf)
+        xlabel = "point rank by conf"
+    else:
+        order = np.arange(conf.size)
+        xlabel = "point slot"
+
+    x = np.arange(conf.size)
+    ax.bar(x, conf[order], width=1.0, linewidth=0,
+           color=np.where(matched[order], _C_MATCH, _C_UNMATCH))
+
+    ax.axhline(INFER_THRESHOLD, color=_C_THR, ls="--", lw=0.8)
+    if SORT_BY_CONF and it["Ni"]:
+        # 排序后这条竖线左边就是"存在性头最看好的 Ni 个点"
+        ax.axvline(it["Ni"] - 0.5, color="#111827", ls=":", lw=1.1)
+
+    ax.set_xlim(-0.5, conf.size - 0.5)
+    ax.set_ylim(0, 1.0)
+    ax.set_yticks([0, 0.25, 0.5, 0.75, 1.0])
+    ax.tick_params(labelsize=5.5, length=2, pad=1)
+    ax.set_xlabel(xlabel, fontsize=5.5, labelpad=1)
+    ax.grid(axis="y", alpha=0.22, lw=0.5)
+    ax.set_axisbelow(True)
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+
+    name = _cls_name(it["cls"])
+    if it["Ni"]:
+        t = (f"g{it['g']} q{it['q']} {name}  Ni={it['Ni']}\n"
+             f"top-Ni 命中 {it['hit']}/{it['Ni']}   超阈值 {it['n_over']}\n"
+             f"匹配 conf {conf[it['row']].min():.2f}~{conf[it['row']].max():.2f}"
+             f"   未匹配 max={conf[~matched].max():.2f}")
+    else:
+        t = (f"g{it['g']} q{it['q']} {name}  Ni=0\n"
+             f"(全部监督为不存在)   超阈值 {it['n_over']}\n"
+             f"conf max={conf.max():.2f}   med={np.median(conf):.2f}")
+    ax.set_title(t, fontsize=6.5, linespacing=1.35)
+
+
+def _draw_conf_bars(items, shown, head_prefix, path):
+    ncols, nrows = _grid_shape(len(shown))
+    fig_w = 2.6 * ncols
+    fig_h = 2.2 * nrows + 1.9
+    fig, axes = plt.subplots(nrows, ncols, figsize=(fig_w, fig_h), squeeze=False)
+    fig.subplots_adjust(left=0.035, right=0.99,
+                        top=1 - 1.35 / fig_h, bottom=0.5 / fig_h,
+                        wspace=0.28, hspace=0.95)
+
+    for ax in axes.ravel():
+        ax.axis("off")
+    for idx, it in enumerate(shown):
+        ax = axes[idx // ncols][idx % ncols]
+        ax.axis("on")
+        _bar_panel(ax, it)
+
+    with_pts = [d for d in items if d["Ni"]]
+    head = head_prefix
+    if with_pts:
+        hit = sum(d["hit"] for d in with_pts)
+        n_gt = sum(d["Ni"] for d in with_pts)
+        over_p = sum(d["n_over"] for d in with_pts)
+        over_n = sum(d["n_over"] for d in items if d["Ni"] == 0)
+        head += (f"\ntop-Ni 命中率 {hit}/{n_gt} ({100.0 * hit / max(n_gt, 1):.1f}%)"
+                 f"   有点实例超阈值点数 {over_p} (GT 共 {n_gt})"
+                 f"   无点实例超阈值点数 {over_n}"
+                 f"   匹配 conf 中位数={np.nanmedian([d['conf_m'] for d in with_pts]):.2f}"
+                 f" / 未匹配={np.nanmedian([d['conf_u'] for d in with_pts]):.2f}")
+    fig.suptitle(head, fontsize=9.5, y=1 - 0.18 / fig_h, va="top", linespacing=1.6)
+
+    fig.legend(
+        handles=[
+            Patch(facecolor=_C_MATCH, label="inner-matched point (positive)"),
+            Patch(facecolor=_C_UNMATCH, label="unmatched point (supervised as absent)"),
+            Line2D([], [], color=_C_THR, ls="--", lw=1.2,
+                   label=f"inference threshold {INFER_THRESHOLD:g}"),
+            Line2D([], [], color="#111827", ls=":", lw=1.2, label="top-Ni boundary"),
+        ],
+        loc="lower center", ncol=4, fontsize=8.5, frameon=False, bbox_to_anchor=(0.5, 0.004),
+    )
+    fig.savefig(path, dpi=120)
+    plt.close(fig)
+
+
+# --------------------------------------------------------------------------
+def visualize_point_match(criterion, outputs, targets, indices, batched_inputs=None, *, tag=""):
+    """画 batch 前 NUM_IMAGES 张图的逐实例点匹配，返回 (写出的路径列表, 处理的图片数)。"""
     if "pred_point_coords" not in outputs or "pred_point_logits" not in outputs:
         raise ValueError("outputs 里没有 pred_point_coords / pred_point_logits")
 
-    out_dir = Path(out_dir)
-    if not out_dir.is_absolute():
-        out_dir = _REPO_ROOT / out_dir
-    out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir, conf_dir = _resolve(OUT_DIR), _resolve(CONF_OUT_DIR)
+    if DRAW_POINT_PANELS:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    if DRAW_CONF_BARS:
+        conf_dir.mkdir(parents=True, exist_ok=True)
 
-    pred_coords = outputs["pred_point_coords"].detach().float()   # [B, Q, P, 2] 框相对
+    pred_coords = outputs["pred_point_coords"].detach().float()     # [B, Q, P, 2] 框相对
     pred_pt_logits = outputs["pred_point_logits"].detach().float()  # [B, Q, P, 1]
+    P = pred_coords.shape[2]
 
-    written = []
+    written, n_imgs = [], 0
     for b in range(min(NUM_IMAGES, pred_coords.shape[0])):
-        src_idx, tgt_idx = indices[b]
-        if src_idx.numel() == 0:
+        if indices[b][0].numel() == 0:
             continue
 
-        gt_masks_t = targets[b]["masks"]
-        h_pad, w_pad = gt_masks_t.shape[-2:]
+        h_pad, w_pad = targets[b]["masks"].shape[-2:]
         if batched_inputs is not None and b < len(batched_inputs) and "image" in batched_inputs[b]:
             img = _to_hwc_uint8(batched_inputs[b]["image"], IMAGE_FORMAT)
             stem = Path(batched_inputs[b].get("file_name", f"img{b}")).stem
@@ -137,139 +396,27 @@ def visualize_point_match(criterion, outputs, targets, indices, batched_inputs=N
             stem = f"img{b}"
         H, W = img.shape[:2]
 
-        boxes = targets[b]["boxes"].float()          # [Ng, 4] cxcywh 图像归一化
-        points = targets[b]["points"]                # list[Tensor[Ni, 2]] 图像归一化
-        labels = targets[b]["labels"].cpu().numpy()
-        gt_masks = gt_masks_t.detach().to(torch.bool).cpu().numpy()
-
-        # 收集每个 GT 实例的绘图数据（内层匹配用 criterion 自己的实现，保证与 loss 一致）
-        items = []
-        n_clamped_total = 0
-        for q_i, g_j in zip(src_idx.tolist(), tgt_idx.tolist()):
-            pred_rel = pred_coords[b, q_i]                        # [P, 2]
-            pred_lg = pred_pt_logits[b, q_i]                      # [P, 1]
-            gt_pts_img = points[g_j].to(pred_rel.device).float()  # [Ni, 2]
-            Ni = int(gt_pts_img.shape[0])
-            if ONLY_WITH_POINTS and Ni == 0:
-                continue
-
-            cx, cy, bw, bh = boxes[g_j].to(pred_rel.device)
-            x0, y0 = cx - bw / 2, cy - bh / 2
-            wh = torch.stack([bw, bh]).clamp(min=1e-6)
-            if Ni > 0:
-                gt_rel_raw = (gt_pts_img - torch.stack([x0, y0])) / wh
-                gt_rel = gt_rel_raw.clamp(0.0, 1.0)               # loss 用的就是 clamp 后的
-                n_clamped = int((gt_rel_raw != gt_rel).any(dim=1).sum())
-            else:
-                gt_rel = gt_pts_img.new_zeros((0, 2))
-                n_clamped = 0
-            n_clamped_total += n_clamped
-
-            row_ind, col_ind = criterion._inner_point_match(pred_rel, pred_lg, gt_rel)
-
-            # 框相对 -> 原图像素
-            bx0, by0 = float(x0) * W, float(y0) * H
-            bpw, bph = float(bw) * W, float(bh) * H
-            pred_px = pred_rel.cpu().numpy() * np.array([bpw, bph]) + np.array([bx0, by0])
-            # GT 点：画在 loss 实际使用的（clamp 后）位置，与连线口径一致
-            gt_used_px = (gt_rel.cpu().numpy() * np.array([bpw, bph]) + np.array([bx0, by0])
-                          if Ni else np.zeros((0, 2)))
-            conf = pred_lg.sigmoid().squeeze(-1).cpu().numpy()
-            r = row_ind.cpu().numpy()
-            c = col_ind.cpu().numpy()
-
-            if r.size:
-                l1 = float(np.abs(pred_rel.cpu().numpy()[r] - gt_rel.cpu().numpy()[c]).sum(1).mean())
-                dist_px = float(np.linalg.norm(pred_px[r] - gt_used_px[c], axis=1).mean())
-                conf_m = float(np.median(conf[r]))
-            else:
-                l1 = dist_px = float("nan")
-                conf_m = float("nan")
-            conf_un = conf[np.setdiff1d(np.arange(conf.size), r)]
-            conf_u = float(np.median(conf_un)) if conf_un.size else float("nan")
-
-            items.append(dict(
-                g=g_j, q=q_i, Ni=Ni, cls=int(labels[g_j]), n_clamped=n_clamped,
-                box_px=(bx0, by0, bx0 + bpw, by0 + bph),
-                mask=gt_masks[g_j], pred_px=pred_px, conf=conf,
-                gt_used_px=gt_used_px, row=r, col=c,
-                l1=l1, dist_px=dist_px, conf_m=conf_m, conf_u=conf_u,
-            ))
-
+        items, n_clamped = _collect_items(criterion, pred_coords, pred_pt_logits,
+                                          targets, indices, b, W, H)
         if not items:
             continue
-        # 有点的排前面，点多的优先
-        items.sort(key=lambda d: (0 if d["Ni"] else 1, -d["Ni"]))
         shown = items[:MAX_INSTANCES]
+        n_with = sum(1 for d in items if d["Ni"])
+        head_prefix = (f"{tag}  {stem}   GT={len(items)} "
+                       f"(有小穗点 {n_with} / 无 {len(items) - n_with})"
+                       f"   P={P}   显示前 {len(shown)} 个")
 
-        ncols = min(NCOLS, len(shown))
-        nrows = int(np.ceil(len(shown) / ncols))
-        # 每个 panel 的标题有三行，行距要留够，否则会压到上一行的图上
-        fig_w = 2.5 * ncols + 1.2          # +1.2 给右侧 colorbar
-        fig_h = 3.4 * nrows + 2.0          # +2.0 给顶部 suptitle（两行）和底部图例
-        fig, axes = plt.subplots(nrows, ncols, figsize=(fig_w, fig_h), squeeze=False)
-        fig.subplots_adjust(left=0.015, right=1 - 1.05 / fig_w,
-                            top=1 - 1.45 / fig_h, bottom=0.55 / fig_h,
-                            wspace=0.10, hspace=0.55)
+        if DRAW_POINT_PANELS:
+            path = out_dir / f"{tag}_b{b}_{stem}.png"
+            _draw_point_panels(img, items, shown, n_clamped, W, H, head_prefix, path)
+            written.append(path)
+        if DRAW_CONF_BARS:
+            path = conf_dir / f"{tag}_b{b}_{stem}_conf.png"
+            _draw_conf_bars(items, shown, head_prefix, path)
+            written.append(path)
+        n_imgs += 1
 
-        for ax in axes.ravel():
-            ax.axis("off")
-        for idx, it in enumerate(shown):
-            ax = axes[idx // ncols][idx % ncols]
-            ax.axis("on")
-            name = CLASS_NAMES[it["cls"]] if it["cls"] < len(CLASS_NAMES) else f"c{it['cls']}"
-            if it["Ni"]:
-                t = (f"g{it['g']} q{it['q']} {name}  Ni={it['Ni']}\n"
-                     f"L1={it['l1']:.3f}  d={it['dist_px']:.1f}px\n"
-                     f"conf m={it['conf_m']:.2f} / u={it['conf_u']:.2f}")
-                if it["n_clamped"]:
-                    t += f"  clamp={it['n_clamped']}"
-            else:
-                t = (f"g{it['g']} q{it['q']} {name}  Ni=0\n"
-                     f"(无小穗点，P 点全监督为不存在)\n"
-                     f"conf max={it['conf'].max():.2f} med={np.median(it['conf']):.2f}")
-            _panel(ax, img, it["mask"], it["box_px"], it["gt_used_px"], it["gt_used_px"],
-                   it["pred_px"], it["conf"], it["row"], it["col"], t, W, H)
-
-        with_pts = [d for d in items if d["Ni"]]
-        head = (f"{tag}  {stem}   GT={len(items)} "
-                f"(有小穗点 {len(with_pts)} / 无 {len(items) - len(with_pts)})"
-                f"   P={pred_coords.shape[2]}   显示前 {len(shown)} 个")
-        if with_pts:
-            head += (f"\n匹配点平均 L1(框相对)={np.nanmean([d['l1'] for d in with_pts]):.3f}"
-                     f"   平均距离={np.nanmean([d['dist_px'] for d in with_pts]):.1f}px"
-                     f"   匹配点 conf 中位数={np.nanmedian([d['conf_m'] for d in with_pts]):.2f}"
-                     f"   未匹配点 conf 中位数={np.nanmedian([d['conf_u'] for d in with_pts]):.2f}")
-        if n_clamped_total:
-            head += f"   [GT 点被 clamp 到框内: {n_clamped_total}]"
-        fig.suptitle(head, fontsize=9.5, y=1 - 0.18 / fig_h, va="top", linespacing=1.6)
-
-        # colorbar 用独立 axes，不从 panel 里抢空间（否则会挤在网格中间）
-        sm = plt.cm.ScalarMappable(cmap=_CMAP, norm=plt.Normalize(0.0, 1.0))
-        cax = fig.add_axes([1 - 0.75 / fig_w, 0.28, 0.10 / fig_w, 0.44])
-        cbar = fig.colorbar(sm, cax=cax)
-        cbar.set_label("predicted point existence  sigmoid(logit)", fontsize=8)
-        cbar.ax.tick_params(labelsize=7)
-        fig.legend(
-            handles=[
-                Line2D([], [], marker="o", ls="", mfc="#bf5b17", mec="#00000066",
-                       label="predicted point (color = confidence)"),
-                Line2D([], [], marker="s", ls="", mfc="none", mec=_C_GT_PT,
-                       label="GT spikelet point"),
-                Line2D([], [], marker="o", ls="", ms=9, mfc="none", mec=_C_MATCH,
-                       label="inner-matched prediction (+ link = L1 residual)"),
-                Line2D([], [], color=_C_MASK, lw=1.2, label="GT mask / box"),
-            ],
-            loc="lower center", ncol=4, fontsize=8.5, frameon=False,
-            bbox_to_anchor=(0.5, 0.004),
-        )
-
-        path = out_dir / f"{tag}_b{b}_{stem}.png"
-        fig.savefig(path, dpi=120)
-        plt.close(fig)
-        written.append(path)
-
-    return written
+    return written, n_imgs
 
 
 def maybe_visualize_point_match(criterion, outputs, targets, indices, batched_inputs=None):
@@ -283,9 +430,9 @@ def maybe_visualize_point_match(criterion, outputs, targets, indices, batched_in
         return
 
     try:
-        paths = visualize_point_match(criterion, outputs, targets, indices, batched_inputs,
-                                      tag=f"call{call:06d}")
-        _STATE["dumped"] += len(paths)
+        paths, n_imgs = visualize_point_match(criterion, outputs, targets, indices,
+                                              batched_inputs, tag=f"call{call:06d}")
+        _STATE["dumped"] += n_imgs
         for p in paths:
             logger.info("[vis_point_match] %s", p)
     except Exception:  # 可视化永远不该让训练挂掉

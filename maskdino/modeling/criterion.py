@@ -25,9 +25,11 @@ from ..utils.misc import is_dist_avail_and_initialized, nested_tensor_from_tenso
 from maskdino.utils import box_ops
 
 try:
-    # 正负样本匹配的 debug 可视化，开关在各自模块顶部的 ENABLED（默认 True）
-    from myscripts.backup.vis_process.vis_match_debug import maybe_visualize_matching
-    from myscripts.backup.vis_process.vis_point_match_debug import maybe_visualize_point_match
+    # # 正负样本匹配的 debug 可视化，开关在各自模块顶部的 ENABLED（默认 True）
+    # from myscripts.backup.vis_process.vis_match_debug import maybe_visualize_matching
+    # from myscripts.backup.vis_process.vis_point_match_debug import maybe_visualize_point_match
+    maybe_visualize_matching = None
+    maybe_visualize_point_match = None
 except Exception:  # 仓库根不在 sys.path 等情况下静默降级，不影响训练
     maybe_visualize_matching = None
     maybe_visualize_point_match = None
