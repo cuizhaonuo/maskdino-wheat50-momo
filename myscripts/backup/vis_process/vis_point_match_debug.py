@@ -49,7 +49,7 @@ from matplotlib.patches import Patch
 from myscripts.backup.vis_process.vis_match_debug import _CJK_FONT, _contour, _to_hwc_uint8  # noqa: F401
 
 # ============================ debug 开关 ============================
-ENABLED = True            # False 则 maybe_visualize_point_match 立即返回
+ENABLED = False            # False 则 maybe_visualize_point_match 立即返回
 DRAW_POINT_PANELS = True  # A 图：GT 裁剪 + 预测点 / GT 点 / 匹配连线
 DRAW_CONF_BARS = True     # B 图：每个实例一个置信度条形图
 DRAW_LOSS_BARS = True     # C 图：每个实例的损失分解堆叠条形图

@@ -144,7 +144,8 @@ class SetCriterion(nn.Module):
 
     def __init__(self, num_classes, matcher, weight_dict, eos_coef, losses,
                  num_points, oversample_ratio, importance_sample_ratio,dn="no",dn_losses=[], panoptic_on=False, semantic_ce_loss=False,
-                 num_spikelet_points=50, point_cost_coord=5.0, point_cost_class=2.0):
+                 num_spikelet_points=50, point_cost_coord=5.0, point_cost_class=2.0,
+                 point_focal_alpha=0.25):
         """Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
@@ -178,6 +179,8 @@ class SetCriterion(nn.Module):
         self.num_spikelet_points = num_spikelet_points   # 每实例预测点上限 P
         self.point_cost_coord = point_cost_coord         # 内层匹配坐标代价权重
         self.point_cost_class = point_cost_class         # 内层匹配存在性代价权重
+        # 点存在性专用的 focal alpha，与 loss_labels 用的 self.focal_alpha 解耦
+        self.point_focal_alpha = point_focal_alpha
 
     def loss_labels_ce(self, outputs, targets, indices, num_masks):
         """Classification loss (NLL)
@@ -332,7 +335,7 @@ class SetCriterion(nn.Module):
         if Ni == 0:
             empty = torch.zeros(0, dtype=torch.int64, device=pred_rel.device)
             return empty, empty
-        alpha, gamma = self.focal_alpha, 2.0
+        alpha, gamma = self.point_focal_alpha, 2.0
         # AMP 下统一用 float32 计算代价，避免 half 精度的 cdist / log 问题
         pred_rel = pred_rel.float()
         gt_rel = gt_rel.float()
@@ -358,7 +361,7 @@ class SetCriterion(nn.Module):
         pred_coords = outputs['pred_point_coords']   # [B, Q, P, 2]
         pred_logits = outputs['pred_point_logits']   # [B, Q, P, 1]
         device = pred_coords.device
-        alpha, gamma = self.focal_alpha, 2.0
+        alpha, gamma = self.point_focal_alpha, 2.0
 
         coord_loss = torch.zeros([], device=device)
         cls_loss = torch.zeros([], device=device)
