@@ -46,6 +46,7 @@ class MaskDINODecoder(nn.Module):
             hidden_dim: int,
             num_queries: int,
             num_points: int,
+            point_class_mlp: bool = False,
             nheads: int,
             dim_feedforward: int,
             dec_layers: int,
@@ -145,7 +146,10 @@ class MaskDINODecoder(nn.Module):
         # 每个实例 query 预测 num_points 个小穗点：坐标（框相对归一化 [0,1]）+ 存在性 logit。
         self.num_points = num_points
         self.point_coord_embed = MLP(hidden_dim, hidden_dim, num_points * 2, 3)
-        self.point_class_embed = nn.Linear(hidden_dim, num_points)
+        # POINT_CLASS_MLP=True 时与坐标头同构（3 层 MLP）。参数名前缀不变，
+        # 仍会被 train_net.py 的 _POINT_HEAD_KEYS 子串匹配到、正确解冻。
+        self.point_class_embed = (MLP(hidden_dim, hidden_dim, num_points, 3)
+                                  if point_class_mlp else nn.Linear(hidden_dim, num_points))
 
         # init decoder
         self.decoder_norm = decoder_norm = nn.LayerNorm(hidden_dim)
@@ -178,6 +182,7 @@ class MaskDINODecoder(nn.Module):
         ret["hidden_dim"] = cfg.MODEL.MaskDINO.HIDDEN_DIM
         ret["num_queries"] = cfg.MODEL.MaskDINO.NUM_OBJECT_QUERIES
         ret["num_points"] = cfg.MODEL.MaskDINO.NUM_POINTS
+        ret["point_class_mlp"] = cfg.MODEL.MaskDINO.POINT_CLASS_MLP
         # Transformer parameters:
         ret["nheads"] = cfg.MODEL.MaskDINO.NHEADS
         ret["dim_feedforward"] = cfg.MODEL.MaskDINO.DIM_FEEDFORWARD
