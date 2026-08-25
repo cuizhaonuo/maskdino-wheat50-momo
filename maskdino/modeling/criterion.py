@@ -24,6 +24,14 @@ from detectron2.projects.point_rend.point_features import (
 from ..utils.misc import is_dist_avail_and_initialized, nested_tensor_from_tensor_list
 from maskdino.utils import box_ops
 
+try:
+    # 正负样本匹配的 debug 可视化，开关在各自模块顶部的 ENABLED（默认 True）
+    from myscripts.backup.vis_process.vis_match_debug import maybe_visualize_matching
+    from myscripts.backup.vis_process.vis_point_match_debug import maybe_visualize_point_match
+except Exception:  # 仓库根不在 sys.path 等情况下静默降级，不影响训练
+    maybe_visualize_matching = None
+    maybe_visualize_point_match = None
+
 
 def sigmoid_focal_loss(inputs, targets, num_boxes, alpha: float = 0.25, gamma: float = 2):
     """
@@ -436,7 +444,7 @@ class SetCriterion(nn.Module):
         assert loss in loss_map, f"do you really want to compute {loss} loss?"
         return loss_map[loss](outputs, targets, indices, num_masks)
 
-    def forward(self, outputs, targets, mask_dict=None):
+    def forward(self, outputs, targets, mask_dict=None, batched_inputs=None):
         """This performs the loss computation.
         Parameters:
              outputs: dict of tensors, see the output specification of the model for the format
@@ -470,6 +478,14 @@ class SetCriterion(nn.Module):
         if is_dist_avail_and_initialized():
             torch.distributed.all_reduce(num_masks)
         num_masks = torch.clamp(num_masks / get_world_size(), min=1).item()
+
+        # debug 可视化：正负样本匹配。此处的 indices 才是最后一层 decoder 的匹配结果
+        # （forward 末尾 return 的 indices 已被 aux / interm 分支覆盖，不能用来画图）。
+        if maybe_visualize_matching is not None:
+            maybe_visualize_matching(outputs, targets, indices, batched_inputs)
+        # 逐实例小穗点的内层匹配可视化（复用 self._inner_point_match，与 loss 同一份配对）
+        if maybe_visualize_point_match is not None:
+            maybe_visualize_point_match(self, outputs, targets, indices, batched_inputs)
 
         # Compute all the requested losses
         losses = {}

@@ -280,7 +280,8 @@ class MaskDINO(nn.Module):
             outputs,mask_dict = self.sem_seg_head(features, targets=targets)
 
             # bipartite matching-based loss
-            losses, indices = self.criterion(outputs, targets, mask_dict)
+            # batched_inputs 只被 criterion 里的 debug 可视化钩子使用，不参与任何计算
+            losses, indices = self.criterion(outputs, targets, mask_dict, batched_inputs=batched_inputs)
 
             for k in list(losses.keys()):
                 if k in self.criterion.weight_dict:
