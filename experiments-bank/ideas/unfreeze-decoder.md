@@ -69,6 +69,23 @@ backbone 两个 arm 都保持冻结。其余一切不变（overfit10、2000 iter
 - `loss_point_coord` 的收敛值与轨迹（判断是否只是训练更久而非表达能力提升）。
 - 八档阈值扫描后的 best-vs-best，不得固定在 0.35 比较。
 
+## 【首次启动即踩坑，2026-08-26】解冻 trunk 必须同时恢复检测损失权重
+
+第一次启动直接沿用了 stage2 配置，结果 **`segm/AP` 从 73.3 掉到 0.25 / 0.00，
+`spike_recall` 归零、一个 wheat_2 都检不出来**，两个 arm 都是。
+
+原因：`wheat_stage2_pointhead.yaml` 里 `CLASS/MASK/DICE/BOX/GIOU_WEIGHT` 全是 0，
+这是 [exp-2026-08-21-pointloss-only](../experiments/exp-2026-08-21-pointloss-only.md)
+置的，**其正当性依据恰恰是「trunk 全部 requires_grad=False，这些损失对唯一可训练的
+点头梯度恒为 0」**。一旦解冻，该前提失效——decoder 变成只为点损失优化，
+**没有任何东西惩罚它破坏检测**，于是它就把检测毁了换取点损失下降。
+
+修法：解冻的 run 必须恢复 `CLASS 4.0 / MASK 5.0 / DICE 5.0 / BOX 5.0 / GIOU 2.0`。
+代价是 `total_loss` 不再等于点损失之和，读收敛曲线时要分开看。
+
+**这条要回填到 `pointloss-only` 的文档里**：那个改动是**有条件安全**的，
+条件就是 trunk 冻结；任何解冻实验都必须先撤销它。
+
 ## 注意事项
 
 - 解冻后检测损失权重仍为 0，`class_embed` / `mask_embed` / `bbox_embed` 会拿到零梯度
