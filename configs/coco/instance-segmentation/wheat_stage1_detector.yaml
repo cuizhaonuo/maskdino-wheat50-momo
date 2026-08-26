@@ -16,11 +16,59 @@ DATASETS:
 MODEL:
   # 从 ImageNet R-50 预训练开始（继承自 Wheat base 的 WEIGHTS）。
   MaskDINO:
-    # 关闭点损失与点匹配代价：此阶段只学检测/分类/mask/box。
+    # ======================= 权重全景（Stage1）=======================
+    # 下面把继承来的默认值也【显式写全】，数值与继承值逐项相同，只是把"隐式默认"
+    # 变成"显式声明"，不改变任何行为；改实验时一眼能看到全部旋钮。
+    #
+    # 三组权重、两层匹配，互相完全解耦：
+    #   1) 外层匹配代价 COST_*        matcher.py:195  C = Σ COST_i * cost_i   （query -> GT 实例）
+    #   2) 内层点匹配代价 COST_POINT_* criterion.py:344 C = Σ COST_POINT_i * cost_i（点槽 -> GT 小穗）
+    #   3) 损失权重 *_WEIGHT          maskdino.py:153 组装 weight_dict
+    # 加权只发生在一处：maskdino.py:286 `losses[k] *= weight_dict[k]`
+    #   （key 不在 weight_dict 里则直接 pop 丢弃）；
+    #   total_loss = 加权后所有项之和，即 metrics.json 里记的 loss_* 已是【加权后】的值。
+    # weight_dict 自动膨胀：7 个基础键 -> +_interm -> +_dn -> +_0.._8（DEC_LAYERS=9）
+    #   = 280 键，实际产生 127 项。没有 per-layer / per-class 接口，深监督各层等权。
+    # ================================================================
+
+    # ---- 【损失权重】反传梯度的加权（值继承自 maskdino_R50_bs16_50ep_3s_dowsample1_2048.yaml）
+    CLASS_WEIGHT: 4.0
+    MASK_WEIGHT: 5.0
+    DICE_WEIGHT: 5.0
+    BOX_WEIGHT: 5.0
+    GIOU_WEIGHT: 2.0
+    # 关闭点损失：此阶段只学检测/分类/mask/box。
+    # 注意"置 0"≠"不算"：criterion 无条件遍历 losses 列表（含 "points"，maskdino.py:180），
+    # 无点数据集下每实例 Ni=0（mapper 给 Tensor[0,2]），坐标损失恒 0、存在性损失把 50 个点
+    # 全监督为背景（原始值非 0），乘 0 后写进 metrics 是 0.0 —— 只清零梯度，不省算力。
     POINT_COORD_WEIGHT: 0.0
     POINT_CLASS_WEIGHT: 0.0
+
+    # ---- 【外层匹配代价】query -> GT 实例的匈牙利分配（不参与反传，@torch.no_grad）
+    # 这五项在整条 _BASE_ 链里从未出现过，一直吃 maskdino/config.py:48-52 的默认值，
+    # 数值恰好与上面的损失权重相同（4/5/5/5/2），极易误以为是同一个旋钮 —— 两者独立：
+    # 改损失权重不影响匹配，改代价不影响损失。matcher.py:104 还有硬保护：
+    # cls/mask/dice 三项不能同时为 0。
+    COST_CLASS_WEIGHT: 4.0
+    COST_MASK_WEIGHT: 5.0
+    COST_DICE_WEIGHT: 5.0
+    COST_BOX_WEIGHT: 5.0
+    COST_GIOU_WEIGHT: 2.0
+    # ---- 【内层点匹配代价】P 个预测点槽 -> Ni 个 GT 小穗
+    # 本阶段无点数据（Ni=0），_inner_point_match 在 criterion.py:331 直接 return，
+    # 这两项取何值都无影响；Stage2 里则【不能】置 0（见 stage2 配置的注释）。
     COST_POINT_COORD_WEIGHT: 0.0
     COST_POINT_CLASS_WEIGHT: 0.0
+
+    # ---- 【死参数】NO_OBJECT_WEIGHT 只经 eos_coef -> empty_weight 进 loss_labels_ce，
+    # 而实例分割走的是 focal 的 loss_labels（criterion.py:200），背景抑制由写死的
+    # focal_alpha=0.25 负责，所以此值在本仓库这条路径上不生效。写出来只为避免下次再查。
+    NO_OBJECT_WEIGHT: 0.1
+
+    # ---- 每实例预测点槽数 P（点头输出维度）。不是权重，但点损失的形状与归一化都依赖它。
+    # 别与 base 里的 TRAIN_NUM_POINTS=12544 混淆 —— 那是 mask 损失的点采样数。
+    NUM_POINTS: 50
+
     FREEZE_EXCEPT_POINT_HEAD: False
 
 SOLVER:
