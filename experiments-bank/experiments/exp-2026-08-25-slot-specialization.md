@@ -144,6 +144,14 @@ CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. python train_net.py --num-gpus 1 \
 已写入 `memory-bank/idea.md`，按预期收益排序：
 `focal_alpha` 独立配置并调高 → GT 小穗点规范排序 → 存在性头容量对齐 → `NUM_POINTS` 下调（原有条目，本次补充证据）。
 
+## 【2026-08-26 补充限定】本文档的探针指标同样是训练数据上测的
+
+[exp-2026-08-26-val-generalization](exp-2026-08-26-val-generalization.md) 证明：
+在 overfit10 上测得的**定位类**改善不具备泛化含义（五个改动的 mF1 优势在 val 上全部消失）。
+本文档的 F1/F2/F3 探针（跨实例 AUC、前缀一致性、坐标铺开比）**全部在训练数据上计算**，
+引用时须带同样的限定——它们说明「头在训练数据上学到了什么结构」，
+不说明「这个结构能否迁移」。
+
 ## 注意事项
 
 - **本次测量全部在 overfit10 这 10 张图上，模型也正是在这 10 张图上过拟合的。**
