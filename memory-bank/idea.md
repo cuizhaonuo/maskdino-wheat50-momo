@@ -1,6 +1,15 @@
 # 待验证的想法
 
-## Stage2 点存在性损失的正负样本失衡
+## Stage2 点存在性损失的正负样本失衡 —— ⚠️ 2026-08-26 已验证：**部分成立**
+
+> 做成可调权重 `POINT_EMPTY_CLS_WEIGHT` 扫 {0.3, 0.1, 0.0}（w=0 即本条选项 (a)）。
+> **计数真实改善**（val MAE 8.60 → 4.14）、**定位零收益**（val mF1 全在噪声地板内）。
+> **选项 (a)（w=0）不可直接采用**：无点实例超阈值槽数从 93 暴涨到 8020（86 倍），
+> 端到端暂被类别门控挡住，但等于把约束完全押在分类头上（val spike_precision 仅 0.7529）。
+> **推荐 w=0.1**。另注：本条原文说的「负样本淹没正样本」在**训练初期成立（93.9%）、
+> 收敛态不成立（9.7%）**。
+> 见 [ideas](../experiments-bank/ideas/point-empty-cls-weight.md) /
+> [实验](../experiments-bank/experiments/exp-2026-08-26-point-empty-cls-weight.md)。
 
 `maskdino/modeling/criterion.py` 的 `loss_points` 对**每个**外层匹配上的实例都计算
 P=50 个点的 focal 存在性损失。其中 `wheat` 实例（GT 小穗数 Ni=0）贡献 50 个纯负样本，
