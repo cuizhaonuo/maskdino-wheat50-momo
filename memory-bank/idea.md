@@ -32,6 +32,23 @@
 > 且两者正交、可叠加。
 > 见 [exp-2026-08-27-unfreeze-val-generalization](../experiments-bank/experiments/exp-2026-08-27-unfreeze-val-generalization.md)。
 
+> **2026-08-28 · 真实数据集（320 图）判决：解冻成立，且 Stage2「冻结 trunk」应当撤销。**
+> A/B/C 三个 arm 在 320 图上各训 8000 iter，val（81 图）八档阈值各取最优：
+> `matched_F1@8` 相对冻结基线 innercost（0.3491）为 **+55% / +59% / +66%**，
+> 计数 MAE 相对 7.6 为 **−64% / −65% / −67%**，代价只有 A/C 的 0.6~0.8 点 segm AP。
+> **arm 排序相对 overfit10 完全反转**（overfit10 A>B>C，真实数据 **B>C>A**），
+> 且 B 收敛最慢、最后 3000 迭代才反超——
+> **可行性闸门能筛掉拟合不了的方案，但不能用来给能拟合的方案排序，
+> overfit10 那批 arm 间比较的结论作废。**
+> 取舍：B 掉的是掩码精度不是实例检出（`spike_precision` 0.720 vs A 0.732），
+> 下游只要点与计数选 B，掩码是交付物的一部分选 A。
+> **方法论教训：`mF1` 的噪声地板 0.008 是在冻结组（`spike_recall` 恒定）上标定的，
+> 对解冻组不适用**（recall 摆 0.47~0.81，mF1 单次摆幅 0.042），
+> 跨 arm 比较必须用 `matched_F1@σ`。
+> 见 [exp-2026-08-27-unfreeze-real-dataset](../experiments-bank/experiments/exp-2026-08-27-unfreeze-real-dataset.md)。
+> **下一步第一优先改为：`canonical` 规范排序 @ 真实数据，以及解冻 + `canonical` 叠加**
+> ——它是唯一在计数上与解冻组打平（2.38 vs 2.48）的改动，且从未在真实数据上训过、与解冻正交。
+
 ## Stage2 点存在性损失的正负样本失衡 —— ⚠️ 2026-08-26 已验证：**部分成立**
 
 > 做成可调权重 `POINT_EMPTY_CLS_WEIGHT` 扫 {0.3, 0.1, 0.0}（w=0 即本条选项 (a)）。
