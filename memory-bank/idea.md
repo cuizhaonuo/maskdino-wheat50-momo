@@ -19,6 +19,19 @@
 > 不必再往 predictor 的头上加解冻范围。
 > 见 [exp-2026-08-27-unfreeze-all-heads](../experiments-bank/experiments/exp-2026-08-27-unfreeze-all-heads.md)。
 
+> **2026-08-27 · val 泛化检验：点头的提升是真的，但被检测器退化抵消。**
+> 三个 arm 拿到 val（81 图 / 257 穗 / 3592 GT 点）上评：
+> `matched_F1@8` 0.3429 → **0.41~0.42（+20~24%）**，这是 detection-insensitive 指标，
+> **解冻带来的点头能力提升可泛化**；但 `mF1` 只有 0.1495 → 0.154~0.162，
+> 三个 arm 有两个在噪声地板（0.008）内——因为检测器过检 wheat_2
+> （预测穗数 259 → 315~357，`spike_precision` 0.7529 → 0.55~0.58）。
+> 过检的一部分来自 overfit10 把 wheat_2 占比抬到 14.0%（val 8.1% / 真实训练集 7.7%），
+> **这部分损害在真实配置上不会发生**；另一部分是对 10 张图的普遍过拟合
+> （arm B 训练集 segm AP 99.30、val 只有 50.57）。
+> 计数一项**冻结组的 `canonical`（val MAE 2.38）仍是全场最好**，解冻组最好 3.62，
+> 且两者正交、可叠加。
+> 见 [exp-2026-08-27-unfreeze-val-generalization](../experiments-bank/experiments/exp-2026-08-27-unfreeze-val-generalization.md)。
+
 ## Stage2 点存在性损失的正负样本失衡 —— ⚠️ 2026-08-26 已验证：**部分成立**
 
 > 做成可调权重 `POINT_EMPTY_CLS_WEIGHT` 扫 {0.3, 0.1, 0.0}（w=0 即本条选项 (a)）。
