@@ -10,6 +10,15 @@
 > 另注：解冻 trunk 时**必须**先恢复五项检测损失权重，否则 decoder 会为了点损失
 > 把检测毁掉（实测 segm AP 73.3 → 0.00）。
 
+> **2026-08-27 · arm C 收窄了解冻范围的结论。**
+> 在 arm A 之上再解冻全部预测头（`mask_embed` + `class_embed`）——
+> 掩码质量一分没涨（segm AP 稳态 85.70~86.87 vs arm A 的 86.07~86.65），
+> 点任务反而变差（F1@8 0.9869 vs 0.9987，`loss_point_coord` 收敛值 0.0207 vs 0.0081）。
+> **解冻预测头没有收益且轻微有害；arm B 的 segm AP 99.30 完全来自 `pixel_decoder`。**
+> 若目标只是小穗点，**arm A（只解冻 transformer decoder，14.4M）是最小且最优的干预**，
+> 不必再往 predictor 的头上加解冻范围。
+> 见 [exp-2026-08-27-unfreeze-all-heads](../experiments-bank/experiments/exp-2026-08-27-unfreeze-all-heads.md)。
+
 ## Stage2 点存在性损失的正负样本失衡 —— ⚠️ 2026-08-26 已验证：**部分成立**
 
 > 做成可调权重 `POINT_EMPTY_CLS_WEIGHT` 扫 {0.3, 0.1, 0.0}（w=0 即本条选项 (a)）。

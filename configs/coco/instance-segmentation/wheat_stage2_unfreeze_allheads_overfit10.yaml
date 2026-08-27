@@ -1,0 +1,101 @@
+# ============================================================================
+# arm C · 解冻 transformer decoder + 全部预测头（编码器侧保持冻结）
+#
+#   冻结线精确画在 pixel_decoder 与 predictor 之间：
+#     解冻 = predictor.decoder(9 层) + decoder_norm + bbox_embed(别名, 见下)
+#            + point_coord_embed / point_class_embed + mask_embed + class_embed
+#            合计 14,610,972
+#     冻结 = backbone(23.6M) + pixel_decoder(14.1M)
+#            + enc_output / enc_output_norm / label_enc(66,816)
+#
+#   与已有两个 arm 构成 A ⊂ C ⊂ B 嵌套阶梯：
+#     arm A  UNFREEZE_KEYS=["predictor.decoder"]   14,413,082
+#     arm C  本配置                                14,610,972
+#     arm B  UNFREEZE_KEYS=["sem_seg_head"]        28,733,212
+#
+#   enc_output / enc_output_norm 是「编码器输出投影」（两阶段查询选择用），
+#   label_enc 是 DN 的标签嵌入 —— 都不算预测头，划在编码器侧。arm B 解冻了
+#   它们，相对 arm A 没有收益。
+#
+# 用法：
+#   CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. python train_net.py --num-gpus 1 \
+#     --config-file configs/coco/instance-segmentation/wheat_stage2_unfreeze_allheads_overfit10.yaml \
+#     MODEL.WEIGHTS <绝对路径>/output_v2/wheat_stage1_detector_v2_cosine/model_final.pth \
+#     OUTPUT_DIR <绝对路径>/output_v2/exp-0827-unfzC
+#   （MODEL.WEIGHTS 必须给绝对路径：配置链里写的是相对路径 output_v2/...，
+#     在 worktree 的 cwd 下解析不到。）
+# ============================================================================
+_BASE_: wheat_stage2_pointhead_overfit10.yaml
+
+MODEL:
+  MaskDINO:
+    # ---- 额外解冻的参数名子串。FREEZE_EXCEPT_POINT_HEAD 仍为 True，
+    # 点头（point_coord_embed / point_class_embed）由 _POINT_HEAD_KEYS 恒定解冻，无需列出。
+    #
+    # 【非直觉】"predictor.decoder" 会连框头一起解冻。maskdino_decoder.py:168 有
+    #     self.decoder.bbox_embed = self.bbox_embed
+    # 这个别名赋值，而 named_parameters() 默认 remove_duplicate=True，共享张量只按
+    # 最先注册的路径报一次；decoder 在 L155 注册、bbox_embed 在 L167，深度优先遍历
+    # 先走到 decoder，所以幸存的名字是 predictor.decoder.bbox_embed.*，含本子串。
+    # arm A 的日志值可以精确对账：
+    #   14,109,824(decoder) + 132,612(bbox_embed, 9 层共享一个 MLP)
+    #   + 512(decoder_norm) + 170,134(点头) = 14,413,082
+    #
+    # "predictor.class_embed" 不会误匹配点头：后者的参数名是
+    # predictor.point_class_embed.*，不含 "predictor.class_embed" 这个子串。
+    UNFREEZE_KEYS: ["predictor.decoder", "predictor.class_embed", "predictor.mask_embed"]
+
+    # ======================= 损失权重：七项全部非零 =======================
+    # 父配置 wheat_stage2_pointhead.yaml 把下面五项检测权重置 0。那个改动的正当性
+    # 依据恰恰是「trunk 全部 requires_grad=False，这些损失对唯一可训练的点头梯度
+    # 恒为 0」—— 一旦解冻，前提就失效：decoder 变成只为点损失优化，没有任何东西
+    # 惩罚它破坏检测。实测代价是 segm AP 73.3 → 0.00、spike_recall 归零
+    # （见 experiments-bank/experiments/exp-2026-08-26-unfreeze-decoder.md 的「踩到的坑」）。
+    # 所以本配置**必须**把它们恢复成 Stage1 原值。
+    #
+    #   头（模块）                      损失项              权重
+    #   ---------------------------------------------------------------
+    #   predictor.class_embed           loss_ce             4.0
+    #   predictor.mask_embed            loss_mask           5.0
+    #   predictor.mask_embed            loss_dice           5.0
+    #   predictor.decoder.bbox_embed    loss_bbox           5.0
+    #   predictor.decoder.bbox_embed    loss_giou           2.0
+    #   predictor.point_coord_embed     loss_point_coord    5.0
+    #   predictor.point_class_embed     loss_point_cls      2.0
+    #
+    # 取 Stage1 原值而非重新调配比的实测依据（arm A, iter 39, 加权后的末层各项）：
+    #   点损失   3.667 + 1.424                          = 5.09
+    #   检测损失 0.431 + 0.355 + 0.275 + 0.081 + 0.042  = 1.18
+    #   →  点 : 检测 ≈ 4.3 : 1
+    # 点任务在原值下已经主导，无须再压检测。而且两侧都是「除以各自样本数」的均值
+    # （点除 num_pos 即小穗总数，检测除 num_boxes），该比例换到真实数据集大体稳定。
+    # ====================================================================
+    CLASS_WEIGHT: 4.0
+    MASK_WEIGHT: 5.0
+    DICE_WEIGHT: 5.0
+    BOX_WEIGHT: 5.0
+    GIOU_WEIGHT: 2.0
+    POINT_COORD_WEIGHT: 5.0
+    POINT_CLASS_WEIGHT: 2.0
+
+    # ---- 【外层匹配代价】query -> GT 实例的匈牙利分配（@torch.no_grad，不参与反传）。
+    # 与上面的损失权重是完全独立的两组旋钮，数值恰好相同极易混淆。保持原值不动。
+    COST_CLASS_WEIGHT: 4.0
+    COST_MASK_WEIGHT: 5.0
+    COST_DICE_WEIGHT: 5.0
+    COST_BOX_WEIGHT: 5.0
+    COST_GIOU_WEIGHT: 2.0
+
+    # ---- 【内层点匹配代价】P 个预测点槽 -> 该穗的 Ni 个 GT 小穗。保持原值不动。
+    # 不可置 0：代价全零会让 linear_sum_assignment 退化成恒等分配，坐标头塌陷到
+    # 穗中轴线（见 exp-2026-08-20-stage2-baseline.md）。
+    COST_POINT_COORD_WEIGHT: 5.0
+    COST_POINT_CLASS_WEIGHT: 2.0
+
+    # ---- 【死参数】NO_OBJECT_WEIGHT 只经 eos_coef -> empty_weight 进 loss_labels_ce，
+    # 而实例分割走的是 focal 的 loss_labels（criterion.py:200），本路径不生效。
+    # 写出来只为避免下次再查。
+    NO_OBJECT_WEIGHT: 0.1
+
+# 注意：检测损失已恢复，total_loss 不再等于点损失之和（前十一个 run 可以那样读，本 run 不行）。
+# 读收敛曲线必须分项看 metrics.json 里的 loss_point_coord / loss_point_cls。
