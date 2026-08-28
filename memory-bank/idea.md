@@ -46,6 +46,19 @@
 > 对解冻组不适用**（recall 摆 0.47~0.81，mF1 单次摆幅 0.042），
 > 跨 arm 比较必须用 `matched_F1@σ`。
 > 见 [exp-2026-08-27-unfreeze-real-dataset](../experiments-bank/experiments/exp-2026-08-27-unfreeze-real-dataset.md)。
+> **2026-08-28 · arm D（全部解冻含 backbone，52,188,124 参数）已补跑：解冻范围存在最优值。**
+> `matched_F1@8` A 0.5428 < C 0.5534 < **B 0.5806** > D 0.5520，**趋势在 B 处拐头**；
+> segm AP 则继续单调下滑 72.69 → 72.54 → 67.85 → **65.10**。
+> **解冻 backbone 只买到掩码的进一步退化（−2.75 AP），没买到定位提升，计数持平（2.46 vs 2.48）。**
+> 过拟合判据未触发（D 峰值仍在 iter 7199，与 A/C/B 相同）——**它输给 B 不是过拟合，
+> 是学到的东西对点任务没帮助、反而持续损害掩码。**
+> 拐点位置有意义：`sem_seg_head` 是任务相关部分、backbone 是通用视觉特征，
+> **320 图足以重训前者、不足以重训后者。**
+> 限定：本次否决的是「backbone @ 1e-5 的全解冻」（`BACKBONE_MULTIPLIER=0.1`
+> 在该 run 里第一次生效，A/C/B 的 backbone 全程冻结、该旋钮一直是死参数）。
+> 见 [exp-2026-08-28-unfreeze-full-model](../experiments-bank/experiments/exp-2026-08-28-unfreeze-full-model.md)。
+> **结论：B（解冻整个 sem_seg_head、backbone 保持冻结）是当前最优配方。**
+>
 > **下一步第一优先改为：`canonical` 规范排序 @ 真实数据，以及解冻 + `canonical` 叠加**
 > ——它是唯一在计数上与解冻组打平（2.38 vs 2.48）的改动，且从未在真实数据上训过、与解冻正交。
 
