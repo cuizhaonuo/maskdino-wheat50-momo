@@ -149,6 +149,7 @@ class SpikeletPointEvaluator(DatasetEvaluator):
         dist_sum = 0.0
         dist_n = 0
         spike_count_abs_err = []        # 配对实例上的每穗点数误差
+        pair_rows = []                  # 逐 TP 穗的 (预测点数, GT点数)，供散点分析
         img_pred_tot, img_gt_tot = [], []
         n_gt_spike = n_pred_spike = n_matched_spike = 0
         rows = []
@@ -191,6 +192,7 @@ class SpikeletPointEvaluator(DatasetEvaluator):
                 n_pred_pts_m += len(pp[pi])
                 n_gt_pts_m += len(gp[gi])
                 spike_count_abs_err.append(abs(len(pp[pi]) - len(gp[gi])))
+                pair_rows.append((gt["file_name"], len(pp[pi]), len(gp[gi]), float(iou[pi, gi])))
 
             rows.append((gt["file_name"], len(pp), pred_tot, len(gp), gt_tot, len(pairs)))
 
@@ -235,5 +237,14 @@ class SpikeletPointEvaluator(DatasetEvaluator):
                                "gt_spikes", "gt_points", "matched_spikes"])
                 wcsv.writerows(sorted(rows))
             self._logger.info(f"[SpikeletPointEvaluator] 逐图明细 -> {path}")
+
+            # 逐 TP 穗明细：与 count_MAE_spike 完全同一批配对（mask IoU 匈牙利 + IoU>=阈值），
+            # count_MAE_spike == mean(|pred_points - gt_points|)。供散点/偏差分析。
+            ppath = os.path.join(self._output_dir, "spikelet_pair_counts.csv")
+            with open(ppath, "w", newline="", encoding="utf-8") as f:
+                wcsv = csv.writer(f)
+                wcsv.writerow(["file_name", "pred_points", "gt_points", "iou"])
+                wcsv.writerows(pair_rows)
+            self._logger.info(f"[SpikeletPointEvaluator] 逐 TP 穗明细 -> {ppath}")
 
         return OrderedDict([("spikelet", copy.deepcopy(res))])
