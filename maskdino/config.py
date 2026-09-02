@@ -82,6 +82,10 @@ def add_maskdino_config(cfg):
     # 内层匈牙利匹配的代价权重
     cfg.MODEL.MaskDINO.COST_POINT_COORD_WEIGHT = 5.0
     cfg.MODEL.MaskDINO.COST_POINT_CLASS_WEIGHT = 2.0
+    # Ni==0（无小穗的 wheat）实例的存在性 focal 损失权重。1.0 = 现状。
+    # 推理时 instance_inference 按 pred_classes 门控，wheat 实例本就不输出小穗点，
+    # 这部分监督只在误分类时才生效，故可降权。0.0 等价于「只对 wheat_2 算点损失」。
+    cfg.MODEL.MaskDINO.POINT_EMPTY_CLS_WEIGHT = 1.0
     # 两阶段迁移：Stage2 冻结除小穗点头（point_coord_embed / point_class_embed）以外的全部参数，
     # 只训练点头。冻结的 trunk 在训练时也强制保持 eval（固定 BN/dropout），与推理一致。
     cfg.MODEL.MaskDINO.FREEZE_EXCEPT_POINT_HEAD = False
