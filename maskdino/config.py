@@ -82,10 +82,10 @@ def add_maskdino_config(cfg):
     # 内层匈牙利匹配的代价权重
     cfg.MODEL.MaskDINO.COST_POINT_COORD_WEIGHT = 5.0
     cfg.MODEL.MaskDINO.COST_POINT_CLASS_WEIGHT = 2.0
-    # FREEZE_EXCEPT_POINT_HEAD=True 时，除点头外额外解冻的参数名子串。
-    # 空 = 只训点头（Stage2 原设计）。例：["predictor.decoder"] 解冻 transformer decoder，
-    # ["sem_seg_head"] 解冻整个分割头（decoder + pixel decoder + 各预测头），backbone 仍冻结。
-    cfg.MODEL.MaskDINO.UNFREEZE_KEYS = []
+    # 点存在性 focal 的 alpha。与 loss_labels 的 self.focal_alpha 解耦：
+    # 检测头是 300 query 配约 39 个正样本，点头是 P 个 slot 配约 14 个正样本，
+    # 正负比温和得多，0.25（来自 RetinaNet 稠密检测）在这里把正样本压得过狠。
+    cfg.MODEL.MaskDINO.POINT_FOCAL_ALPHA = 0.25
     # True = 存在性头 point_class_embed 用 3 层 MLP（与坐标头 point_coord_embed 对齐），
     # False = 保持单层 nn.Linear。点头参数 12,850 -> 144,434。
     # 【口径】08-25 在 overfit10 上三向同时改善，但 08-26 的 val 检验判定 mF1 优势是记忆
@@ -94,6 +94,10 @@ def add_maskdino_config(cfg):
     # 【注意】开关会改变参数名（point_class_embed.weight/bias <-> .layers.{0,1,2}.*），
     # 两种设置下训出的 Stage2 checkpoint 不能互相加载（会被静默跳过）。
     cfg.MODEL.MaskDINO.POINT_CLASS_MLP = False
+    # FREEZE_EXCEPT_POINT_HEAD=True 时，除点头外额外解冻的参数名子串。
+    # 空 = 只训点头（Stage2 原设计）。例：["predictor.decoder"] 解冻 transformer decoder，
+    # ["sem_seg_head"] 解冻整个分割头（decoder + pixel decoder + 各预测头），backbone 仍冻结。
+    cfg.MODEL.MaskDINO.UNFREEZE_KEYS = []
     # 两阶段迁移：Stage2 冻结除小穗点头（point_coord_embed / point_class_embed）以外的全部参数，
     # 只训练点头。冻结的 trunk 在训练时也强制保持 eval（固定 BN/dropout），与推理一致。
     cfg.MODEL.MaskDINO.FREEZE_EXCEPT_POINT_HEAD = False
