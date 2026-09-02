@@ -86,6 +86,14 @@ def add_maskdino_config(cfg):
     # 空 = 只训点头（Stage2 原设计）。例：["predictor.decoder"] 解冻 transformer decoder，
     # ["sem_seg_head"] 解冻整个分割头（decoder + pixel decoder + 各预测头），backbone 仍冻结。
     cfg.MODEL.MaskDINO.UNFREEZE_KEYS = []
+    # True = 存在性头 point_class_embed 用 3 层 MLP（与坐标头 point_coord_embed 对齐），
+    # False = 保持单层 nn.Linear。点头参数 12,850 -> 144,434。
+    # 【口径】08-25 在 overfit10 上三向同时改善，但 08-26 的 val 检验判定 mF1 优势是记忆
+    # （+0.061 -> -0.0012），仅计数存活；且该结论测于「冻结 trunk」，而 08-26~08-28
+    # 已证明那道闸门本身才是瓶颈。故此项为待重测的开关，不是已生效的配方。
+    # 【注意】开关会改变参数名（point_class_embed.weight/bias <-> .layers.{0,1,2}.*），
+    # 两种设置下训出的 Stage2 checkpoint 不能互相加载（会被静默跳过）。
+    cfg.MODEL.MaskDINO.POINT_CLASS_MLP = False
     # 两阶段迁移：Stage2 冻结除小穗点头（point_coord_embed / point_class_embed）以外的全部参数，
     # 只训练点头。冻结的 trunk 在训练时也强制保持 eval（固定 BN/dropout），与推理一致。
     cfg.MODEL.MaskDINO.FREEZE_EXCEPT_POINT_HEAD = False
