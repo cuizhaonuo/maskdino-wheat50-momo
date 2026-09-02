@@ -76,7 +76,7 @@ from data_register import wheat_data, maize_rice_data, xinxiang_data, gwhd2021_d
 _POINT_HEAD_KEYS = ("point_coord_embed", "point_class_embed")
 
 
-def freeze_all_but_point_head(model):
+def freeze_all_but_point_head(model, extra_keys=()):
     """两阶段迁移的 Stage2：冻结除小穗点头以外的全部参数，只训练点头。
 
     除 point_coord_embed / point_class_embed 外的参数 requires_grad=False，
@@ -89,9 +89,10 @@ def freeze_all_but_point_head(model):
     而"固定 BN/dropout"这个初衷本就无需处理：backbone 是 FrozenBN、pixel decoder 是 GN、
     MaskDINO.DROPOUT=0.0，没有任何对 train/eval 敏感的层。
     """
+    keys = tuple(_POINT_HEAD_KEYS) + tuple(extra_keys)
     trainable, frozen = 0, 0
     for name, p in model.named_parameters():
-        if any(k in name for k in _POINT_HEAD_KEYS):
+        if any(k in name for k in keys):
             p.requires_grad_(True)
             trainable += p.numel()
         else:
@@ -101,6 +102,7 @@ def freeze_all_but_point_head(model):
     logger = logging.getLogger("detectron2")
     logger.info(
         f"[FREEZE_EXCEPT_POINT_HEAD] 可训练参数 {trainable:,} | 冻结参数 {frozen:,}"
+        + (f" | 额外解冻 {list(extra_keys)}" if extra_keys else "")
     )
     if trainable == 0:
         raise RuntimeError(
@@ -125,7 +127,7 @@ class Trainer(DefaultTrainer):
         # Stage2：只训练小穗点头时，先冻结其余参数（必须在 build_optimizer 之前，
         # 因为优化器按 requires_grad 过滤参数）。
         if cfg.MODEL.MaskDINO.FREEZE_EXCEPT_POINT_HEAD:
-            freeze_all_but_point_head(model)
+            freeze_all_but_point_head(model, cfg.MODEL.MaskDINO.UNFREEZE_KEYS)
         optimizer = self.build_optimizer(cfg, model)
         data_loader = self.build_train_loader(cfg)
 
