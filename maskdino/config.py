@@ -164,6 +164,17 @@ def add_maskdino_config(cfg):
     cfg.INPUT.MIN_SCALE = 0.1
     cfg.INPUT.MAX_SCALE = 2.0
 
+    # ---- LSJ 增强造成的 wheat_2 标签噪声修复 ----
+    # ResizeScale(MIN~MAX)+FixedSizeCrop 在 scale>1 时会把完整的 wheat_2 切到 crop 边界，
+    # 但标签仍是 wheat_2，与标注规则「截断的穗子归 wheat」矛盾。抽样实测 100 张增强图的
+    # 200 个 wheat_2 中有 45 个（22.5%）贴边。开启后在 mapper 里把贴边实例降级为 wheat，
+    # 并清空其 gt_points（截断穗的 GT 点数对应的是完整穗，留着即系统性 GT-图像不一致；
+    # 清空后该实例 Ni=0，自然走 POINT_EMPTY_CLS_WEIGHT 的降权路径）。
+    # 只作用于训练（mapper 对 is_train=False 提前返回），不影响评估。
+    cfg.INPUT.DEMOTE_BORDER_TRUNCATED = False
+    cfg.INPUT.DEMOTE_FROM_TO = (1, 0)   # (源 contiguous id, 目标 id)；wheat cat2 为 wheat_2->wheat
+    cfg.INPUT.DEMOTE_BORDER_MARGIN = 2  # 贴边判定容差（像素）
+
     # point loss configs
     # Number of points sampled during training for a mask point head.
     cfg.MODEL.MaskDINO.TRAIN_NUM_POINTS = 112 * 112

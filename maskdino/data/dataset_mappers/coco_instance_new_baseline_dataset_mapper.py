@@ -91,6 +91,9 @@ class COCOInstanceNewBaselineDatasetMapper:
         *,
         tfm_gens,
         image_format,
+        demote_border_truncated=False,
+        demote_from_to=(1, 0),
+        demote_border_margin=2,
     ):
         """
         NOTE: this interface is experimental.
@@ -107,6 +110,10 @@ class COCOInstanceNewBaselineDatasetMapper:
 
         self.img_format = image_format
         self.is_train = is_train
+        # 贴边截断实例降级（见 config.py 的 INPUT.DEMOTE_* 说明）
+        self.demote_border_truncated = demote_border_truncated
+        self.demote_from_to = tuple(demote_from_to)
+        self.demote_border_margin = int(demote_border_margin)
     
     @classmethod
     def from_config(cls, cfg, is_train=True):
@@ -117,6 +124,9 @@ class COCOInstanceNewBaselineDatasetMapper:
             "is_train": is_train,
             "tfm_gens": tfm_gens,
             "image_format": cfg.INPUT.FORMAT,
+            "demote_border_truncated": cfg.INPUT.DEMOTE_BORDER_TRUNCATED,
+            "demote_from_to": cfg.INPUT.DEMOTE_FROM_TO,
+            "demote_border_margin": cfg.INPUT.DEMOTE_BORDER_MARGIN,
         }
         return ret
 
@@ -216,6 +226,27 @@ class COCOInstanceNewBaselineDatasetMapper:
                 gt_masks = instances.gt_masks
                 gt_masks = convert_coco_poly_to_mask(gt_masks.polygons, h, w)
                 instances.gt_masks = gt_masks
+
+                # 被 ResizeScale+FixedSizeCrop 切到 crop 边界的 wheat_2 已不完整，
+                # 按标注规则（截断的穗子归 wheat）降级类别，并清空其小穗点 ——
+                # 截断穗的 GT 点数对应的是完整穗，留着就是系统性的 GT-图像不一致。
+                # 清空后该实例 Ni=0，自然走 POINT_EMPTY_CLS_WEIGHT 的降权路径，
+                # 与推理端 instance_inference 按 pred_classes 门控的行为保持一致。
+                if self.demote_border_truncated and len(instances) > 0:
+                    src, dst = self.demote_from_to
+                    m = self.demote_border_margin
+                    mk = instances.gt_masks.bool()
+                    touches = (
+                        mk[:, :m, :].flatten(1).any(dim=1)
+                        | mk[:, -m:, :].flatten(1).any(dim=1)
+                        | mk[:, :, :m].flatten(1).any(dim=1)
+                        | mk[:, :, -m:].flatten(1).any(dim=1)
+                    )
+                    demote = touches & (instances.gt_classes == src)
+                    if bool(demote.any()):
+                        instances.gt_classes[demote] = dst
+                        for i in demote.nonzero().squeeze(1).tolist():
+                            gt_points[i] = gt_points[i].new_zeros((0, 2))
 
             # 把对齐过滤后的小穗点挂为自定义 list 字段（每实例 Tensor[Ni,2]，绝对像素坐标）。
             # wheat（无小穗）实例为 Tensor[0,2]。
