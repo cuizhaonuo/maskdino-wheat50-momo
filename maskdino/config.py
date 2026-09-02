@@ -86,6 +86,10 @@ def add_maskdino_config(cfg):
     # 检测头是 300 query 配约 39 个正样本，点头是 P 个 slot 配约 14 个正样本，
     # 正负比温和得多，0.25（来自 RetinaNet 稠密检测）在这里把正样本压得过狠。
     cfg.MODEL.MaskDINO.POINT_FOCAL_ALPHA = 0.25
+    # Ni==0（无小穗的 wheat）实例的存在性 focal 损失权重。1.0 = 现状。
+    # 推理时 instance_inference 按 pred_classes 门控，wheat 实例本就不输出小穗点，
+    # 这部分监督只在误分类时才生效，故可降权。0.0 等价于「只对 wheat_2 算点损失」。
+    cfg.MODEL.MaskDINO.POINT_EMPTY_CLS_WEIGHT = 1.0
     # True = 存在性头 point_class_embed 用 3 层 MLP（与坐标头 point_coord_embed 对齐），
     # False = 保持单层 nn.Linear。点头参数 12,850 -> 144,434。
     # 【口径】08-25 在 overfit10 上三向同时改善，但 08-26 的 val 检验判定 mF1 优势是记忆

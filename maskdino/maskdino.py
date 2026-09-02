@@ -198,6 +198,7 @@ class MaskDINO(nn.Module):
             point_cost_coord=cfg.MODEL.MaskDINO.COST_POINT_COORD_WEIGHT,
             point_cost_class=cfg.MODEL.MaskDINO.COST_POINT_CLASS_WEIGHT,
             point_focal_alpha=cfg.MODEL.MaskDINO.POINT_FOCAL_ALPHA,
+            point_empty_cls_weight=cfg.MODEL.MaskDINO.POINT_EMPTY_CLS_WEIGHT,
         )
 
         return {

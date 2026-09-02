@@ -145,7 +145,7 @@ class SetCriterion(nn.Module):
     def __init__(self, num_classes, matcher, weight_dict, eos_coef, losses,
                  num_points, oversample_ratio, importance_sample_ratio,dn="no",dn_losses=[], panoptic_on=False, semantic_ce_loss=False,
                  num_spikelet_points=50, point_cost_coord=5.0, point_cost_class=2.0,
-                 point_focal_alpha=0.25):
+                 point_focal_alpha=0.25, point_empty_cls_weight=1.0):
         """Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
@@ -181,6 +181,8 @@ class SetCriterion(nn.Module):
         self.point_cost_class = point_cost_class         # 内层匹配存在性代价权重
         # 点存在性专用的 focal alpha，与 loss_labels 用的 self.focal_alpha 解耦
         self.point_focal_alpha = point_focal_alpha
+        # Ni==0 实例的存在性损失权重（只作用于 cls_loss 的分子，不影响 denom）
+        self.point_empty_cls_weight = point_empty_cls_weight
 
     def loss_labels_ce(self, outputs, targets, indices, num_masks):
         """Classification loss (NLL)
@@ -406,7 +408,10 @@ class SetCriterion(nn.Module):
                 focal = ce * ((1 - p_t) ** gamma)
                 alpha_t = alpha * tgt_exist + (1 - alpha) * (1 - tgt_exist)
                 focal = alpha_t * focal
-                cls_loss = cls_loss + focal.sum()
+                # Ni==0 的 wheat 实例贡献 P 个纯负样本，但推理时按类别门控、
+                # 它们本就不输出点，这部分监督只在误分类时生效，故可降权。
+                w = 1.0 if Ni > 0 else self.point_empty_cls_weight
+                cls_loss = cls_loss + focal.sum() * w
 
                 num_pos += Ni
 
