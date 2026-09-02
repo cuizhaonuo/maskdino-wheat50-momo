@@ -8,29 +8,51 @@
 #   训练期评估**就是 val 评估**，自带一条泛化曲线，可直接看出过拟合拐点、
 #   挑最好的 checkpoint。这与 overfit10 那批（TRAIN == TEST）性质完全不同。
 #
-# 三个 arm 只差 UNFREEZE_KEYS 一项，值走 CLI（与 08-26/08-27 那批同样处理）：
+# 四个 arm 只差 UNFREEZE_KEYS 一项，值走 CLI（与 08-26/08-27 那批同样处理）：
 #   arm A  ["predictor.decoder"]                                      14,413,082
 #   arm C  ["predictor.decoder","predictor.class_embed","predictor.mask_embed"]
 #                                                                     14,610,972
 #   arm B  ["sem_seg_head"]                                           28,733,212
-# 本文件的默认值是 arm A（overfit10 上三者里点任务最好、干预最小的那个）。
+#   arm D  ["backbone","sem_seg_head"]                                52,188,124
 #
-# 用法：
+# 【2026-08-28 起默认值为 arm B】真实数据 320 图 / 81 图 val 上四个 arm 的判决
+# （见 experiments-bank/experiments/exp-2026-08-28-unfreeze-full-model.md）：
+#
+#   arm | matched_F1@8 | 计数 MAE | segm AP
+#   ----|--------------|----------|--------
+#    A  |    0.5428    |   2.75   |  72.69
+#    C  |    0.5534    |   2.69   |  72.54
+#    B  |    0.5806    |   2.48   |  67.85   <- 最优点
+#    D  |    0.5520    |   2.46   |  65.10
+#
+# matched_F1@8 在 B 处拐头（A < C < B > D）：解冻范围存在最优值，不是越多越好。
+# 代价是 segm AP -5.5（掩码更糙），但 spike_precision 只差 1.2 个百分点、
+# 实例照样检得出来 —— 掉的是掩码精度，不是实例检出。
+# 【若掩码本身是交付物的一部分，改用 arm A】：点指标只低 7%，掩码几乎无损。
+#
+# 用法（默认即 arm B，无需覆盖）：
 #   CUDA_VISIBLE_DEVICES=<g> PYTHONPATH=. python train_net.py --num-gpus 1 \
 #     --config-file configs/coco/instance-segmentation/wheat_stage2_unfreeze.yaml \
 #     MODEL.WEIGHTS <绝对路径>/output_v2/wheat_stage1_detector_v2_cosine/model_final.pth \
-#     OUTPUT_DIR <绝对路径>/output_v2/exp-0827-real-unfzA \
-#     MODEL.MaskDINO.UNFREEZE_KEYS "['predictor.decoder']"
+#     OUTPUT_DIR <绝对路径>/output_v2/<run 名>
+#   换 arm 时追加覆盖：MODEL.MaskDINO.UNFREEZE_KEYS "['predictor.decoder']"
 # ============================================================================
 _BASE_: wheat_stage2_pointhead.yaml
 
 MODEL:
   MaskDINO:
-    # ---- 默认 arm A。三个 arm 通过 CLI 覆盖此项，其余一切相同。
-    # 注意 "predictor.decoder" 因 maskdino_decoder.py:168 的别名赋值
+    # ---- 默认 arm B：解冻整个 sem_seg_head（pixel_decoder + predictor 的全部子模块），
+    # backbone 保持冻结。可训练参数 28,733,212 —— 训练日志会打印，对不上立即停。
+    # 四个 arm 通过 CLI 覆盖此项，其余一切相同。
+    #
+    # 拐点落在 sem_seg_head 与 backbone 之间是有实际意义的：前者是任务相关部分
+    # （编码器 + 解码器 + 各预测头），后者是通用视觉特征。320 图足以重训前者、
+    # 不足以重训后者 —— arm D 把 backbone 也解冻，只买到掩码进一步退化（segm AP 65.10）。
+    #
+    # 若覆盖成 arm A 的 ["predictor.decoder"]，注意 maskdino_decoder.py:168 的别名赋值
     #   self.decoder.bbox_embed = self.bbox_embed
-    # 连框头一并解冻（named_parameters 去重后幸存名为 predictor.decoder.bbox_embed.*）。
-    UNFREEZE_KEYS: ["predictor.decoder"]
+    # 会连框头一并解冻（named_parameters 去重后幸存名为 predictor.decoder.bbox_embed.*）。
+    UNFREEZE_KEYS: ["sem_seg_head"]
 
     # ======================= 损失权重：七项全部非零 =======================
     # 父配置 wheat_stage2_pointhead.yaml 把下面五项检测权重置 0，其正当性依据是
