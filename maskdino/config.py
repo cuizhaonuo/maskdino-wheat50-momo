@@ -121,6 +121,15 @@ def add_maskdino_config(cfg):
     cfg.MODEL.MaskDINO.TEST.SPIKELET_EVAL_SCORE_THRESH = 0.4
     # GT 穗与预测穗配对所需的最小 mask IoU
     cfg.MODEL.MaskDINO.TEST.SPIKELET_EVAL_IOU_THRESH = 0.5
+    # ---- 逐层 decoder 诊断（仅评估用，默认关，不改变任何既有行为）----
+    # EVAL_ALL_DECODER_MASKS: 推理时也为每一层算掩码。默认只有最后一层算（省算力），
+    #   中间层的 pred_masks 是 None，无法评 segm。
+    # EVAL_DECODER_OUTPUT: 用哪个预测点作为最终输出。
+    #   "final"          第 9 层 decoder（正常推理路径）
+    #   "aux0".."aux8"   aux_outputs[k]；aux0 是 tgt 初始预测，aux1..aux8 是第 1..8 层
+    #   "interm"         两阶段编码器提案
+    cfg.MODEL.MaskDINO.TEST.EVAL_ALL_DECODER_MASKS = False
+    cfg.MODEL.MaskDINO.TEST.EVAL_DECODER_OUTPUT = "final"
     # cfg.MODEL.MaskDINO.TEST.EVAL_FLAG = 1
 
     # Sometimes `backbone.size_divisibility` is set to 0 for some backbone (e.g. ResNet)

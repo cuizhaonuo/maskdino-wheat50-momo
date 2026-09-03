@@ -54,6 +54,7 @@ class MaskDINO(nn.Module):
         transform_eval: bool = False,
         semantic_ce_loss: bool = False,
         point_threshold: float = 0.35,
+        eval_decoder_output: str = "final",
     ):
         """
         Args:
@@ -110,6 +111,7 @@ class MaskDINO(nn.Module):
         self.semantic_ce_loss = semantic_ce_loss
         # 小穗点推理：存在性阈值 + 带小穗的类别（wheat_2 的连续 id=1，只有该类输出点）
         self.point_threshold = point_threshold
+        self.eval_decoder_output = eval_decoder_output
         self.spikelet_class_id = 1
 
         if not self.semantic_on:
@@ -226,6 +228,7 @@ class MaskDINO(nn.Module):
             "pano_temp": cfg.MODEL.MaskDINO.TEST.PANO_TEMPERATURE,
             "semantic_ce_loss": cfg.MODEL.MaskDINO.TEST.SEMANTIC_ON and cfg.MODEL.MaskDINO.SEMANTIC_CE_LOSS and not cfg.MODEL.MaskDINO.TEST.PANOPTIC_ON,
             "point_threshold": cfg.MODEL.MaskDINO.TEST.POINT_THRESHOLD,
+            "eval_decoder_output": cfg.MODEL.MaskDINO.TEST.EVAL_DECODER_OUTPUT,
         }
 
     @property
@@ -293,6 +296,24 @@ class MaskDINO(nn.Module):
 
             # 在推理过程中 aux_outputs.pred_masks 是 None，但是在训练的过程中是 (bs, num_queries, H/4, W/4)
             outputs, _ = self.sem_seg_head(features)
+
+            # ---- 逐层 decoder 诊断：把某一层的预测当作最终输出 ----
+            # aux_outputs 顺序为 [tgt 初始预测, 第1层, ..., 第8层]，共 9 项；
+            # outputs 本身是第 9 层；interm_outputs 是两阶段编码器提案。
+            sel = self.eval_decoder_output
+            if sel != "final":
+                if sel == "interm":
+                    picked = outputs["interm_outputs"]
+                elif sel.startswith("aux"):
+                    picked = outputs["aux_outputs"][int(sel[3:])]
+                else:
+                    raise ValueError(f"未知的 EVAL_DECODER_OUTPUT: {sel}")
+                if picked.get("pred_masks", None) is None:
+                    raise RuntimeError(
+                        f"{sel} 的 pred_masks 为 None —— 请同时设置 "
+                        "MODEL.MaskDINO.TEST.EVAL_ALL_DECODER_MASKS True")
+                outputs = picked
+
             # test the outputs of interm_outputs and aux_outputs
             # ...
             # outputs = outputs['interm_outputs']

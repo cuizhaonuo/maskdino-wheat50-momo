@@ -46,6 +46,7 @@ class MaskDINODecoder(nn.Module):
             hidden_dim: int,
             num_queries: int,
             num_points: int,
+            eval_all_decoder_masks: bool = False,
             nheads: int,
             dim_feedforward: int,
             dec_layers: int,
@@ -144,6 +145,7 @@ class MaskDINODecoder(nn.Module):
         # ===== 逐实例小穗点回归头 =====
         # 每个实例 query 预测 num_points 个小穗点：坐标（框相对归一化 [0,1]）+ 存在性 logit。
         self.num_points = num_points
+        self.eval_all_decoder_masks = eval_all_decoder_masks
         self.point_coord_embed = MLP(hidden_dim, hidden_dim, num_points * 2, 3)
         self.point_class_embed = nn.Linear(hidden_dim, num_points)
 
@@ -178,6 +180,7 @@ class MaskDINODecoder(nn.Module):
         ret["hidden_dim"] = cfg.MODEL.MaskDINO.HIDDEN_DIM
         ret["num_queries"] = cfg.MODEL.MaskDINO.NUM_OBJECT_QUERIES
         ret["num_points"] = cfg.MODEL.MaskDINO.NUM_POINTS
+        ret["eval_all_decoder_masks"] = cfg.MODEL.MaskDINO.TEST.EVAL_ALL_DECODER_MASKS
         # Transformer parameters:
         ret["nheads"] = cfg.MODEL.MaskDINO.NHEADS
         ret["dim_feedforward"] = cfg.MODEL.MaskDINO.DIM_FEEDFORWARD
@@ -484,7 +487,8 @@ class MaskDINODecoder(nn.Module):
         if self.initial_pred:
             # 暂时注释
             outputs_class, outputs_mask, outputs_point_coord, outputs_point_logit = \
-                self.forward_prediction_heads(tgt.transpose(0, 1), mask_features, self.training)
+                self.forward_prediction_heads(tgt.transpose(0, 1), mask_features,
+                                              self.training or self.eval_all_decoder_masks)
 
             # debug: 查看推理时每一层的预测结果
             # outputs_class, outputs_mask = self.forward_prediction_heads(tgt.transpose(0, 1), mask_features, pred_mask=True)
@@ -538,7 +542,8 @@ class MaskDINODecoder(nn.Module):
 
             # 暂时注释
             outputs_class, outputs_mask, outputs_point_coord, outputs_point_logit = \
-                self.forward_prediction_heads(output.transpose(0, 1), mask_features, self.training or (i == len(hs)-1))
+                self.forward_prediction_heads(output.transpose(0, 1), mask_features,
+                                              self.training or self.eval_all_decoder_masks or (i == len(hs)-1))
 
             # debug: 查看推理时每一层的预测结果
             # outputs_class, outputs_mask = self.forward_prediction_heads(output.transpose(0, 1), mask_features, pred_mask=True)
