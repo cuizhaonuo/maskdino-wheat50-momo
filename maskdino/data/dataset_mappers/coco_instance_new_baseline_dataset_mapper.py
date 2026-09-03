@@ -17,6 +17,8 @@ from detectron2.structures import BitMasks, Instances, PolygonMasks
 
 from pycocotools import mask as coco_mask
 
+from maskdino.data.copy_paste import build_copy_paste
+
 __all__ = ["COCOInstanceNewBaselineDatasetMapper"]
 
 
@@ -94,6 +96,7 @@ class COCOInstanceNewBaselineDatasetMapper:
         demote_border_truncated=False,
         demote_from_to=(1, 0),
         demote_border_margin=2,
+        copy_paste=None,
     ):
         """
         NOTE: this interface is experimental.
@@ -114,6 +117,8 @@ class COCOInstanceNewBaselineDatasetMapper:
         self.demote_border_truncated = demote_border_truncated
         self.demote_from_to = tuple(demote_from_to)
         self.demote_border_margin = int(demote_border_margin)
+        # wheat_2 专项 copy-paste（见 maskdino/data/copy_paste.py），None 表示未开启
+        self.copy_paste = copy_paste
     
     @classmethod
     def from_config(cls, cfg, is_train=True):
@@ -127,6 +132,7 @@ class COCOInstanceNewBaselineDatasetMapper:
             "demote_border_truncated": cfg.INPUT.DEMOTE_BORDER_TRUNCATED,
             "demote_from_to": cfg.INPUT.DEMOTE_FROM_TO,
             "demote_border_margin": cfg.INPUT.DEMOTE_BORDER_MARGIN,
+            "copy_paste": build_copy_paste(cfg) if is_train else None,
         }
         return ret
 
@@ -141,6 +147,15 @@ class COCOInstanceNewBaselineDatasetMapper:
         dataset_dict = copy.deepcopy(dataset_dict)  # it will be modified by code below
         image = utils.read_image(dataset_dict["file_name"], format=self.img_format)
         utils.check_image_size(dataset_dict, image)
+
+        # ---- wheat_2 专项 copy-paste：必须在 LSJ 增广之前、于【原图尺度】上做 ----
+        # 所有图都是同 GSD 的 1024x1024 航拍裁片，原图尺度一致，贴进去无尺度失配；
+        # 贴完把新标注追加进 dataset_dict["annotations"]，后续多边形变换、points 变换、
+        # DEMOTE_BORDER_TRUNCATED 降级、空实例过滤全部复用下方已有链路。
+        if self.is_train and self.copy_paste is not None and "annotations" in dataset_dict:
+            image, dataset_dict["annotations"], _n_pasted = self.copy_paste(
+                image, dataset_dict["annotations"])
+            dataset_dict["n_copy_pasted"] = _n_pasted
 
         # TODO: get padding mask
         # by feeding a "segmentation mask" to the same transforms

@@ -175,6 +175,22 @@ def add_maskdino_config(cfg):
     cfg.INPUT.DEMOTE_FROM_TO = (1, 0)   # (源 contiguous id, 目标 id)；wheat cat2 为 wheat_2->wheat
     cfg.INPUT.DEMOTE_BORDER_MARGIN = 2  # 贴边判定容差（像素）
 
+    # ---- wheat_2 专项 copy-paste 增强（只作用于训练）----
+    # 从离线实例库随机取 wheat_2 贴到当前图，直到该图 wheat_2 数达到 TARGET_PER_IMG。
+    # 两条几何约束：wheat_2 之间零重叠；wheat_2 可贴在 wheat 上面，被覆盖的 wheat
+    # 掩码减掉重叠区、残余面积比低于 MIN_KEEP 则整个丢弃。
+    # 实例库用 myscripts/backup/build_wheat2_bank.py 离线构建（含三条质量闸门）。
+    # 【风险】本项目有前科：overfit10 把 wheat_2 占比抬到 14.0%（真实 7.7%），
+    # val 上过检 +39%、spike_precision 从 0.7588 崩到 0.5462。调 TARGET_PER_IMG 时
+    # 必须盯 spike_precision（判否线 0.70）与预测穗数/GT 穗数（上限 1.2）。
+    cfg.INPUT.COPY_PASTE_ENABLED = False
+    cfg.INPUT.COPY_PASTE_BANK = ""              # 实例库 npz 路径
+    cfg.INPUT.COPY_PASTE_TARGET_PER_IMG = 6     # 补到每图几个 wheat_2（现状 3.1）
+    cfg.INPUT.COPY_PASTE_MAX_TRIES = 30         # 单次贴图的位置重试上限
+    cfg.INPUT.COPY_PASTE_MARGIN = 8             # 距图边最小像素，须 > DEMOTE_BORDER_MARGIN
+    cfg.INPUT.COPY_PASTE_MIN_KEEP = 0.2         # 被遮挡 wheat 的残余面积比下限
+    cfg.INPUT.COPY_PASTE_FLIP_PROB = 0.5        # 贴图前随机水平翻转的概率
+
     # point loss configs
     # Number of points sampled during training for a mask point head.
     cfg.MODEL.MaskDINO.TRAIN_NUM_POINTS = 112 * 112

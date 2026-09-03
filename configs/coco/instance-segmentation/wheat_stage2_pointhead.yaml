@@ -263,6 +263,27 @@ INPUT:
   # 与推理端 instance_inference 按 pred_classes 门控的行为一致。
   DEMOTE_BORDER_TRUNCATED: True
 
+  # ---- wheat_2 专项 copy-paste（本分支 exp/copy-paste-wheat2 的实验改动）----
+  # 从离线实例库随机取 wheat_2 贴到当前图，补到每图 6 个（现状 3.1，约 2 倍）。
+  # 贴图在【原图尺度】上做，之后的多边形/points 变换、贴边降级、空实例过滤
+  # 全部复用已有链路（见 maskdino/data/copy_paste.py 的说明）。
+  # 约束：wheat_2 之间零重叠；可贴在 wheat 上面，被覆盖的 wheat 掩码减掉重叠区，
+  # 残余面积比 < MIN_KEEP 则整个丢弃。
+  #
+  # 实例库 934/988 条（刷掉 47 个贴边源、7 个零点源），建库命令见
+  # myscripts/backup/build_wheat2_bank.py 的 docstring。
+  #
+  # 【⚠️ 先验偏移风险】本项目有前科：overfit10 把 wheat_2 占比抬到 14.0%（真实 7.7%），
+  # val 上过检 +39%、spike_precision 从 0.7588 崩到 0.5462
+  # （exp-2026-08-27-unfreeze-val-generalization）。本档把占比推到约 14%，
+  # 判否线写死：spike_precision >= 0.70 且 预测穗数/GT穗数 <= 1.2（val GT 257，即 <= 308）。
+  COPY_PASTE_ENABLED: True
+  COPY_PASTE_BANK: "/public/home/zncui/datasets/wheat50/banks/wheat2_pts_train.npz"
+  COPY_PASTE_TARGET_PER_IMG: 6
+  COPY_PASTE_MARGIN: 8
+  COPY_PASTE_MIN_KEEP: 0.2
+  COPY_PASTE_FLIP_PROB: 0.5
+
 SOLVER:
   # 320 图 / IMS_PER_BATCH 4 = 80 iter/epoch，8000 iter ≈ 100 epoch。
   # 解冻 28.7M 参数后 100 epoch 可能过拟合，但训练期评估就是 val，直接读曲线取峰值即可，
