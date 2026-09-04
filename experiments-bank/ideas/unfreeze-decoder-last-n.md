@@ -1,0 +1,139 @@
+# 想法：按 decoder 层数细分解冻面 —— 最后 1 / 3 / 5 / 7 / 9 层
+
+状态：**待验证** ｜ 提出 2026-09-04 ｜ 分支 `exp/decoder-layer-unfreeze`，worktree `.claude/worktrees/exp-decoder-unfz` ｜ 承接
+[unfreeze-full-model](unfreeze-full-model.md) /
+[exp-2026-09-02-stage2-combo](../experiments/exp-2026-09-02-stage2-combo.md) /
+[exp-2026-09-03-decoder-layer-baseline](../experiments/exp-2026-09-03-decoder-layer-baseline.md)
+
+## 动机：已有的四个 arm 在 decoder 这一档上是「全有或全无」
+
+A/C/B/D 的解冻面是按**模块**切的，decoder 的 9 层永远一起动：
+
+| arm | 解冻面 | 可训练参数 |
+|:--|:--|--:|
+| A | decoder 全 9 层 + 框头 | 14,413,082 |
+| C | + class/mask 头 | 14,610,972 |
+| B | + pixel_decoder（整个 sem_seg_head） | 28,733,212 |
+| D | + backbone | 52,188,124 |
+
+而 [exp-2026-09-03 的逐层基线](../experiments/exp-2026-09-03-decoder-layer-baseline.md)
+表明这 9 层的贡献**极不均匀**：
+
+```
+segm AP:  69.45  69.45  69.45 │ 71.79  72.17  73.18 │ 73.28  73.32  73.32  73.43  73.30
+          interm  aux0   第1层 │ 第2层  第3层  第4层 │ 第5层  第6层  第7层  第8层  第9层
+                  ├─ 完全不动 ─┤├──── +3.73 ────┤├───── +0.25，已收敛 ─────┤
+```
+
+**第 5 层往后是近恒等的精修层**（+0.25），检测能力在第 4 层就基本成型。
+那么 Stage2 只解冻这几层近恒等层，理论上：
+
+1. **对检测的破坏最小** —— 被改动的是本来就没做多少事的层；
+2. **仍然能改写最终 query 表征** —— 点头读的是最后一层的 `decoder_output`，
+   最后一层能动，点任务就有适配空间。
+
+这正对着 Stage2 目前最大的代价。同一篇基线量化过：
+**Stage2 解冻训练把 wheat_2 打掉 8.6 点 segm AP50（82.89 → 74.30），wheat 只掉 1.6 点**，
+组合方案收回 63%（→ 79.72）仍差 3.17。点损失只监督 wheat_2、却压着 9 层共享 decoder，
+代价精确落在这个类别上。**缩小解冻面到「不干活的那几层」，是把这笔代价还回去的直接手段。**
+
+## 改动：只动 `UNFREEZE_KEYS`，五档层数
+
+每个 arm 解冻 = **最后 N 层 decoder** + **decoder 内全部非层模块** + **全部预测头**。
+后两项四个 arm 完全相同，是常量 810,577：
+
+| 常量部分 | 参数 |
+|:--|--:|
+| `predictor.class_embed` 分类头 | 514 |
+| `predictor.mask_embed` 掩码头 | 197,376 |
+| `predictor.decoder.bbox_embed` 框头（9 层共享一份） | 132,612 |
+| `predictor.decoder_norm` 每层输出进头前的 LN | 512 |
+| `predictor.decoder.ref_point_head` | 197,120 |
+| 点头 `point_coord_embed` + `point_class_embed`（P=25 + MLP） | 282,443 |
+
+每层 decoder 恰好 1,545,856。五档（**实测值，非估算**，见下「控制量」）：
+
+| arm | 解冻层 | 可训练参数 | 占全模型 52,300,433 |
+|:--|:--|--:|--:|
+| last1 | 8 | **2,356,433** | 4.5% |
+| last3 | 6–8 | **5,448,145** | 10.4% |
+| last5 | 4–8 | **8,539,857** | 16.3% |
+| last7 | 2–8 | **11,631,569** | 22.2% |
+| last9 | 0–8 | **14,723,281** | 28.2% |
+
+**`last9` 与组合口径的 arm C 逐位相同（14,723,281）** —— 本族就是 arm C 沿层数方向的
+严格嵌套细分，右端能直接接回 A/C/B/D 体系。
+（旧 arm C 记录的 14,610,972 是 P=50 + Linear 存在性头口径，换算：
+`14,610,972 − 170,134 + 282,443 = 14,723,281`。）
+
+其余**与 [exp-0902-combo](../experiments/exp-2026-09-02-stage2-combo.md) 逐项相同**：
+组合配方（P=25 / MLP / α0.5 / w0.1 / DEMOTE_BORDER_TRUNCATED）、七项损失权重、
+320 图 / bs4 / 8000 iter / LR 1e-4 / WARMUP 500 / STEPS (6400,7400) / EVAL_PERIOD 400 /
+`MIN/MAX_SIZE_TEST=1024`。**唯一变量是解冻的层数。**
+
+对照就是 `exp-0902-combo`（`output_v2/exp-0902-combo`），它本身即组合配方下的 arm B。
+
+### 两条必须记录的口径
+
+**① 全部预测头都是 9 层共享的。** `forward_prediction_heads` 对每层输出都算
+class/mask/box/point，所以冻结层虽自身不更新，其 aux 输出仍在训练这些共享头，
+也仍通过共享头对点头产生梯度。这是既有全部 arm 的一致行为，五个 arm 相同，不构成额外变量。
+
+**② `ref_point_head` 计入常量部分。** 它给每一层生成 query 位置编码，动它对冻结层
+也有间接影响。计入是为了让 `last9 ≡ arm C` 这个锚点成立；代价是"只动最后 N 层"这句话
+严格说是"只动最后 N 层的自身权重 + 全部跨层共享件"。
+
+**③ `enc_output` / `enc_output_norm` / `label_enc`（两阶段提案 + DN 路径，共 66,816）保持冻结**，
+与旧 arm C 一致。
+
+## 跑之前写死的预期与判否线
+
+对照 `exp-0902-combo`（八档→十档阈值各取最优）：
+`matched_F1@8` **0.5638** ／ `count_MAE_spike` **2.10** ／ segm AP **70.32** ／
+wheat_2 segm AP50 **79.72** ／ `spike_recall` 0.7004 ／ `spike_precision` 0.8257。
+Stage1 上限：wheat_2 AP50 **82.89** ／ 全类 segm AP **73.30**。
+
+跨 arm 比较**必须用 `matched_F1@σ`**，`mF1` 因 `spike_recall` 摆动大不可作单点判据
+（[unfreeze-real-dataset](unfreeze-real-dataset.md) 的方法论教训）。
+
+**主判据 · 点定位（八档阈值各取最优的 `matched_F1@8`）**
+
+- 存在某档 **≥ 0.5638** → 层数细分至少不亏，且该档的掩码代价必然低于 arm B，**直接取代组合方案**。
+- 全部五档 **< 0.5638 且随层数单调上升** → 点任务需要的是**容量**而非特定层，
+  arm B 的优势来自 `pixel_decoder` 而非 decoder 层数，本方向到此为止。
+- 出现**中间峰**（如 last3/last5 高于 last1 与 last9）→ 存在最优层数，
+  与 A→B→D 那条「解冻面有最优值」的结论同构，值得继续细分。
+
+**掩码判据 · wheat_2 是本实验的主要动机**
+
+- 某档 wheat_2 segm AP50 **≥ 82**（距 Stage1 的 82.89 不足 1 点）→ **假设成立**：
+  Stage2 的 wheat_2 代价确实来自「动了干活的那几层」，缩小解冻面即可消除。
+- 五档全部 **≤ 79.72**（不优于组合）→ 该代价与解冻哪些层无关，来自点损失本身，
+  需改从损失侧下手（例如只在 wheat_2 上加权、或给检测损失加保护项）。
+- 全类 segm AP **≥ 72.5**（接近 arm A/C 的 72.5~72.7）同时点指标不劣于组合 → 
+  **掩码与点两头兼得**，这是本实验最好的结局。
+
+**欠拟合判据 · last1 只有 2.36M 可训练参数**
+
+- 若 val 曲线在 **iter 8000 仍单调上升、峰值即末次** → schedule 不够，需延长后重跑该档；
+  A/C/B/D 与组合的峰值都在 iter 7200 附近、末次略低，可作对照形状。
+- 若 last1 的点指标显著低于 last3 且训练损失也明显更高 → 容量不足，非正则化收益。
+
+**控制量（对不上立即停）**
+
+- 五档可训练参数须精确等于上表。这些数字来自 worktree 内的 dry-run
+  （CPU 建模 + `freeze_all_but_point_head` 逐参数计数），且用同一脚本复算
+  **arm B 组合口径得 28,845,521，与 `exp-0902-combo` 训练日志逐位相同**，
+  旧 arm A/C 换算亦对得上，故这套核算可信。日志首行会打印实际值。
+- `spike_recall` 首次评估不得为 0。
+- 七项损失全部非零非 NaN（检测五项必须保留 Stage1 原值，见配置文件第四节的 08-26 教训）。
+- 阈值扫描**必须每个 run 重做**：解冻面变化会整体推移置信度分布，
+  组合方案的最优点在 T=0.28（定位）/ T=0.50（计数），本族不可沿用。
+
+## 注意事项
+
+- **`BACKBONE_MULTIPLIER` 在本族全程是死参数**（backbone 全冻结），与 A/C/B 相同。
+- 五个 run 的显存与耗时应**低于**组合方案的 20,290M / 2.21 s/iter（反传路径更短），
+  若显著更高说明冻结没生效。
+- last1 与 arm A 不同源：arm A 因 `maskdino_decoder.py:172` 的别名赋值把框头一并解冻，
+  但**层是全部 9 层**；本族的 last9 才是 arm A/C 的可比对象。
