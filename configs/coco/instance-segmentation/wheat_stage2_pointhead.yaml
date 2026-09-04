@@ -279,7 +279,13 @@ INPUT:
   # 判否线写死：spike_precision >= 0.70 且 预测穗数/GT穗数 <= 1.2（val GT 257，即 <= 308）。
   COPY_PASTE_ENABLED: True
   COPY_PASTE_BANK: "/public/home/zncui/datasets/wheat50/banks/wheat2_pts_train.npz"
-  COPY_PASTE_TARGET_PER_IMG: 6
+  # 【2026-09-04 降剂量】6 -> 3，与 Stage1 同口径。全库精确值：
+  #   target  wheat_2 实例   先验    相对 val 8.1%
+  #     关       + 0%       7.7%       0.95x
+  #      3       +23%       9.3%       1.14x   <- 本次
+  #      6       +98%      14.1%       1.74x   <- 首轮配置
+  # 理由见 wheat_stage1_detector.yaml：target=5 在 Stage1 上已触发先验偏移判否线。
+  COPY_PASTE_TARGET_PER_IMG: 3
   COPY_PASTE_MARGIN: 8
   COPY_PASTE_MIN_KEEP: 0.2
   COPY_PASTE_FLIP_PROB: 0.5
