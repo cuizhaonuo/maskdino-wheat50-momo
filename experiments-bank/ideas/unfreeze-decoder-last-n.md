@@ -1,6 +1,6 @@
 # 想法：按 decoder 层数细分解冻面 —— 最后 1 / 3 / 5 / 7 / 9 层
 
-状态：**待验证** ｜ 提出 2026-09-04 ｜ 分支 `exp/decoder-layer-unfreeze`，worktree `.claude/worktrees/exp-decoder-unfz` ｜ 承接
+状态：**部分成立**（掩码判据触发、点定位判否线触发）｜ 提出 2026-09-04 ｜ 验证于 [exp-2026-09-04-unfreeze-decoder-last-n](../experiments/exp-2026-09-04-unfreeze-decoder-last-n.md) ｜ 分支 `exp/decoder-layer-unfreeze`，worktree `.claude/worktrees/exp-decoder-unfz` ｜ 承接
 [unfreeze-full-model](unfreeze-full-model.md) /
 [exp-2026-09-02-stage2-combo](../experiments/exp-2026-09-02-stage2-combo.md) /
 [exp-2026-09-03-decoder-layer-baseline](../experiments/exp-2026-09-03-decoder-layer-baseline.md)
@@ -137,3 +137,29 @@ Stage1 上限：wheat_2 AP50 **82.89** ／ 全类 segm AP **73.30**。
   若显著更高说明冻结没生效。
 - last1 与 arm A 不同源：arm A 因 `maskdino_decoder.py:172` 的别名赋值把框头一并解冻，
   但**层是全部 9 层**；本族的 last9 才是 arm A/C 的可比对象。
+
+## 结论（2026-09-04）
+
+见 [exp-2026-09-04-unfreeze-decoder-last-n](../experiments/exp-2026-09-04-unfreeze-decoder-last-n.md)。
+**掩码假设成立，点定位判否线触发 —— 这是一条取舍曲线，不是替代方案。**
+
+| arm | 可训练 | `matched_F1@8` | `count_MAE_spike` | segm AP | wheat_2 AP50 |
+|:--|--:|--:|--:|--:|--:|
+| last1 | 2.36M | 0.4893 | 1.99 | **73.35** | **82.77** |
+| last3 | 5.45M | 0.5191 | 1.95 | 73.09 | **82.60** |
+| last5 | 8.54M | 0.5196 | 2.01 | 72.32 | 80.82 |
+| last7 | 11.63M | **0.5333** | **1.89** | 71.83 | 80.29 |
+| last9 | 14.72M | 0.5326 | 1.90 | 72.66 | 81.61 |
+| 组合（arm B） | 28.85M | **0.5638** | 2.10 | 70.32 | 79.72 |
+| Stage1 上限 | — | — | — | 73.30 | 82.89 |
+
+- **掩码判据第一档触发**：last1 / last3 的 wheat_2 AP50 达 82.77 / 82.60，距 Stage1 的
+  82.89 只差 0.12 / 0.29。**Stage2 打掉 wheat_2 的那 8.6 点 AP50，约 8.5 点可以靠
+  「只解冻最后 1~3 层」直接免掉**，不必改损失或数据。
+- **主判据第二条触发**：五档 `matched_F1@8` 全部低于组合的 0.5638，最好的 last7 差 0.0305；
+  1→7 层单调上升 +0.044 后饱和。**last9(14.7M) → arm B(28.85M) 的 +0.031 正是加进
+  `pixel_decoder` 这一步** —— 点任务要的是容量，且分界与掩码退化的分界是同一个、方向相反。
+- **「两头兼得」未达成**；计数五档虽全部优于组合，但它们的 `spike_recall` 只有 0.62~0.65
+  （组合 0.7004），是在更小更容易的集合上打分，**不作为独立结论**。
+- 工程取用：掩码是交付物取 **last1**（参数量 1/12、显存减半、掩码与 Stage1 持平）；
+  点定位是交付物维持组合；折中取 **last3**。
