@@ -63,9 +63,9 @@ MODEL:
     NO_OBJECT_WEIGHT: 0.1
 
     # ---- 点头结构与标定（与 Stage2 现行配置逐项相同）----
-    # P=25：全库实测每穗小穗数 mean=15.9 / p95=20 / p99=22，train 最大 31（仅 6 个实例 >25）。
+    # P=30：全库实测每穗小穗数 mean=15.9 / p95=20 / p99=22，train 最大 31（超过 30 的仅 1 个实例）。
     # Ni>P 时内层匹配只配前 P 个，多出的 GT 点不产生损失，不会报错。
-    NUM_POINTS: 25
+    NUM_POINTS: 30
     # 存在性头用 3 层 MLP（与坐标头对齐）。注意：该开关会改参数名，
     # True/False 训出的 checkpoint 不能互相加载（会被静默跳过）。
     POINT_CLASS_MLP: True
