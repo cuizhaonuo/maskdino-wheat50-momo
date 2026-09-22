@@ -80,6 +80,41 @@ SOLVER:
   CHECKPOINT_PERIOD: 1000
   BASE_LR: 0.0001
   BACKBONE_MULTIPLIER: 0.1
+  # 【2026-09-04 补】所有 Stage2 实验赖以为基的检查点 wheat_stage1_detector_v2_cosine
+  # 是用 cosine 训的，但该项从未写进任何 yaml —— 2026-07-17 那次是从命令行传的，
+  # 于是本配置按现状会吃 detectron2 默认的 WarmupMultiStepLR，复现不出那个检查点。
+  # 09-03 的 copy-paste 首轮因此混入了第二个变量（见 experiments-bank）。此处写死。
+  # 注：cosine 下 STEPS 不生效，保留只为切回 step 时不用再查数值。
+  LR_SCHEDULER_NAME: "WarmupCosineLR"
 
 TEST:
   EVAL_PERIOD: 1000
+
+INPUT:
+  # val/test 图原生 1024x1024；Stage1 原本不覆盖这两项、吃 detectron2 默认的 800/1333，
+  # 会把图压到 800x800。2026-09-03 的逐层 decoder 基线因此错了一轮（segm AP 71.93 vs 73.30），
+  # 这里显式写死，与 Stage2 口径一致。
+  MIN_SIZE_TEST: 1024
+  MAX_SIZE_TEST: 1024
+
+  # ---- wheat_2 专项 copy-paste（本分支 exp/copy-paste-wheat2 的实验改动）----
+  # coco_2cat train 现状每图 2.6 个 wheat_2（占比 6.0%），补到 5 个约合 2 倍。
+  # 该数据集无 points 字段，实例库用 --min-points 0 建（5265/5428 条，刷掉 162 个贴边源）。
+  # 风险与判否线同 Stage2，见 wheat_stage2_pointhead.yaml 的说明。
+  COPY_PASTE_ENABLED: True
+  COPY_PASTE_BANK: "/public/home/zncui/datasets/wheat50/banks/wheat2_nop_train.npz"
+  # 【2026-09-04 降剂量】首轮 target=5 触发了先验偏移判否线：
+  # nop val score>=0.5 上 wheat_2 预测/GT 从 0.89 涨到 1.26（上限 1.2），
+  # 且 wheat 预测数反降 303、wheat_2 反增 225 —— 概率质量在两类间搬家。
+  #
+  # 全库精确计算（按 max(现有, target) 逐图补足）：
+  #   target  wheat_2 实例   先验    相对 val 7.1%
+  #     关       +  0%      6.0%       0.84x
+  #      3       + 40%      8.2%       1.15x   <- 本次
+  #      4       + 68%      9.7%       1.36x
+  #      5       +101%     11.3%       1.59x   <- 首轮，判否
+  # 取 3：先验只比 val 高 15%，而 wheat_2 实例仍增 40%，属真实治疗量而非噪声扰动。
+  COPY_PASTE_TARGET_PER_IMG: 3
+  COPY_PASTE_MARGIN: 8
+  COPY_PASTE_MIN_KEEP: 0.2
+  COPY_PASTE_FLIP_PROB: 0.5

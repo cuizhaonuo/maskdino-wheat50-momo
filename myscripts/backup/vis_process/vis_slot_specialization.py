@@ -38,7 +38,7 @@ import matplotlib.pyplot as plt
 from myscripts.backup.vis_process.vis_match_debug import _CJK_FONT  # noqa: F401
 
 # ============================ debug 开关 ============================
-ENABLED = True
+ENABLED = False
 OUT_DIR = "output_v2/vis_slot_stats"   # 相对路径按仓库根解析
 DUMP_EVERY = 100          # 每 N 次 criterion 调用 dump 一次图 + CSV
 MIN_OBS = 30              # 至少累计这么多个实例观测才开始 dump
