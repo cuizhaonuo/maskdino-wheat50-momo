@@ -1,0 +1,112 @@
+# ============================================================================
+# 单阶段联合训练 · 实例分割 + 小穗点回归一起从头训
+#   数据：coco_2cat_with_points（带点，train=2092 图 / 90850 实例，val=200 图）
+#   目标：不分两阶段、不冻结任何参数，七项损失（cls/mask/dice/box/giou/点坐标/点存在性）
+#         同时反传，得到一个既能分割又能定位小穗点的模型。
+#
+# 与两阶段（wheat_stage1_detector.yaml -> wheat_stage2_pointhead.yaml）的区别只有三处：
+#   1) 数据集：全程用带点数据集，不再是「Stage1 用无点大集、Stage2 用带点小集」；
+#   2) 初始权重：ImageNet R-50，不再是 Stage1 的 checkpoint；
+#   3) FREEZE_EXCEPT_POINT_HEAD=False：没有任何冻结，点头与 trunk 一起学。
+# 点头相关的五个旋钮（NUM_POINTS / POINT_CLASS_MLP / POINT_FOCAL_ALPHA /
+# POINT_EMPTY_CLS_WEIGHT / 两项内层代价）与 Stage2 现行配置【逐项相同】，
+# 这样与两阶段对比时「是否分阶段」才是唯一变量。
+#
+# 【两阶段当初的前提已经消失】Stage2 只训点头，是因为带点数据当时只有 320 图，
+# 不足以重训 trunk（见 experiments-bank/exp-2026-08-28-unfreeze-full-model.md：
+# 320 图撑得住 28.7M 参数、撑不住 52.2M）。带点数据集已在 2026-09-22 扩到
+# 与无点集同规模（2092 图，90850 实例，5394 个 wheat_2 带点），本配置即建立在此之上。
+#
+# 用法：
+#   python train_net.py --num-gpus 1 \
+#     --config-file configs/coco/instance-segmentation/wheat_joint_single_stage.yaml \
+#     OUTPUT_DIR output_v2/<run-name>
+# ============================================================================
+_BASE_: maskdino_R50_bs16_50ep_3s_dowsample1_2048.yaml
+
+DATASETS:
+  # 固定命名的带点数据集（data_register/wheat_data_cat2.py 的 _STAGE_DATASETS["pts"]），
+  # 与全局 WITH_POINTS 开关解耦。train/val 都带 points 字段。
+  TRAIN: ("wheat_cat2_pts_coco_train",)
+  TEST: ("wheat_cat2_pts_coco_val",)
+
+MODEL:
+  # 从 ImageNet R-50 开始（与 Stage1 同一起点）。显式写出，避免被误当成要接 Stage1 权重。
+  WEIGHTS: "detectron2://ImageNetPretrained/torchvision/R-50.pkl"
+  MaskDINO:
+    # ======================= 不冻结 =======================
+    FREEZE_EXCEPT_POINT_HEAD: False
+    UNFREEZE_KEYS: []
+
+    # ---- 【损失权重】七项全部非零，这是「联合训练」的定义所在。
+    # 前五项与 Stage1 相同，点的两项与 Stage2 相同。
+    CLASS_WEIGHT: 4.0
+    MASK_WEIGHT: 5.0
+    DICE_WEIGHT: 5.0
+    BOX_WEIGHT: 5.0
+    GIOU_WEIGHT: 2.0
+    POINT_COORD_WEIGHT: 5.0
+    POINT_CLASS_WEIGHT: 2.0
+
+    # ---- 【外层匹配代价】query -> GT 实例（不反传，@torch.no_grad）。
+    # 与损失权重是两套独立旋钮，数值相同纯属巧合，见 Stage1 配置里的长注释。
+    COST_CLASS_WEIGHT: 4.0
+    COST_MASK_WEIGHT: 5.0
+    COST_DICE_WEIGHT: 5.0
+    COST_BOX_WEIGHT: 5.0
+    COST_GIOU_WEIGHT: 2.0
+    # ---- 【内层点匹配代价】P 个点槽 -> Ni 个 GT 小穗。此处【不能】置 0：
+    # 全零会让 scipy 的 linear_sum_assignment 退化成任意配对。
+    COST_POINT_COORD_WEIGHT: 5.0
+    COST_POINT_CLASS_WEIGHT: 2.0
+
+    NO_OBJECT_WEIGHT: 0.1
+
+    # ---- 点头结构与标定（与 Stage2 现行配置逐项相同）----
+    # P=25：全库实测每穗小穗数 mean=15.9 / p95=20 / p99=22，train 最大 31（仅 6 个实例 >25）。
+    # Ni>P 时内层匹配只配前 P 个，多出的 GT 点不产生损失，不会报错。
+    NUM_POINTS: 25
+    # 存在性头用 3 层 MLP（与坐标头对齐）。注意：该开关会改参数名，
+    # True/False 训出的 checkpoint 不能互相加载（会被静默跳过）。
+    POINT_CLASS_MLP: True
+    # 点存在性 focal 的 alpha，与检测头的 0.25 解耦（点头正负比温和得多）。
+    POINT_FOCAL_ALPHA: 0.5
+    # Ni==0 的 wheat 实例只贡献纯负样本，降权到 0.1。
+    POINT_EMPTY_CLS_WEIGHT: 0.1
+
+    TEST:
+      POINT_THRESHOLD: 0.35
+      SPIKELET_EVAL: True
+      SPIKELET_EVAL_SIGMAS: [3.0, 5.0, 8.0]
+      SPIKELET_EVAL_SCORE_THRESH: 0.4
+      SPIKELET_EVAL_IOU_THRESH: 0.5
+
+INPUT:
+  # val 图原生 1024x1024；不写这两项会吃 detectron2 默认的 800/1333 把图压小
+  # （Stage1 曾因此错过一轮基线，segm AP 71.93 vs 73.30）。
+  MIN_SIZE_TEST: 1024
+  MAX_SIZE_TEST: 1024
+  # LSJ 把完整 wheat_2 切到 crop 边界时降级为 wheat 并清空其 gt_points，只作用于训练。
+  DEMOTE_BORDER_TRUNCATED: True
+  # copy-paste 仍是未判决的实验项，默认关闭；要开就 CLI 覆盖 INPUT.COPY_PASTE_ENABLED True。
+  COPY_PASTE_ENABLED: False
+  COPY_PASTE_BANK: "/public/home/zncui/datasets/wheat50/banks/wheat2_pts_train.npz"
+  COPY_PASTE_TARGET_PER_IMG: 3
+  COPY_PASTE_MARGIN: 8
+  COPY_PASTE_MIN_KEEP: 0.2
+  COPY_PASTE_FLIP_PROB: 0.5
+
+SOLVER:
+  # 2092 图 / IMS_PER_BATCH 4 ≈ 523 iter/epoch，26000 iter ≈ 50 epoch，与 Stage1 同口径。
+  # 联合训练要同时学检测与点，不宜比 Stage1 短。
+  IMS_PER_BATCH: 4
+  MAX_ITER: 26000
+  STEPS: (20800, 24000)   # cosine 下不生效，保留以便切回 step 调度
+  WARMUP_ITERS: 1000
+  BASE_LR: 0.0001
+  BACKBONE_MULTIPLIER: 0.1
+  CHECKPOINT_PERIOD: 1000
+  LR_SCHEDULER_NAME: "WarmupCosineLR"
+
+TEST:
+  EVAL_PERIOD: 1000
