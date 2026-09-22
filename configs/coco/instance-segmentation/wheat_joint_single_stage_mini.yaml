@@ -1,0 +1,63 @@
+# ============================================================================
+# 单阶段联合训练 · 500 图小集版（快速迭代基线）
+#   数据：coco_2cat_with_points_mini（train=500 图 / 27702 实例，val=200 图 / 8631 实例）
+#   目标：与 wheat_joint_single_stage.yaml 完全同一套模型与旋钮，只把训练集换小，
+#         把单轮墙钟从 26000 iter（A100 约 15 h）压到 6250 iter（约 3.6 h），
+#         用于反复扫旋钮；结论定型后再回 wheat_joint_single_stage.yaml 上复跑。
+#
+# 与父配置 wheat_joint_single_stage.yaml 的差异【只有两处】：DATASETS 与 SOLVER/TEST 的 schedule。
+# 初始权重、FREEZE_EXCEPT_POINT_HEAD、七项损失权重、外层/内层匹配代价、点头五个旋钮
+# （NUM_POINTS / POINT_CLASS_MLP / POINT_FOCAL_ALPHA / POINT_EMPTY_CLS_WEIGHT / 两项内层代价）、
+# INPUT 的全部设置，一律继承不动 —— 这样与父配置对比时「训练集大小」才是唯一变量。
+#
+# ---- 这 500 张是怎么选的 ----
+# 从 coco_2cat_with_points 的 train2017（2092 张）里按
+#     排序键 (wheat_2 实例数降序, 小穗点总数降序, file_name 升序)
+# 取前 500 张。val2017 全部 200 张原样保留，与父集逐条相同（image_id / ann_id 都不重编号，
+# 可直接反查父集）。切点落在 wheat_2 数 == 4 的并列组里（229 张中取 179 张），
+# 故 tie-break 的后两项是必需的，不是装饰。
+#
+#             imgs   wheat   wheat_2   占比   小穗点   wheat_2/图
+#   父集 train 2092   85456     5394    5.9%   85946      2.58
+#   父集 val    200    8018      613    7.1%    9747      3.06
+#   mini train  500   24948     2754    9.9%   43024      5.51
+#
+# 用 24% 的图拿到 51% 的 wheat_2 实例和 50% 的小穗点监督。
+#
+# ---- ⚠️ 已知代价：类别先验偏移 ----
+# 选图偏向 wheat_2 密集的图，把 train 的 wheat_2 占比从 5.9% 推到 9.9%，而 val 是 7.1%。
+# experiments-bank/ideas/unfreeze-real-dataset.md 已确认类别先验偏移会造成过检、压低
+# spike_precision（overfit10 的 14.0% vs val 8.1% 那次把 0.7529 打到 0.55）。
+# 本次偏移 1.4×，比那次 1.7× 温和，但非零。
+# 【因此：mini 上得到的 spike_precision 与预测穗数不可与父配置直接互比。】
+# 跨配置比较请用 matched_F1@σ 这类对 recall 不敏感的指标，或只在 mini 内部横向比 arm。
+#
+# 用法：
+#   python train_net.py --num-gpus 1 \
+#     --config-file configs/coco/instance-segmentation/wheat_joint_single_stage_mini.yaml \
+#     OUTPUT_DIR output_v2/<run-name>
+# ============================================================================
+_BASE_: wheat_joint_single_stage.yaml
+
+DATASETS:
+  # data_register/wheat_data_cat2.py 的 _STAGE_DATASETS["pts_mini"]，带 points 字段。
+  # val 与父配置的 wheat_cat2_pts_coco_val 是同一批 200 张图（逐条相同），
+  # 所以 val 指标与父配置的 val 指标口径一致、可比。
+  TRAIN: ("wheat_cat2_pts_mini_coco_train",)
+  TEST: ("wheat_cat2_pts_mini_coco_val",)
+
+SOLVER:
+  # 500 图 / IMS_PER_BATCH 4 = 125 iter/epoch，6250 iter = 50 epoch，与父配置同 epoch 口径
+  # （父配置 2092 图 → 523 iter/ep × 50 ep ≈ 26000 iter）。
+  MAX_ITER: 6250
+  # 保持父配置 3.8% 的 warmup 比例（1000/26000）。
+  WARMUP_ITERS: 250
+  # cosine 下不生效，按父配置比例缩放后保留，以便切回 step 调度。
+  STEPS: (5000, 5750)
+  # 2 epoch 一存，与父配置同口径（父配置 1000 iter ≈ 2 ep）。
+  CHECKPOINT_PERIOD: 250
+
+TEST:
+  # 25 个 val 采样点。500 图 / 50 epoch 下解冻全模型大概率过拟合，
+  # 报告时以 val 曲线峰值为准并同时给出末次值（见 unfreeze-real-dataset.md 的注意事项）。
+  EVAL_PERIOD: 250

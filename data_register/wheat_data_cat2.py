@@ -43,18 +43,26 @@ MetadataCatalog.get("wheat_cat2_coco_val").set(
     thing_dataset_id_to_contiguous_id={1: 0, 2: 1}
 )
 
-# ====== 两阶段迁移专用：与全局 WITH_POINTS 解耦的固定命名数据集 ======
-# Stage1（训练检测/分类头）：无点大数据集 coco_2cat。
-# Stage2（只训练小穗点头）：带点小数据集 coco_2cat_with_points。
-# 两组名字固定，各自 config 直接引用，不依赖上面的 WITH_POINTS 开关。
+# ====== 固定命名数据集：与全局 WITH_POINTS 解耦，各自 config 直接引用 ======
+# nop      ：无点数据集 coco_2cat（Stage1 训检测/分类头用）。
+# pts      ：带点数据集 coco_2cat_with_points。2026-09-22 扩容后 train=2092 图 /
+#            90850 实例 / 5394 个带点 wheat_2，与无点集同规模。
+# pts_mini ：带点小集 coco_2cat_with_points_mini。train 从 pts 的 2092 张里按
+#            (wheat_2 实例数降序, 小穗点总数降序, file_name 升序) 取前 500 张，
+#            val 就是 pts 的全部 200 张（逐条相同）。用 24% 的图拿到 51% 的 wheat_2
+#            和 50% 的小穗点，单轮 50 epoch 从 26000 iter 降到 6250 iter。
+#            ⚠️ 选图偏向密集图，train 的 wheat_2 占比 9.9%，而 pts 是 5.9%、val 是 7.1%。
+#            类别先验偏移会压 spike_precision（见 experiments-bank/ideas/unfreeze-real-dataset.md），
+#            所以 mini 上的 spike_precision / 预测穗数不可与 pts 直接互比。
 _STAGE_DATASETS = {
-    "nop": "coco_2cat",              # 无点（no points），2 类
-    "pts": "coco_2cat_with_points",  # 带点（points），2 类
+    "nop": "coco_2cat",                        # 无点（no points），2 类
+    "pts": "coco_2cat_with_points",            # 带点（points），2 类
+    "pts_mini": "coco_2cat_with_points_mini",  # 带点小集：train 500 张，val 全留 200 张
 }
 for _tag, _ds in _STAGE_DATASETS.items():
     # 只有带点数据集传 extra_annotation_keys=["points"]；无点数据集的 ann 没有该字段，
     # 传入会触发 load_coco_json 的 KeyError。
-    _extra = ["points"] if _tag == "pts" else []
+    _extra = [] if _tag == "nop" else ["points"]
     for _split in ("train", "val"):
         _name = f"wheat_cat2_{_tag}_coco_{_split}"
         DatasetCatalog.register(
