@@ -277,7 +277,9 @@ INPUT:
   # val 上过检 +39%、spike_precision 从 0.7588 崩到 0.5462
   # （exp-2026-08-27-unfreeze-val-generalization）。本档把占比推到约 14%，
   # 判否线写死：spike_precision >= 0.70 且 预测穗数/GT穗数 <= 1.2（val GT 257，即 <= 308）。
-  COPY_PASTE_ENABLED: True
+  # 【2026-09-22】合入 debug 后默认关掉，同 wheat_stage1_detector.yaml：未判决的实验项，
+  #                 跑实验时改 True 或 CLI 覆盖 INPUT.COPY_PASTE_ENABLED True。
+  COPY_PASTE_ENABLED: False
   COPY_PASTE_BANK: "/public/home/zncui/datasets/wheat50/banks/wheat2_pts_train.npz"
   # 【2026-09-04 降剂量】6 -> 3，与 Stage1 同口径。全库精确值：
   #   target  wheat_2 实例   先验    相对 val 8.1%

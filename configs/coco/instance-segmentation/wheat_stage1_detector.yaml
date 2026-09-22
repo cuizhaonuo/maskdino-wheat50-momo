@@ -101,7 +101,10 @@ INPUT:
   # coco_2cat train 现状每图 2.6 个 wheat_2（占比 6.0%），补到 5 个约合 2 倍。
   # 该数据集无 points 字段，实例库用 --min-points 0 建（5265/5428 条，刷掉 162 个贴边源）。
   # 风险与判否线同 Stage2，见 wheat_stage2_pointhead.yaml 的说明。
-  COPY_PASTE_ENABLED: True
+  # 【2026-09-22】合入 debug 后默认关掉：该增强仍是未判决的实验项（target=3 这档没出判决，
+  #                 target=5 触发过先验偏移判否线）。跑实验时把这里改 True，或 CLI 覆盖
+  #                 INPUT.COPY_PASTE_ENABLED True。下面几项数值保留，改回来即可用。
+  COPY_PASTE_ENABLED: False
   COPY_PASTE_BANK: "/public/home/zncui/datasets/wheat50/banks/wheat2_nop_train.npz"
   # 【2026-09-04 降剂量】首轮 target=5 触发了先验偏移判否线：
   # nop val score>=0.5 上 wheat_2 预测/GT 从 0.89 涨到 1.26（上限 1.2），
