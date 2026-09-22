@@ -67,7 +67,7 @@ def _setup_cjk_font():
 _CJK_FONT = _setup_cjk_font()
 
 # ============================ debug 开关 ============================
-ENABLED = True           # False 则 maybe_visualize_matching 立即返回，零开销
+ENABLED = False           # False 则 maybe_visualize_matching 立即返回，零开销
 OUT_DIR = "output_v2/vis_match"   # 相对路径按仓库根目录解析，与工作目录无关
 EVERY = 1                # 每 N 次 criterion 调用画一次
 MAX_DUMP = 20            # 本进程最多画多少张，画满即停（防止长训练刷屏）
