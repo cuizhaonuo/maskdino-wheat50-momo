@@ -1,6 +1,6 @@
 # 想法：mini 上把 schedule 从 50 epoch 拉到 100 epoch
 
-状态：**待验证** ｜ 提出 2026-09-23 ｜ 承接 [exp-2026-09-22-mini-baseline](../experiments/exp-2026-09-22-mini-baseline.md)
+状态：**成立（幅度很大）** ｜ 提出 2026-09-23 ｜ 验证于 [exp-2026-09-23-mini-longer-schedule](../experiments/exp-2026-09-23-mini-longer-schedule.md) ｜ 承接 [exp-2026-09-22-mini-baseline](../experiments/exp-2026-09-22-mini-baseline.md)
 
 ## 为什么值得做
 
