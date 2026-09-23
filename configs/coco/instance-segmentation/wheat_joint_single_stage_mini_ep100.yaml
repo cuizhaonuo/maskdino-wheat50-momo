@@ -1,0 +1,45 @@
+# ============================================================================
+# 单阶段联合训练 · 500 图小集 · 100 epoch 版
+#   目的：检验 mini/baseline 末段的平台是 cosine 把 lr 退到 0 造成的，还是模型容量饱和。
+#   预注册：experiments-bank/ideas/mini-longer-schedule.md（判否线已在跑之前写死）
+#
+# 与 wheat_joint_single_stage_mini.yaml 的差异【只有 schedule】：
+#   MAX_ITER 6250 -> 12500，EVAL/CHECKPOINT_PERIOD 250 -> 500，STEPS 按比例缩放。
+#   数据集、初始权重、七项损失权重、匹配代价、点头五个旋钮、INPUT 全部继承不动。
+#
+# ---- 为什么 WARMUP_ITERS 保持 250 不缩放 ----
+# 保持绝对值使前 250 iter 与基线逐步相同，差异从 warmup 结束后才出现，便于归因。
+# 代价是 warmup 占比从 4%（250/6250）降到 2%（250/12500）。
+#
+# ---- ⚠️ 这不是基线的续训 ----
+# detectron2 的 cosine 周期与 warmup 比例都绑在 MAX_ITER 上
+# （solver/build.py: LRMultiplier(..., max_iter=cfg.SOLVER.MAX_ITER)，
+#  warmup 比例 = WARMUP_ITERS / MAX_ITER）。改 MAX_ITER 会同时改变退火周期
+# ——这正是本实验想要的，不是副作用。两条 lr 路径从 iter 250 起就不同，
+# 【不能用 --resume 从 baseline 的 checkpoint 衔接】，必须从 ImageNet 重头跑。
+#
+# ---- 主判据（摘自预注册，完整版见 ideas 文档）----
+#   matched_F1@8 峰值 > 0.593  -> 更长 schedule 成立（基线峰值 0.5783 + 噪声地板 0.015）
+#   matched_F1@8 峰值 < 0.5783 -> 不成立，50 epoch 已经够
+#   过拟合判据：val 峰值若出现在 iter < 6250 且此后连续 3 轮低于峰值超过 0.015，
+#              则 100 epoch 是过训，应缩短而非延长。
+#
+# 用法：
+#   python train_net.py --num-gpus 1 \
+#     --config-file configs/coco/instance-segmentation/wheat_joint_single_stage_mini_ep100.yaml \
+#     OUTPUT_DIR output_v2/<run-name>
+# ============================================================================
+_BASE_: wheat_joint_single_stage_mini.yaml
+
+SOLVER:
+  # 500 图 / IMS_PER_BATCH 4 = 125 iter/epoch，12500 iter = 100 epoch。
+  MAX_ITER: 12500
+  # 故意不缩放，见上方注释。
+  WARMUP_ITERS: 250
+  # cosine 下不生效，按比例缩放后保留，以便切回 step 调度。
+  STEPS: (10000, 11500)
+  # 4 epoch 一存，保持 25 个采样点，与基线的曲线分辨率和评估开销都可比。
+  CHECKPOINT_PERIOD: 500
+
+TEST:
+  EVAL_PERIOD: 500
