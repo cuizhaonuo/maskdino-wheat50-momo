@@ -84,6 +84,20 @@ def add_maskdino_config(cfg):
     # 内层匈牙利匹配的代价权重
     cfg.MODEL.MaskDINO.COST_POINT_COORD_WEIGHT = 5.0
     cfg.MODEL.MaskDINO.COST_POINT_CLASS_WEIGHT = 2.0
+    # ===== KMO-based 内层匹配（CLTR, ECCV 2022, Eq.3）=====
+    # 内层代价在 L1 坐标 + 存在性之外再加一项近邻上下文 |y^k - ŷ^k|：
+    #   y^k = GT 小穗到其 K 个最近邻（不含自身）的平均欧氏距离，在框相对 [0,1] 空间里算，
+    #         与 L1 坐标项同一空间、同一量纲；Ni<=K 时对仅有的 Ni-1 个邻居取均值，Ni=1 时为 0。
+    #   ŷ^k = 独立头 point_knn_embed 逐槽预测（sigmoid），只在匹配上的槽用 L1 监督。
+    # 只作用于训练期的内层匹配，推理不用。False 时不建头、不加代价、不产生损失，与现状逐位一致。
+    cfg.MODEL.MaskDINO.POINT_KMO = False
+    # 近邻数（不含点自身）。论文正文写 k=4，对应官方代码 num_knn=4，但 cKDTree 查询结果的
+    # 第 0 列是点自身、随后被删掉，实际只平均 3 个邻居；3 与官方实现逐值一致。
+    cfg.MODEL.MaskDINO.POINT_KMO_K = 3
+    # 内层匹配中 KMO 项的权重。官方把 (x, y, d) 放进同一个 cdist(p=1)，即与坐标项同权。
+    cfg.MODEL.MaskDINO.COST_POINT_KNN_WEIGHT = 5.0
+    # ŷ^k 的 L1 回归损失权重。官方 (x, y, d) 共用一个 L1 损失，即与 POINT_COORD_WEIGHT 同权。
+    cfg.MODEL.MaskDINO.POINT_KNN_WEIGHT = 5.0
     # 点存在性 focal 的 alpha。与 loss_labels 的 self.focal_alpha 解耦：
     # 检测头是 300 query 配约 39 个正样本，点头是 P 个 slot 配约 14 个正样本，
     # 正负比温和得多，0.25（来自 RetinaNet 稠密检测）在这里把正样本压得过狠。
