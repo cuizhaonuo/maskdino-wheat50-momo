@@ -8,6 +8,10 @@ Reports
       plus the within-instance std of ŷ^k vs y^k over the matched slots.
   M2  override rate: KMO assignment's Eq.2 cost > Eq.2 optimum + 1e-5 (KMO traded L1 for context);
       tie-swap rate: same Eq.2 cost, different assignment (KMO only picked another exact L1 optimum).
+  post-hoc (added after the first run, NOT pre-registered): splits the M1 error into
+      - level: |mean_inst(ŷ^k) - mean_inst(y^k)| per instance
+      - within-instance Pearson r of (ŷ^k - mean_inst ŷ^k) vs (y^k - mean_inst y^k), pooled
+      - oracle_inst_same_sample: mean|y^k - median_inst(y^k)| on the very same matched pairs
 
 Run from the repo root:
   PYTHONPATH=. python myscripts/backup/vis_process/kmo_match_diag.py --config <run>/config.yaml --weights <run>/model_XXXX.pth --batches 100 --out <json>
@@ -64,7 +68,8 @@ def main():
     crit = model.criterion
 
     stats = dict(inst=0, override=0, tie_swap=0, pts=0, err_l1=0.0, err_kmo=0.0,
-                 std_pred=[], std_gt=[], cost_gap=[])
+                 std_pred=[], std_gt=[], cost_gap=[],
+                 level=[], sxy=0.0, sxx=0.0, syy=0.0, oracle=0.0)
     orig_loss_points = SetCriterion.loss_points
     orig_match = SetCriterion._inner_point_match
     state = {"top": False}
@@ -98,6 +103,14 @@ def main():
             stats["err_kmo"] += (pk[r_k] - gk[c_k]).abs().sum().item()
             stats["std_pred"].append(pk[r_l].std().item())
             stats["std_gt"].append(gk[c_l].std().item())
+            # post-hoc decomposition (not pre-registered)
+            p_m, g_m = pk[r_l].double().flatten(), gk[c_l].double().flatten()
+            stats["level"].append(abs(p_m.mean().item() - g_m.mean().item()))
+            pc, gc = p_m - p_m.mean(), g_m - g_m.mean()
+            stats["sxy"] += (pc * gc).sum().item()
+            stats["sxx"] += (pc * pc).sum().item()
+            stats["syy"] += (gc * gc).sum().item()
+            stats["oracle"] += (g_m - g_m.median()).abs().sum().item()
         return r_k, c_k
 
     SetCriterion.loss_points = loss_points
@@ -119,6 +132,9 @@ def main():
         "M2_tie_swap_rate": stats["tie_swap"] / n_i,
         "median_eq2_cost_gap_when_override": float(np.median([g for g in stats["cost_gap"] if g > 1e-5]))
         if stats["override"] else None,
+        "posthoc_level_bias_mean": float(np.mean(stats["level"])) if stats["level"] else None,
+        "posthoc_within_inst_pearson_r": stats["sxy"] / max((stats["sxx"] * stats["syy"]) ** 0.5, 1e-12),
+        "posthoc_oracle_inst_same_sample": stats["oracle"] / n_p,
     }
     print(json.dumps(res, indent=2))
     if args.out:
