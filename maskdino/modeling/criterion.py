@@ -135,6 +135,25 @@ def calculate_uncertainty(logits):
     return -(torch.abs(gt_class_logits))
 
 
+def knn_mean_distance(pts: torch.Tensor, k: int) -> torch.Tensor:
+    """KMO 的 y^k（CLTR Eq.3）：每个点到其 k 个最近邻（不含自身）的平均欧氏距离。
+    与官方 CLTR dataset.caculate_knn_distance 逐值一致：N<=k 时对仅有的 N-1 个邻居取均值，N==1 时为 0。
+    Args:
+        pts: [N, 2] 点坐标
+        k:   近邻数（不含自身）
+    Returns:
+        [N, 1]
+    """
+    n = pts.shape[0]
+    if n <= 1:
+        return pts.new_zeros((n, 1))
+    # 直接求差取范数，不用 torch.cdist：N>25 时 cdist 会切到矩阵乘法近似，与 cKDTree 对不上
+    dist = (pts[:, None, :] - pts[None, :, :]).norm(dim=-1)        # [N, N]
+    dist.fill_diagonal_(float("inf"))
+    knn = dist.topk(min(k, n - 1), dim=1, largest=False).values    # [N, k_eff]
+    return knn.mean(dim=1, keepdim=True)
+
+
 class SetCriterion(nn.Module):
     """This class computes the loss for DETR.
     The process happens in two steps:
@@ -145,7 +164,8 @@ class SetCriterion(nn.Module):
     def __init__(self, num_classes, matcher, weight_dict, eos_coef, losses,
                  num_points, oversample_ratio, importance_sample_ratio,dn="no",dn_losses=[], panoptic_on=False, semantic_ce_loss=False,
                  num_spikelet_points=50, point_cost_coord=5.0, point_cost_class=2.0,
-                 point_focal_alpha=0.25, point_empty_cls_weight=1.0):
+                 point_focal_alpha=0.25, point_empty_cls_weight=1.0,
+                 point_kmo=False, point_kmo_k=3, point_cost_knn=5.0):
         """Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
@@ -183,6 +203,10 @@ class SetCriterion(nn.Module):
         self.point_focal_alpha = point_focal_alpha
         # Ni==0 实例的存在性损失权重（只作用于 cls_loss 的分子，不影响 denom）
         self.point_empty_cls_weight = point_empty_cls_weight
+        # KMO（CLTR Eq.3）：内层代价加近邻上下文项 |ŷ^k - y^k|，并对 ŷ^k 做 L1 监督
+        self.point_kmo = point_kmo
+        self.point_kmo_k = point_kmo_k            # 近邻数 K（不含自身）
+        self.point_cost_knn = point_cost_knn      # 内层匹配中 KMO 项的权重
 
     def loss_labels_ce(self, outputs, targets, indices, num_masks):
         """Classification loss (NLL)
@@ -324,12 +348,14 @@ class SetCriterion(nn.Module):
         return losses
 
     @torch.no_grad()
-    def _inner_point_match(self, pred_rel, pred_logit, gt_rel):
+    def _inner_point_match(self, pred_rel, pred_logit, gt_rel, pred_knn=None, gt_knn=None):
         """逐实例内层匈牙利匹配：把 P 个预测点匹配到 Ni 个 GT 小穗。
         Args:
             pred_rel:   [P, 2]  预测点（框相对归一化坐标）
             pred_logit: [P, 1]  预测点存在性 logit
             gt_rel:     [Ni, 2] GT 小穗（框相对归一化坐标）
+            pred_knn:   [P, 1]  预测的近邻平均距离 ŷ^k，POINT_KMO=True 时必传
+            gt_knn:     [Ni, 1] GT 的 y^k；不传则由 gt_rel 现算（诊断脚本走这条路）
         Returns:
             (row_ind, col_ind): 匹配的预测点索引与 GT 索引（长度均为 min(P, Ni)=Ni）
         """
@@ -347,6 +373,13 @@ class SetCriterion(nn.Module):
         cost_class = (pos_cost - neg_cost)                # [P,1]，与 GT 无关，作为每个预测点的偏置
         cost_coord = torch.cdist(pred_rel, gt_rel, p=1)   # [P, Ni]
         C = self.point_cost_coord * cost_coord + self.point_cost_class * cost_class  # [P, Ni]
+        if self.point_kmo:
+            # KMO（CLTR Eq.3）：再加近邻上下文代价 |ŷ^k - y^k|
+            assert pred_knn is not None, "POINT_KMO=True 时 _inner_point_match 必须传入 pred_knn"
+            if gt_knn is None:
+                gt_knn = knn_mean_distance(gt_rel, self.point_kmo_k)
+            cost_knn = torch.cdist(pred_knn.float(), gt_knn.float(), p=1)    # [P, Ni]
+            C = C + self.point_cost_knn * cost_knn
         C = C.cpu()
         row_ind, col_ind = linear_sum_assignment(C)
         row_ind = torch.as_tensor(row_ind, dtype=torch.int64, device=pred_rel.device)
@@ -355,18 +388,22 @@ class SetCriterion(nn.Module):
 
     def loss_points(self, outputs, targets, indices, num_masks):
         """逐实例小穗点损失：对每个外层匹配到的实例，做内层匈牙利匹配后计算
-        点坐标 L1 损失 + 点存在性 focal 损失。
+        点坐标 L1 损失 + 点存在性 focal 损失（KMO 开启时再加 ŷ^k 的 L1 损失）。
         - 点坐标采用"实例框相对归一化"[0,1]：用匹配到的 GT 框把 GT 小穗换算到框相对坐标。
         - wheat 实例（无小穗，Ni=0）：无坐标损失，P 个点全部监督为不存在（背景）。
         """
         assert 'pred_point_coords' in outputs and 'pred_point_logits' in outputs
         pred_coords = outputs['pred_point_coords']   # [B, Q, P, 2]
         pred_logits = outputs['pred_point_logits']   # [B, Q, P, 1]
+        if self.point_kmo:
+            assert 'pred_point_knn' in outputs, "POINT_KMO=True 但 outputs 里没有 pred_point_knn"
+            pred_knns = outputs['pred_point_knn']    # [B, Q, P, 1]
         device = pred_coords.device
         alpha, gamma = self.point_focal_alpha, 2.0
 
         coord_loss = torch.zeros([], device=device)
         cls_loss = torch.zeros([], device=device)
+        knn_loss = torch.zeros([], device=device)
         num_pos = 0  # 总匹配小穗数，用于归一化
 
         for b, (src_idx, tgt_idx) in enumerate(indices):
@@ -391,7 +428,11 @@ class SetCriterion(nn.Module):
                 else:
                     gt_rel = gt_pts_img.new_zeros((0, 2))
 
-                row_ind, col_ind = self._inner_point_match(pred_rel, pred_lg, gt_rel)
+                pred_knn = gt_knn = None
+                if self.point_kmo:
+                    pred_knn = pred_knns[b, q_i].float()                    # [P,1]
+                    gt_knn = knn_mean_distance(gt_rel, self.point_kmo_k)    # [Ni,1]，匹配与损失共用
+                row_ind, col_ind = self._inner_point_match(pred_rel, pred_lg, gt_rel, pred_knn, gt_knn)
 
                 # 存在性目标：匹配上的预测点为 1，其余为 0
                 tgt_exist = torch.zeros((self.num_spikelet_points, 1), device=device, dtype=pred_lg.dtype)
@@ -400,6 +441,10 @@ class SetCriterion(nn.Module):
                     # 坐标 L1 损失（仅匹配点）
                     coord_loss = coord_loss + F.l1_loss(
                         pred_rel[row_ind], gt_rel[col_ind], reduction='sum')
+                    if self.point_kmo:
+                        # ŷ^k 的 L1 回归（仅匹配点）。官方 (x, y, d) 共用一个 L1，这里拆成独立的 key
+                        knn_loss = knn_loss + F.l1_loss(
+                            pred_knn[row_ind], gt_knn[col_ind], reduction='sum')
 
                 # 存在性 focal 损失（全部 P 个点）
                 prob = pred_lg.sigmoid()
@@ -420,6 +465,8 @@ class SetCriterion(nn.Module):
             'loss_point_coord': coord_loss / denom,
             'loss_point_cls': cls_loss / denom,
         }
+        if self.point_kmo:
+            losses['loss_point_knn'] = knn_loss / denom
         return losses
 
     def prep_for_dn(self,mask_dict):
