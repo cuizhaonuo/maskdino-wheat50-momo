@@ -179,3 +179,7 @@ KMO = 新的匹配代价 + `ŷ^k` 辅助回归损失，两者绑在一起。若�
 
 **下一步**（详见实验记录）：两臂各补一个种子 → 消融 `COST_POINT_KNN_WEIGHT=0` → 计数阈值扫描 →
 效应仍在则上全集（`full/kmo-matcher`）。
+
+**【2026-09-24】** `mini/ep100` 分支的 `exp-2026-09-23-mini-longer-schedule.md` 把 mini 的默认 schedule 改成了
+100 epoch，50 epoch 的基线训练不充分。因此下一步改为先在 100 epoch 下复核本实验：
+[kmo-matcher-ep100](kmo-matcher-ep100.md)（分支 `mini/kmo-matcher-ep100`）。

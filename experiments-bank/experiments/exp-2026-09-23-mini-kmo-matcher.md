@@ -14,6 +14,12 @@
 | 实测 | 3.37 s/iter（基线 3.84 s/iter 是与 p30 并发时测的，两者不可比）；峰值显存 24.5G（基线 23.9G） |
 | 状态 | 6250/6250 iter · 25/25 评估 · 0 报错 |
 
+> **【2026-09-24 补记】对照基线的 schedule 不足。**
+> `mini/ep100` 分支的 `experiments-bank/experiments/exp-2026-09-23-mini-longer-schedule.md` 证明 mini 上 50 epoch 是被 cosine 掐断的：
+> 只把 schedule 拉到 100 epoch，基线 `matched_F1@8` 峰值就从 0.5783 升到 0.6331。
+> 本实验的 +0.024 是在这个训练不充分的基线上测的，可能有一部分只是 KMO 让训练收敛得更快。
+> 100 epoch 下的复核见 [kmo-matcher-ep100](../ideas/kmo-matcher-ep100.md)（分支 `mini/kmo-matcher-ep100`）。
+
 ## 判定（按预注册）
 
 **预注册判定：「机制未启动」。** 机制门 M1 没过：L1-only 配对下 `ŷ^k` 的误差为 **0.0189**，线是 < 0.0158。
