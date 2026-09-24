@@ -2,7 +2,7 @@
 # 单阶段联合训练 · 500 图小集 · GroupPose 式分组 decoder（mini/group-decoder，E3）
 #   来源：Liu et al., "Group Pose: A Simple Baseline for End-to-End Multi-person Pose Estimation"（ICCV 2023）
 #   预注册：experiments-bank/ideas/group-decoder.md
-#   对照：wheat_joint_single_stage_mini_q100.yaml（mini/q100，E2：同为 100 个实例 query、原 MLP 点头）
+#   对照：wheat_joint_single_stage_mini_q100.yaml（100 epoch 版为 mini/q100-ep100；50 epoch 版为 mini/q100，E2：同为 100 个实例 query、原 MLP 点头）
 #
 # 结构：每个匹配 query（Ni=100）挂 NUM_POINTS=30 个小穗 token（Ki=30）。decoder 每层：
 #   实例内 SA（1+30 个 token）→ 实例 token 走原层（跨实例 SA / 4-D 框 cross-attn / FFN，一行不改）
@@ -25,8 +25,10 @@
 #     --config-file configs/coco/instance-segmentation/wheat_joint_single_stage_mini_group.yaml \
 #     OUTPUT_DIR /public/home/zncui/pycharm_project/maskdino-wheat50/output_v2/<run-name>
 # 消融（E4，点 token 不做跨实例 SA）：追加 MODEL.MaskDINO.POINT_ACROSS_ATTN none
+# 【100 epoch 版】_BASE_ 改为 wheat_joint_single_stage_mini_ep100.yaml（mini/baseline@0f71161），
+#   schedule 全部继承自它；50 epoch 版见 mini/group-decoder 分支。其余与 50 epoch 版逐字相同。
 # ============================================================================
-_BASE_: wheat_joint_single_stage_mini.yaml
+_BASE_: wheat_joint_single_stage_mini_ep100.yaml
 
 MODEL:
   MaskDINO:
