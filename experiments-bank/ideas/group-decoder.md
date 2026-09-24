@@ -1,7 +1,10 @@
 # 想法：GroupPose 式分组 decoder —— 麦穗实例 token + 小穗 token
 
-状态：**待验证** ｜ 提出 2026-09-23 ｜ 分支 `mini/group-decoder`（从 `mini/baseline` 拉出）｜ 配置
-`wheat_joint_single_stage_mini_group.yaml` ｜ 输出 `output_v2/exp-0923-mini-group-decoder`
+状态：**待验证（100 epoch 复跑）** ｜ 提出 2026-09-23 ｜ 分支 `mini/group-decoder`（从 `mini/baseline`@`0f71161` 开出，100 epoch）｜ 配置
+`wheat_joint_single_stage_mini_group.yaml`（`_BASE_` 为 `wheat_joint_single_stage_mini_ep100.yaml`）｜ 输出 `output_v2/exp-<启动日期>-mini-group-decoder`
+
+50 epoch 版（输出 `output_v2/exp-0923-mini-group-decoder`，原提交由 tag `archive/mini-group-decoder-ep50` 保留）已判
+「机制未启动、主判据歧义、计数成立」，判据与结论保留在文末，不再适用于 100 epoch 复跑。
 
 来源：Liu et al., *Group Pose: A Simple Baseline for End-to-End Multi-person Pose Estimation*（ICCV 2023），
 本地源码 `/public/home/zncui/pycharm_project/GroupPose`。结合方案讨论见本次会话的计划文件（E3）。
@@ -71,7 +74,52 @@ mini/baseline：matched_F1@8 0.578、每穗计数 MAE 3.81（GT 均 15.9 点，�
   4090（24 GB）放不下：iter 0 在 mask 损失的点采样处 OOM（已分配 22.8 GB）。
   另：`wheat_cat2_pts_coco_overfit10` 当前不可用作评估集——其标注里的图像文件名是 09-22 重新生成数据集之前的，文件已不存在。
 
-## 预期与判否线（跑之前写死）
+## 100 epoch 复跑：预期与判否线（跑之前写死，2026-09-24）
+
+2026-09-24 起 `mini/baseline` 就是 100 epoch 基线（原 `mini/ep100`，`0f71161`）。本节写于任何 100 epoch E2 / E3 结果之前。
+主对照仍是 **E2**，即 `mini/q100` 的 100 epoch 复跑（同 query 预算，输出 `output_v2/exp-<启动日期>-mini-q100`）；
+E2 的数值出来前，阈值以 E2 的峰值 / 末值为变量写死。规则沿用 50 epoch 版，改两处（见各条说明）：
+`segm/AP` 护栏的容差按基线噪声放宽；峰值的取法事先写死。
+
+**峰值的取法**：E2、E3 的峰值一律只在 `spike_recall` ≥ 0.8 的评估轮里取。50 epoch 判定时，E3 的官方峰值出现在
+`spike_recall` 0.002 的一轮（约 1 个配对穗），是小样本假象，当时是事后排除的；这次事先写死。
+
+### 机制（先判）
+
+口径与 50 epoch 版相同（`point_token_diag.py`，最终 checkpoint）。100 epoch 基线 E0 的参照值（跑 E3 之前测得，
+`output_v2/_diag-0924/exp-0923-mini-ep100.json`；自检：重算的 matched_F1@8 为 0.63116，与训练日志末值 0.6312 一致）：
+存在性 AUC **0.667**（14450 个 slot，正样本率 0.481），重复点 0.075%（8 / 10599）。
+
+- **M1（存在性变成局部判别）**：E3 的存在性 AUC 须比 E2（同口径）高 **≥ 0.05**。M1 不通过 → 判「机制未启动」，
+  端到端差异不归因于局部存在性。
+- **M2（不引入重复点，护栏）**：阈值化后同一穗内距离 < 3 px 的预测点对数 / 预测点数 ≤ **1%**。
+
+### 主判据：`matched_F1@8`
+
+| 条件 | 判定 |
+|:--|:--|
+| 峰值 ≥ E2 峰值 **+0.02** 且末值 ≥ E2 末值 **+0.02**，护栏满足 | **成立** |
+| 峰值 ≤ E2 峰值 | **判否** |
+| 介于两者之间 | **歧义**（单种子，种子方差未测） |
+
++0.02 已高于 mini 实验族的噪声地板 0.015，不改。
+
+### 次判据：计数
+
+`count_MAE_spike` 峰值（即最小值）≤ E2 峰值 × **0.9** → 计数成立（与定位分开判），规则不改。
+50 epoch 时计数随训练往回漂（iter 3249 的 2.19 → 末值 3.15），所以这次同时报告末值与末 5 轮均值（只记录，不作判据）。
+
+### 护栏
+
+- `segm/AP` 峰值 ≥ E2 峰值 − **1.0**（50 epoch 版是 −0.5，但 100 epoch 基线末 4 轮的平台摆幅已有 0.70）；
+- `spike_recall` 峰值 ≥ E2 峰值 − **0.02**（大于基线末 4 轮摆幅 0.011，不改）。
+
+### 阈值口径
+
+同 50 epoch 版：训练期评估都在 `POINT_THRESHOLD=0.35`；主判据落在歧义区或判否时，必须对 E2、E3 的最终 checkpoint
+做阈值扫描后比 best-vs-best，再下结论。
+
+## 50 epoch 版：预期与判否线（2026-09-23 写死，已按此判，结论见文末）
 
 主对照是 **E2**（同 query 预算）。E2 的数值出来前，下面的阈值以 E2 的峰值 / 末值为变量写死：
 
@@ -124,9 +172,14 @@ M1 不通过 → 判「机制未启动」，端到端差异不归因于局部存
 
 ## 成本
 
-6250 iter；正式 run 开头实测 3.56 s/iter（qiuhao A100，与 ep100 并发），约 6.5 h + 25 次评估。峰值显存约 26 GB，需 A100。
+100 epoch 版：12500 iter，按 50 epoch 实测的 3.56 s/iter（与另一个 run 并发）约 12 ~ 13 h + 25 次评估。峰值显存约 26 GB，需 A100。
+50 epoch 版：6250 iter，约 6.5 h + 25 次评估。
 
-## 结论（2026-09-24，对照 E2，按上面写死的规则判）
+## 100 epoch 结论
+
+（待填）
+
+## 50 epoch 版结论（2026-09-24，对照 E2，按 50 epoch 的判否线判）
 
 **机制未启动；主判据歧义（阈值扫描后仍未过 +0.02）；计数次判据成立；护栏全过。**
 详见 [exp-2026-09-23-mini-group-decoder](../experiments/exp-2026-09-23-mini-group-decoder.md)。
