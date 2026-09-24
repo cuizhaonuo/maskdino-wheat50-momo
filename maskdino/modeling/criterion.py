@@ -145,7 +145,8 @@ class SetCriterion(nn.Module):
     def __init__(self, num_classes, matcher, weight_dict, eos_coef, losses,
                  num_points, oversample_ratio, importance_sample_ratio,dn="no",dn_losses=[], panoptic_on=False, semantic_ce_loss=False,
                  num_spikelet_points=50, point_cost_coord=5.0, point_cost_class=2.0,
-                 point_focal_alpha=0.25, point_empty_cls_weight=1.0):
+                 point_focal_alpha=0.25, point_empty_cls_weight=1.0, point_coord_norm="box_axis",
+                 point_coord_robust_c=0.0):
         """Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
@@ -183,6 +184,11 @@ class SetCriterion(nn.Module):
         self.point_focal_alpha = point_focal_alpha
         # Ni==0 实例的存在性损失权重（只作用于 cls_loss 的分子，不影响 denom）
         self.point_empty_cls_weight = point_empty_cls_weight
+        # 点坐标误差的归一化方式（内层代价与 L1 共用），见 _point_iso_scale
+        assert point_coord_norm in ("box_axis", "iso"), f"未知 POINT_COORD_NORM: {point_coord_norm}"
+        self.point_coord_norm = point_coord_norm
+        # 绝对坐标输出（分组 decoder 的小穗 token）的坐标误差稳健化常数 c，见 _point_coord_rho
+        self.point_coord_robust_c = point_coord_robust_c
 
     def loss_labels_ce(self, outputs, targets, indices, num_masks):
         """Classification loss (NLL)
@@ -323,13 +329,57 @@ class SetCriterion(nn.Module):
         del target_masks
         return losses
 
+    @staticmethod
+    def _pred_to_box_rel(pred, box_xy0, box_wh, abs_frame):
+        """把预测小穗点换到 GT 框相对系（与 gt_rel 同一坐标系）。
+        abs_frame=False（MLP 点头）：输出本来就是框相对坐标，原样返回；
+        abs_frame=True（分组 decoder 的小穗 token）：图像归一化绝对坐标 → (p - xy0) / wh，不 clamp。
+        Args:
+            pred:    [P, 2]
+            box_xy0: [2] GT 框左上角，图像归一化
+            box_wh:  [2] GT 框 (w, h)，图像归一化
+        """
+        if not abs_frame:
+            return pred
+        return (pred - box_xy0) / box_wh
+
+    def _point_coord_rho(self, abs_err, robust):
+        """逐轴坐标误差 → 损失。robust=False 或 c<=0：L1；否则 ρ(e) = c·log(1 + |e|/c)。
+        小穗 token 输出绝对坐标、在 GT 框系里算误差：开训时实例框还很差，匹配上的 token 可离 GT
+        几十个框宽（实测 L1 初值 57/层，基线 1.8），L1 对每个远点都给满额梯度，小穗分支会去追框级别的误差。
+        ρ 在 |e| << c 时 ≈ L1（c=1 时，|e|=0.05 处只差 2.5%），远处梯度 1/(1+|e|/c) 不为零但变弱。
+        """
+        c = self.point_coord_robust_c
+        if not robust or c <= 0:
+            return abs_err
+        return c * torch.log1p(abs_err / c)
+
+    def _point_iso_scale(self, box_wh, image_wh=None):
+        """POINT_COORD_NORM="iso" 时，框相对坐标换到各向同性空间的逐轴缩放因子；"box_axis" 时返回 None。
+        框相对坐标的 1 个单位在 x/y 上分别是 w/h 个像素；乘以 (w, h)/sqrt(w·h) 后两轴的
+        1 个单位都等于 sqrt(w·h) 个像素，即误差 = 像素误差 / sqrt(w·h)，两轴同权。
+        Args:
+            box_wh:   [2] GT 框 (w, h)，图像归一化
+            image_wh: [2] 图像像素 (W, H)，用于还原像素纵横比；LSJ 训练输入恒为 1024x1024，可不传
+        Returns:
+            [2] 或 None
+        """
+        if self.point_coord_norm != "iso":
+            return None
+        wh = box_wh.float()
+        if image_wh is not None:
+            wh = wh * image_wh.to(wh)
+        return wh / wh.prod().sqrt().clamp(min=1e-12)
+
     @torch.no_grad()
-    def _inner_point_match(self, pred_rel, pred_logit, gt_rel):
+    def _inner_point_match(self, pred_rel, pred_logit, gt_rel, iso_scale=None, robust=False):
         """逐实例内层匈牙利匹配：把 P 个预测点匹配到 Ni 个 GT 小穗。
         Args:
             pred_rel:   [P, 2]  预测点（框相对归一化坐标）
             pred_logit: [P, 1]  预测点存在性 logit
             gt_rel:     [Ni, 2] GT 小穗（框相对归一化坐标）
+            iso_scale:  [2] 或 None，_point_iso_scale 的返回值；非 None 时坐标代价在各向同性空间算
+            robust:     True 时坐标代价用 _point_coord_rho（与该输出的 L1 损失同一函数）
         Returns:
             (row_ind, col_ind): 匹配的预测点索引与 GT 索引（长度均为 min(P, Ni)=Ni）
         """
@@ -341,11 +391,17 @@ class SetCriterion(nn.Module):
         # AMP 下统一用 float32 计算代价，避免 half 精度的 cdist / log 问题
         pred_rel = pred_rel.float()
         gt_rel = gt_rel.float()
+        if iso_scale is not None:
+            pred_rel = pred_rel * iso_scale
+            gt_rel = gt_rel * iso_scale
         prob = pred_logit.float().sigmoid()               # [P,1]
         neg_cost = (1 - alpha) * (prob ** gamma) * (-(1 - prob + 1e-8).log())
         pos_cost = alpha * ((1 - prob) ** gamma) * (-(prob + 1e-8).log())
         cost_class = (pos_cost - neg_cost)                # [P,1]，与 GT 无关，作为每个预测点的偏置
-        cost_coord = torch.cdist(pred_rel, gt_rel, p=1)   # [P, Ni]
+        if robust and self.point_coord_robust_c > 0:
+            cost_coord = self._point_coord_rho((pred_rel[:, None] - gt_rel[None]).abs(), True).sum(-1)  # [P, Ni]
+        else:
+            cost_coord = torch.cdist(pred_rel, gt_rel, p=1)   # [P, Ni]
         C = self.point_cost_coord * cost_coord + self.point_cost_class * cost_class  # [P, Ni]
         C = C.cpu()
         row_ind, col_ind = linear_sum_assignment(C)
@@ -357,11 +413,16 @@ class SetCriterion(nn.Module):
         """逐实例小穗点损失：对每个外层匹配到的实例，做内层匈牙利匹配后计算
         点坐标 L1 损失 + 点存在性 focal 损失。
         - 点坐标采用"实例框相对归一化"[0,1]：用匹配到的 GT 框把 GT 小穗换算到框相对坐标。
+          POINT_COORD_NORM="iso" 时，误差（内层代价与 L1）再换到各向同性空间计算，见 _point_iso_scale。
+        - outputs['pred_point_abs']=True（分组 decoder 的小穗 token）：预测是图像归一化绝对坐标，
+          先换到 GT 框相对系，坐标误差用 _point_coord_rho（POINT_COORD_ROBUST_C>0 时有界增长）。
+          缺省 False：MLP 点头的框相对坐标，与原实现一致。
         - wheat 实例（无小穗，Ni=0）：无坐标损失，P 个点全部监督为不存在（背景）。
         """
         assert 'pred_point_coords' in outputs and 'pred_point_logits' in outputs
         pred_coords = outputs['pred_point_coords']   # [B, Q, P, 2]
         pred_logits = outputs['pred_point_logits']   # [B, Q, P, 1]
+        abs_frame = bool(outputs.get('pred_point_abs', False))
         device = pred_coords.device
         alpha, gamma = self.point_focal_alpha, 2.0
 
@@ -374,9 +435,10 @@ class SetCriterion(nn.Module):
                 continue
             boxes_b = targets[b]['boxes']      # [Ng, 4] cxcywh 图像归一化
             points_b = targets[b]['points']    # list[Tensor[Ni,2]] 图像归一化
+            image_wh = targets[b].get('image_wh')   # [2] 图像像素 (W, H)
             for q_i, g_j in zip(src_idx.tolist(), tgt_idx.tolist()):
                 # AMP 下预测为 half，GT 为 float32；统一转 float32 避免 dtype 不匹配
-                pred_rel = pred_coords[b, q_i].float()     # [P,2]
+                pred_c = pred_coords[b, q_i].float()       # [P,2]
                 pred_lg = pred_logits[b, q_i].float()      # [P,1]
                 gt_pts_img = points_b[g_j].to(device).float()   # [Ni,2] 图像归一化
                 Ni = gt_pts_img.shape[0]
@@ -386,20 +448,27 @@ class SetCriterion(nn.Module):
                 x0 = cx - bw / 2
                 y0 = cy - bh / 2
                 wh = torch.stack([bw, bh]).clamp(min=1e-6)
+                pred_rel = self._pred_to_box_rel(pred_c, torch.stack([x0, y0]), wh, abs_frame)  # [P,2] GT 框相对
                 if Ni > 0:
                     gt_rel = ((gt_pts_img - torch.stack([x0, y0])) / wh).clamp(0.0, 1.0)  # [Ni,2]
                 else:
                     gt_rel = gt_pts_img.new_zeros((0, 2))
 
-                row_ind, col_ind = self._inner_point_match(pred_rel, pred_lg, gt_rel)
+                iso_scale = self._point_iso_scale(wh, image_wh)
+                row_ind, col_ind = self._inner_point_match(pred_rel, pred_lg, gt_rel, iso_scale, robust=abs_frame)
 
                 # 存在性目标：匹配上的预测点为 1，其余为 0
                 tgt_exist = torch.zeros((self.num_spikelet_points, 1), device=device, dtype=pred_lg.dtype)
                 if row_ind.numel() > 0:
                     tgt_exist[row_ind] = 1.0
-                    # 坐标 L1 损失（仅匹配点）
-                    coord_loss = coord_loss + F.l1_loss(
-                        pred_rel[row_ind], gt_rel[col_ind], reduction='sum')
+                    # 坐标 L1 损失（仅匹配点），与内层代价同一个空间、同一个误差函数
+                    pred_m, gt_m = pred_rel[row_ind], gt_rel[col_ind]
+                    if iso_scale is not None:
+                        pred_m, gt_m = pred_m * iso_scale, gt_m * iso_scale
+                    if abs_frame and self.point_coord_robust_c > 0:
+                        coord_loss = coord_loss + self._point_coord_rho((pred_m - gt_m).abs(), True).sum()
+                    else:
+                        coord_loss = coord_loss + F.l1_loss(pred_m, gt_m, reduction='sum')
 
                 # 存在性 focal 损失（全部 P 个点）
                 prob = pred_lg.sigmoid()

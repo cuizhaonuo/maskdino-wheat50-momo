@@ -73,7 +73,12 @@ from data_register import wheat_data, maize_rice_data, xinxiang_data, gwhd2021_d
 
 
 # 小穗点头的参数名子串（decoder 中的 point_coord_embed / point_class_embed）。
-_POINT_HEAD_KEYS = ("point_coord_embed", "point_class_embed")
+# 其余是分组 decoder（POINT_GROUP_DECODER）的小穗分支，开关关着时不存在、匹配不到也无害。
+# 细化头同时挂在 predictor.point_delta_embed 与 predictor.decoder.pt_delta_embed 下
+# （同 bbox_embed 的写法），named_parameters 去重后报的是后者，所以两个名字都列上。
+_POINT_HEAD_KEYS = ("point_coord_embed", "point_class_embed",
+                    "point_slot_embed", "point_delta_embed", "point_exist_embed",
+                    "decoder.pt_layers", "decoder.pt_ref_head", "decoder.pt_delta_embed")
 
 
 def freeze_all_but_point_head(model, extra_keys=()):

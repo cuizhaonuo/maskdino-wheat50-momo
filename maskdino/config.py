@@ -92,6 +92,34 @@ def add_maskdino_config(cfg):
     # 推理时 instance_inference 按 pred_classes 门控，wheat 实例本就不输出小穗点，
     # 这部分监督只在误分类时才生效，故可降权。0.0 等价于「只对 wheat_2 算点损失」。
     cfg.MODEL.MaskDINO.POINT_EMPTY_CLS_WEIGHT = 1.0
+    # 点坐标误差（内层匹配代价与 L1 损失共用）的归一化方式：
+    # "box_axis" = 现状，框相对坐标按 (w, h) 分轴归一化。框长宽比实测 p50 2.3 / p90 3.7，
+    #              短轴 1 px 误差的权重是长轴的 2.3~3.7 倍，而小穗最挤的恰是沿轴方向
+    #              （相邻约 9.5 px，逼近 σ=8）。
+    # "iso"      = 各向同性：误差统一除以 sqrt(w·h)（像素纵横比还原后），两轴同权。
+    cfg.MODEL.MaskDINO.POINT_COORD_NORM = "box_axis"
+    # ---- GroupPose 式分组 decoder（mini/group-decoder）----
+    # True：每个匹配 query 挂 NUM_POINTS 个小穗 token，decoder 每层做「实例内 SA → 实例 token 走原层 →
+    # 小穗 token 的跨实例 SA / 可变形 cross-attn / FFN」；小穗点 = 各 token 自己的参考点逐层细化，
+    # 存在性由各 token 自己判别。现有 MLP 点头只保留为 interm 与 layer-0 的点预测，兼作初始参考点。
+    # 所有层的 pred_point_coords 变为图像归一化绝对坐标（criterion / 推理据此换算）。
+    # False：原 MLP 点头，模型逐位不变。
+    cfg.MODEL.MaskDINO.POINT_GROUP_DECODER = False
+    # 小穗 token 的跨实例 SA："slot" = 第 k 号 token 与其它实例的第 k 号交流（GroupPose 原样）；
+    # "none" = 不做（只经实例内 SA 间接获得跨实例信息）
+    cfg.MODEL.MaskDINO.POINT_ACROSS_ATTN = "slot"
+    # 小穗 token 的 FFN 宽度（实例 token 仍用 DIM_FEEDFORWARD）
+    cfg.MODEL.MaskDINO.POINT_DIM_FEEDFORWARD = 1024
+    # 实例 token 接收实例内 SA 的更新时乘一个零初始化的标量门：开训时实例路径与原模型一致
+    cfg.MODEL.MaskDINO.POINT_WITHIN_GATE = True
+    # 小穗 token 输出绝对坐标、在 GT 框系里算误差。开训时实例框还很差，匹配上的 token 可离 GT
+    # 几十个框宽（实测 L1 初值 57/层，基线 1.8）。L1 对每个远点都给满额梯度，小穗分支会去追这些
+    # 框级别的误差（开训时该分支梯度范数 L1 290 vs ρ 48；对共享主干的梯度两者都约 14，
+    # 远小于检测/mask 损失的 2400~3900，不存在「压过其它损失」）。
+    # >0 时这些输出的坐标误差（内层代价与损失）改用 ρ(e) = c·log(1 + |e|/c)：|e|<<c 时 ≈ L1
+    # （c=1、|e|=0.05 处差 2.5%），远处梯度 1/(1+|e|/c)，方向由已定位好的实例主导。
+    # 0 = 纯 L1。只作用于绝对坐标输出，layer-0 / interm 的 MLP 点头不受影响。
+    cfg.MODEL.MaskDINO.POINT_COORD_ROBUST_C = 0.0
     # True = 存在性头 point_class_embed 用 3 层 MLP（与坐标头 point_coord_embed 对齐），
     # False = 保持单层 nn.Linear。点头参数 12,850 -> 144,434。
     # 【口径】08-25 在 overfit10 上三向同时改善，但 08-26 的 val 检验判定 mF1 优势是记忆

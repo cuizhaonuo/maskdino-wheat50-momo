@@ -54,6 +54,7 @@ class MaskDINO(nn.Module):
         transform_eval: bool = False,
         semantic_ce_loss: bool = False,
         point_threshold: float = 0.35,
+        point_abs_coords: bool = False,
     ):
         """
         Args:
@@ -111,6 +112,8 @@ class MaskDINO(nn.Module):
         # 小穗点推理：存在性阈值 + 带小穗的类别（wheat_2 的连续 id=1，只有该类输出点）
         self.point_threshold = point_threshold
         self.spikelet_class_id = 1
+        # 分组 decoder（POINT_GROUP_DECODER）的小穗点是图像归一化绝对坐标，不再经预测框换算
+        self.point_abs_coords = point_abs_coords
 
         if not self.semantic_on:
             assert self.sem_seg_postprocess_before_inference
@@ -199,6 +202,8 @@ class MaskDINO(nn.Module):
             point_cost_class=cfg.MODEL.MaskDINO.COST_POINT_CLASS_WEIGHT,
             point_focal_alpha=cfg.MODEL.MaskDINO.POINT_FOCAL_ALPHA,
             point_empty_cls_weight=cfg.MODEL.MaskDINO.POINT_EMPTY_CLS_WEIGHT,
+            point_coord_norm=cfg.MODEL.MaskDINO.POINT_COORD_NORM,
+            point_coord_robust_c=cfg.MODEL.MaskDINO.POINT_COORD_ROBUST_C,
         )
 
         return {
@@ -228,6 +233,7 @@ class MaskDINO(nn.Module):
             "pano_temp": cfg.MODEL.MaskDINO.TEST.PANO_TEMPERATURE,
             "semantic_ce_loss": cfg.MODEL.MaskDINO.TEST.SEMANTIC_ON and cfg.MODEL.MaskDINO.SEMANTIC_CE_LOSS and not cfg.MODEL.MaskDINO.TEST.PANOPTIC_ON,
             "point_threshold": cfg.MODEL.MaskDINO.TEST.POINT_THRESHOLD,
+            "point_abs_coords": cfg.MODEL.MaskDINO.POINT_GROUP_DECODER,
         }
 
     @property
@@ -353,6 +359,9 @@ class MaskDINO(nn.Module):
                     height = new_size[0]/image_size[0]*height
                     width = new_size[1]/image_size[1]*width
                     mask_box_result = self.box_postprocess(mask_box_result, height, width)
+                    if self.point_abs_coords:
+                        # 分组 decoder 的小穗点与框同为 padded 图像归一化坐标，用同一套缩放换到原图像素
+                        point_coord_result = point_coord_result * point_coord_result.new_tensor([width, height])
 
                     instance_r = retry_if_cuda_oom(self.instance_inference)(mask_cls_result, mask_pred_result, mask_box_result, point_coord_result, point_logit_result)
                     processed_results[-1]["instances"] = instance_r
@@ -379,6 +388,8 @@ class MaskDINO(nn.Module):
                     "masks": padded_masks,
                     "boxes":box_ops.box_xyxy_to_cxcywh(targets_per_image.gt_boxes.tensor)/image_size_xyxy,
                     "points": gt_points,
+                    # 图像像素尺寸 (W, H)：POINT_COORD_NORM="iso" 用它还原框的像素纵横比
+                    "image_wh": wh,
                 }
             )
         return new_targets
@@ -403,6 +414,8 @@ class MaskDINO(nn.Module):
                     "masks": padded_masks,
                     "boxes": box_ops.box_xyxy_to_cxcywh(targets_per_image.gt_boxes.tensor) / image_size_xyxy,
                     "points": gt_points,
+                    # 图像像素尺寸 (W, H)：POINT_COORD_NORM="iso" 用它还原框的像素纵横比
+                    "image_wh": wh,
                 }
             )
         return new_targets
@@ -500,7 +513,7 @@ class MaskDINO(nn.Module):
         mask_pred = mask_pred[topk_indices]
         # 同步按 topk 选出每个实例的小穗点预测
         if point_coords is not None:
-            point_coords = point_coords[topk_indices]   # [K, P, 2] 框相对 [0,1]
+            point_coords = point_coords[topk_indices]   # [K, P, 2] 框相对 [0,1]（分组 decoder 下为像素）
             point_logits = point_logits[topk_indices]   # [K, P, 1]
         # if this is panoptic segmentation, we only keep the "thing" classes
         if self.panoptic_on:
@@ -538,13 +551,16 @@ class MaskDINO(nn.Module):
             boxes_xyxy = mask_box_result  # [K, 4] 像素 xyxy
             for k in range(len(result)):
                 if int(labels_per_image[k].item()) == self.spikelet_class_id:
-                    x0, y0, x1, y1 = boxes_xyxy[k]
-                    bw = (x1 - x0).clamp(min=0)
-                    bh = (y1 - y0).clamp(min=0)
                     score_k = point_logits[k].sigmoid().squeeze(-1)   # [P]
                     keep_pt = score_k > self.point_threshold
-                    rel = point_coords[k][keep_pt]                    # [Ki, 2] 框相对
-                    xy = torch.stack([x0, y0]) + rel * torch.stack([bw, bh])  # [Ki, 2] 像素
+                    if self.point_abs_coords:
+                        xy = point_coords[k][keep_pt]                 # [Ki, 2] 已是像素（见 forward）
+                    else:
+                        x0, y0, x1, y1 = boxes_xyxy[k]
+                        bw = (x1 - x0).clamp(min=0)
+                        bh = (y1 - y0).clamp(min=0)
+                        rel = point_coords[k][keep_pt]                # [Ki, 2] 框相对
+                        xy = torch.stack([x0, y0]) + rel * torch.stack([bw, bh])  # [Ki, 2] 像素
                     spikelet_points.append(xy)
                     spikelet_counts.append(int(keep_pt.sum().item()))
                 else:
