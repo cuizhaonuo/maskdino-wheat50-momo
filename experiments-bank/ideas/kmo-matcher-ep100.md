@@ -1,7 +1,13 @@
 # 想法：KMO 内层点匹配在 100 epoch 下复核
 
-状态：**待验证** ｜ 提出 2026-09-24 ｜ 分支 `mini/kmo-matcher-ep100`（从 `mini/kmo-matcher` 拉出；
-100 epoch 的 schedule 直接写在本分支配置里，**没有合并 `mini/ep100`**）
+状态：**待验证** ｜ 提出 2026-09-24 ｜ 分支 `mini/kmo-matcher-ep100`（从 `mini/baseline`@`0f71161` 开出，
+带上 `mini/kmo-matcher` 的 KMO 实现与 50 epoch 结果；100 epoch 的 schedule 直接写在本分支配置里）
+
+> 分支来源（2026-09-24 补）：本分支最初从 `mini/kmo-matcher`（挂在 `1ffe75f`）拉出，
+> `output_v2/exp-0924-mini-kmo-matcher-ep100` 于 11:22 从 `1a9a3f3` 启动。run 开跑后，经用户批准，
+> 把 `f3ced48` / `512f281` / `1a9a3f3` 重放到 `mini/baseline`@`0f71161` 上（提交信息带 `cherry picked from` 标注），
+> 与其余 `mini/*-ep100` arm 同源。移动前后，代码与 `wheat_joint_single_stage_mini_kmo_ep100.yaml` 逐字相同，
+> 只多了 `mini/baseline` 带来的 3 篇文档和 `wheat_joint_single_stage_mini_ep100.yaml`，因此该 run 的结果仍对应本分支的代码。
 
 ## 动机
 
