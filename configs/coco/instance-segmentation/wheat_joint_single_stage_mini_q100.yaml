@@ -1,7 +1,7 @@
 # ============================================================================
 # 单阶段联合训练 · 500 图小集 · 实例 query 300 -> 100（mini/q100，E2）
 #   预注册：experiments-bank/ideas/mini-q100.md
-#   对照：wheat_joint_single_stage_mini_ep100.yaml（mini/baseline = mini/ep100，output_v2/exp-0923-mini-ep100）
+#   对照：wheat_joint_single_stage_mini_ep100.yaml（mini/baseline@0f71161，100 epoch，output_v2/exp-0923-mini-ep100）
 #
 # 目的：GroupPose 式分组 decoder（mini/group-decoder，E3）按 Ni=100 设计，每个实例 query 挂 30 个
 # 小穗 token。先单独量「query 从 300 砍到 100」本身的检测代价，决定 E3 走 Ni=100，
@@ -19,7 +19,7 @@
 #     --config-file configs/coco/instance-segmentation/wheat_joint_single_stage_mini_q100.yaml \
 #     OUTPUT_DIR /public/home/zncui/pycharm_project/maskdino-wheat50/output_v2/<run-name>
 # 【100 epoch 版】_BASE_ 改为 wheat_joint_single_stage_mini_ep100.yaml（mini/baseline@0f71161），
-#   schedule 全部继承自它；50 epoch 版见 mini/q100 分支。其余与 50 epoch 版逐字相同。
+#   schedule 全部继承自它；50 epoch 版的原提交由 tag archive/mini-q100-ep50 保留。其余与 50 epoch 版逐字相同。
 # ============================================================================
 _BASE_: wheat_joint_single_stage_mini_ep100.yaml
 
