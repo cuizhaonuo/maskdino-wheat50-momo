@@ -1,0 +1,26 @@
+# ============================================================================
+# 单阶段联合训练 · 500 图小集 · 实例 query 300 -> 100（mini/q100，E2）
+#   预注册：experiments-bank/ideas/mini-q100.md
+#   对照：wheat_joint_single_stage_mini.yaml（mini/baseline，output_v2/exp-0922-single-stage-mini）
+#
+# 目的：GroupPose 式分组 decoder（mini/group-decoder，E3）按 Ni=100 设计，每个实例 query 挂 30 个
+# 小穗 token。先单独量「query 从 300 砍到 100」本身的检测代价，决定 E3 走 Ni=100，
+# 还是走「300 个实例 query 里只给前 100 个挂小穗组」的备选。
+#
+# 数据侧的风险（实测）：mini train 每图实例 均 55.4 / p99 102 / max 121，7/500 张图 GT>100
+# （这些图必然漏检）；val 每图 max 88。query/GT 比从约 5.4 降到 1.8，两阶段 top-100 提案要覆盖
+# 最多 121 个目标。
+#
+# 与父配置的差异【只有 NUM_OBJECT_QUERIES 一处】。DN_NUM（100）与 TEST.DETECTIONS_PER_IMAGE（100）
+# 不变：前者按 GT 数分组、与 query 数无关；后者是每图输出上限，基线同样是 100。
+#
+# 用法：
+#   python train_net.py --num-gpus 1 \
+#     --config-file configs/coco/instance-segmentation/wheat_joint_single_stage_mini_q100.yaml \
+#     OUTPUT_DIR /public/home/zncui/pycharm_project/maskdino-wheat50/output_v2/<run-name>
+# ============================================================================
+_BASE_: wheat_joint_single_stage_mini.yaml
+
+MODEL:
+  MaskDINO:
+    NUM_OBJECT_QUERIES: 100
