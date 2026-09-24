@@ -3,6 +3,11 @@
 状态：**待验证** ｜ 提出 2026-09-24 ｜ 分支 `mini/kmo-matcher-ep100`（从 `mini/kmo-matcher` 拉出；
 100 epoch 的 schedule 直接写在本分支配置里，**没有合并 `mini/ep100`**）
 
+> 拓扑说明（2026-09-24 补）：此后 `mini/baseline` 已快进到 `mini/ep100`（0f71161），其余 arm 的 100 epoch 版
+> （`mini/{group-decoder,iso-norm,q100}-ep100`）都从它开出。本分支仍挂在 1ffe75f 上，没有重开，因为 run 已经在跑。
+> 解析后的 cfg 与 `output_v2/exp-0923-mini-ep100/config.yaml` 逐项比对，只差 `POINT_KMO` 一项，
+> 所以数值上与其他 `-ep100` arm 处于同一基线。
+
 ## 动机
 
 [kmo-matcher](kmo-matcher.md) 在 50 epoch 下的结果：`matched_F1@8` 峰值 / 末值为 0.5962 / 0.5954，
