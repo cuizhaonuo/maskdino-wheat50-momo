@@ -1,0 +1,23 @@
+# ============================================================================
+# 单阶段联合训练 · 500 图小集 · 小穗点误差改用各向同性归一化（mini/iso-norm，E1）
+#   预注册：experiments-bank/ideas/iso-point-norm.md
+#   对照：wheat_joint_single_stage_mini.yaml（mini/baseline，output_v2/exp-0922-single-stage-mini）
+#
+# 与父配置的差异【只有 POINT_COORD_NORM 一处】：
+#   box_axis（现状）：误差 = 框相对坐标差，x 除以 w、y 除以 h —— 两轴权重之比 = 框长宽比
+#                     （wheat_2 实测 p50 2.3 / p90 3.7），沿穗轴方向的误差被压得最轻；
+#   iso：             误差 = 像素误差 / sqrt(w·h)，两轴同权。
+# 内层匹配代价与坐标 L1 损失同时切换（两者始终在同一空间）。量级与原来相近（sqrt(w·h) 是 w、h 的
+# 几何平均），所以 POINT_COORD_WEIGHT / COST_POINT_COORD_WEIGHT 不动。
+# 模型结构、数据、schedule、其余旋钮一律继承 —— 与 mini/baseline 比较时「误差怎么归一化」是唯一变量。
+#
+# 用法：
+#   python train_net.py --num-gpus 1 \
+#     --config-file configs/coco/instance-segmentation/wheat_joint_single_stage_mini_iso.yaml \
+#     OUTPUT_DIR /public/home/zncui/pycharm_project/maskdino-wheat50/output_v2/<run-name>
+# ============================================================================
+_BASE_: wheat_joint_single_stage_mini.yaml
+
+MODEL:
+  MaskDINO:
+    POINT_COORD_NORM: "iso"

@@ -92,6 +92,12 @@ def add_maskdino_config(cfg):
     # 推理时 instance_inference 按 pred_classes 门控，wheat 实例本就不输出小穗点，
     # 这部分监督只在误分类时才生效，故可降权。0.0 等价于「只对 wheat_2 算点损失」。
     cfg.MODEL.MaskDINO.POINT_EMPTY_CLS_WEIGHT = 1.0
+    # 点坐标误差（内层匹配代价与 L1 损失共用）的归一化方式：
+    # "box_axis" = 现状，框相对坐标按 (w, h) 分轴归一化。框长宽比实测 p50 2.3 / p90 3.7，
+    #              短轴 1 px 误差的权重是长轴的 2.3~3.7 倍，而小穗最挤的恰是沿轴方向
+    #              （相邻约 9.5 px，逼近 σ=8）。
+    # "iso"      = 各向同性：误差统一除以 sqrt(w·h)（像素纵横比还原后），两轴同权。
+    cfg.MODEL.MaskDINO.POINT_COORD_NORM = "box_axis"
     # True = 存在性头 point_class_embed 用 3 层 MLP（与坐标头 point_coord_embed 对齐），
     # False = 保持单层 nn.Linear。点头参数 12,850 -> 144,434。
     # 【口径】08-25 在 overfit10 上三向同时改善，但 08-26 的 val 检验判定 mF1 优势是记忆

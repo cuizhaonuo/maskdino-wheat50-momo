@@ -139,7 +139,8 @@ def _collect_items(criterion, pred_coords, pred_pt_logits, targets, indices, b, 
             n_clamped = 0
         n_clamped_total += n_clamped
 
-        row_ind, col_ind = criterion._inner_point_match(pred_rel, pred_lg, gt_rel)
+        iso_scale = criterion._point_iso_scale(wh, targets[b].get("image_wh"))
+        row_ind, col_ind = criterion._inner_point_match(pred_rel, pred_lg, gt_rel, iso_scale)
 
         # 框相对 -> 原图像素
         bx0, by0 = float(x0) * W, float(y0) * H
