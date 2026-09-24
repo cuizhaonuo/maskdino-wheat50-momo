@@ -103,7 +103,7 @@ def _grid_shape(n):
 # --------------------------------------------------------------------------
 # 数据收集：两张图共用，内层匹配只做一遍
 # --------------------------------------------------------------------------
-def _collect_items(criterion, pred_coords, pred_pt_logits, targets, indices, b, W, H, denom):
+def _collect_items(criterion, pred_coords, pred_pt_logits, targets, indices, b, W, H, denom, abs_frame=False):
     """整理第 b 张图每个 GT 实例的绘图数据。
 
     返回 (items, n_clamped_total)。items 已按"有小穗点优先、点多优先"排好序。
@@ -130,6 +130,8 @@ def _collect_items(criterion, pred_coords, pred_pt_logits, targets, indices, b, 
         cx, cy, bw, bh = boxes[g_j].to(pred_rel.device)
         x0, y0 = cx - bw / 2, cy - bh / 2
         wh = torch.stack([bw, bh]).clamp(min=1e-6)
+        # 分组 decoder 输出绝对坐标，与 loss 一样先换到 GT 框相对系
+        pred_rel = criterion._pred_to_box_rel(pred_rel.float(), torch.stack([x0, y0]), wh, abs_frame)
         if Ni > 0:
             gt_rel_raw = (gt_pts_img - torch.stack([x0, y0])) / wh
             gt_rel = gt_rel_raw.clamp(0.0, 1.0)               # loss 用的就是 clamp 后的
@@ -139,7 +141,8 @@ def _collect_items(criterion, pred_coords, pred_pt_logits, targets, indices, b, 
             n_clamped = 0
         n_clamped_total += n_clamped
 
-        row_ind, col_ind = criterion._inner_point_match(pred_rel, pred_lg, gt_rel)
+        iso_scale = criterion._point_iso_scale(wh, targets[b].get("image_wh"))
+        row_ind, col_ind = criterion._inner_point_match(pred_rel, pred_lg, gt_rel, iso_scale, robust=abs_frame)
 
         # 框相对 -> 原图像素
         bx0, by0 = float(x0) * W, float(y0) * H
@@ -528,7 +531,8 @@ def visualize_point_match(criterion, outputs, targets, indices, batched_inputs=N
         H, W = img.shape[:2]
 
         items, n_clamped = _collect_items(criterion, pred_coords, pred_pt_logits,
-                                          targets, indices, b, W, H, denom)
+                                          targets, indices, b, W, H, denom,
+                                          abs_frame=bool(outputs.get("pred_point_abs", False)))
         if not items:
             continue
         shown = items[:MAX_INSTANCES]

@@ -1,0 +1,40 @@
+# ============================================================================
+# 单阶段联合训练 · 500 图小集 · GroupPose 式分组 decoder（mini/group-decoder，E3）
+#   来源：Liu et al., "Group Pose: A Simple Baseline for End-to-End Multi-person Pose Estimation"（ICCV 2023）
+#   预注册：experiments-bank/ideas/group-decoder.md
+#   对照：wheat_joint_single_stage_mini_q100.yaml（mini/q100，E2：同为 100 个实例 query、原 MLP 点头）
+#
+# 结构：每个匹配 query（Ni=100）挂 NUM_POINTS=30 个小穗 token（Ki=30）。decoder 每层：
+#   实例内 SA（1+30 个 token）→ 实例 token 走原层（跨实例 SA / 4-D 框 cross-attn / FFN，一行不改）
+#   → 小穗 token 的同 slot 跨实例 SA / 2-D 点 cross-attn / FFN → 小穗参考点逐层细化。
+#   小穗点 = 各 token 的参考点；存在性由各 token 自己判别。原 MLP 点头只保留为 interm 与 layer-0
+#   的点预测，兼作第 1 层的初始参考点。DN query 不挂小穗组。
+#
+# 与 E2 的差异（四处，绑在一起作为「分组 decoder 方案」）：
+#   1) POINT_GROUP_DECODER: True（结构本身，及随之而来的逐 token 存在性）
+#   2) POINT_COORD_NORM: iso（各向同性误差；其单独作用由 E1 mini/iso-norm 量）
+#   3) NUM_POINTS: 25 -> 30（每穗 max 31、p99 22；按 Ki=30 设计）
+#   4) POINT_COORD_ROBUST_C: 1.0 —— 小穗 token 输出绝对坐标、在 GT 框系里算误差，开训时实例框很差，
+#      匹配上的 token 离 GT 几十个框宽（L1 初值 57/层，基线 1.8），L1 让小穗分支去追框级别的误差；
+#      ρ(e)=c·log(1+|e|/c) 远处梯度变弱、收敛区（|e|≈0.05）与 L1 只差 2.5%。只作用于小穗 token 的
+#      输出，layer-0 / interm 的 MLP 点头仍按框相对坐标、纯 L1 监督（与基线口径相同）。
+# POINT_EMPTY_CLS_WEIGHT 仍为 0.1（与基线同），改 0 是后续 E5 的消融项。
+#
+# 用法：
+#   python train_net.py --num-gpus 1 \
+#     --config-file configs/coco/instance-segmentation/wheat_joint_single_stage_mini_group.yaml \
+#     OUTPUT_DIR /public/home/zncui/pycharm_project/maskdino-wheat50/output_v2/<run-name>
+# 消融（E4，点 token 不做跨实例 SA）：追加 MODEL.MaskDINO.POINT_ACROSS_ATTN none
+# ============================================================================
+_BASE_: wheat_joint_single_stage_mini.yaml
+
+MODEL:
+  MaskDINO:
+    NUM_OBJECT_QUERIES: 100
+    NUM_POINTS: 30
+    POINT_GROUP_DECODER: True
+    POINT_ACROSS_ATTN: "slot"
+    POINT_DIM_FEEDFORWARD: 1024
+    POINT_WITHIN_GATE: True
+    POINT_COORD_NORM: "iso"
+    POINT_COORD_ROBUST_C: 1.0

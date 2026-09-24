@@ -15,8 +15,11 @@ from detectron2.layers import Conv2d
 from detectron2.utils.registry import Registry
 from detectron2.structures import BitMasks
 
-from .dino_decoder import TransformerDecoder, DeformableTransformerDecoderLayer
-from ...utils.utils import MLP, gen_encoder_output_proposals, inverse_sigmoid
+import copy
+
+from .dino_decoder import TransformerDecoder, DeformableTransformerDecoderLayer, PointGroupLayer
+from ..pixel_decoder.ops.modules import MSDeformAttn
+from ...utils.utils import MLP, gen_encoder_output_proposals, inverse_sigmoid, _get_clones
 from ...utils import box_ops
 
 
@@ -68,6 +71,10 @@ class MaskDINODecoder(nn.Module):
             query_dim: int = 4,
             dec_layer_share: bool = False,
             semantic_ce_loss: bool = False,
+            point_group: bool = False,
+            point_across_attn: str = "slot",
+            point_dim_feedforward: int = 1024,
+            point_within_gate: bool = True,
     ):
         """
         NOTE: this interface is experimental.
@@ -171,6 +178,38 @@ class MaskDINODecoder(nn.Module):
         self.bbox_embed = nn.ModuleList(box_embed_layerlist)
         self.decoder.bbox_embed = self.bbox_embed
 
+        # ===== GroupPose 式分组 decoder（POINT_GROUP_DECODER）=====
+        # 每个匹配 query 挂 num_points 个小穗 token（DN query 不挂）。全部模块建在 __init__ 末尾，
+        # 不打乱已有模块的初始化顺序；开关关着时一个参数都不建，模型与原来逐位一致。
+        self.point_group = point_group
+        if point_group:
+            assert two_stage and initial_pred, \
+                "分组 decoder 用 layer-0 的 MLP 点预测初始化小穗参考点，需要 TWO_STAGE 与 INITIAL_PRED"
+            # 小穗 token 的内容 = slot embedding + 所属实例 token 的内容（detach），同 GroupPose
+            self.point_slot_embed = nn.Embedding(num_points, hidden_dim)
+            pt_layer = PointGroupLayer(hidden_dim, point_dim_feedforward, dropout, activation,
+                                       self.num_feature_levels, nhead, dec_n_points,
+                                       across=point_across_attn, within_gate=point_within_gate)
+            self.decoder.pt_layers = _get_clones(pt_layer, self.num_layers)
+            # 小穗 token 的 query pos：2-D 点的 sine 编码 → MLP（GroupPose 的 half_pose_ref_point_head）
+            self.decoder.pt_ref_head = MLP(hidden_dim, hidden_dim, hidden_dim, 2)
+            # 初始化与 TransformerDecoder._reset_parameters 相同
+            for p in list(self.decoder.pt_layers.parameters()) + list(self.decoder.pt_ref_head.parameters()):
+                if p.dim() > 1:
+                    nn.init.xavier_uniform_(p)
+            for m in self.decoder.pt_layers.modules():
+                if isinstance(m, MSDeformAttn):
+                    m._reset_parameters()
+            # 每层独立的小穗参考点细化头（GroupPose 的 pose_embed[l]），末层零初始化：开训时参考点不动
+            _pt_delta = MLP(hidden_dim, hidden_dim, 2, 3)
+            nn.init.constant_(_pt_delta.layers[-1].weight.data, 0)
+            nn.init.constant_(_pt_delta.layers[-1].bias.data, 0)
+            self.point_delta_embed = nn.ModuleList([copy.deepcopy(_pt_delta) for _ in range(self.num_layers)])
+            self.decoder.pt_delta_embed = self.point_delta_embed
+            # 每个小穗 token 1 个存在性 logit，各层共享（同 class_embed）
+            self.point_exist_embed = (MLP(hidden_dim, hidden_dim, 1, 3)
+                                      if point_class_mlp else nn.Linear(hidden_dim, 1))
+
 
     @classmethod
     def from_config(cls, cfg, in_channels, mask_classification):
@@ -198,6 +237,11 @@ class MaskDINODecoder(nn.Module):
         ret["learn_tgt"] = cfg.MODEL.MaskDINO.LEARN_TGT
         ret["total_num_feature_levels"] = cfg.MODEL.SEM_SEG_HEAD.TOTAL_NUM_FEATURE_LEVELS
         ret["semantic_ce_loss"] = cfg.MODEL.MaskDINO.TEST.SEMANTIC_ON and cfg.MODEL.MaskDINO.SEMANTIC_CE_LOSS and ~cfg.MODEL.MaskDINO.TEST.PANOPTIC_ON
+        # 分组 decoder
+        ret["point_group"] = cfg.MODEL.MaskDINO.POINT_GROUP_DECODER
+        ret["point_across_attn"] = cfg.MODEL.MaskDINO.POINT_ACROSS_ATTN
+        ret["point_dim_feedforward"] = cfg.MODEL.MaskDINO.POINT_DIM_FEEDFORWARD
+        ret["point_within_gate"] = cfg.MODEL.MaskDINO.POINT_WITHIN_GATE
 
         return ret
 
@@ -341,7 +385,8 @@ class MaskDINODecoder(nn.Module):
             output_known_mask = outputs_mask[:, :, :pad_size, :]
             outputs_mask = outputs_mask[:, :, pad_size:, :]
         # 点预测与 mask 一样在 query 维（dim=2）切分；dn 部分不参与点损失，直接丢弃。
-        if outputs_point_coord is not None:
+        # 分组 decoder 的点输出本来就只覆盖匹配 query（DN query 不挂小穗组），不用再切。
+        if outputs_point_coord is not None and not self.point_group:
             outputs_point_coord = outputs_point_coord[:, :, pad_size:]
             outputs_point_logit = outputs_point_logit[:, :, pad_size:]
         out = {'pred_logits': output_known_class[-1], 'pred_boxes': output_known_coord[-1],'pred_masks': output_known_mask[-1]}
@@ -494,6 +539,18 @@ class MaskDINODecoder(nn.Module):
             # debug: 查看推理时每一层的预测结果
             # outputs_class, outputs_mask = self.forward_prediction_heads(tgt.transpose(0, 1), mask_features, pred_mask=True)
 
+            if self.point_group:
+                # layer-0 的 MLP 点预测照旧是框相对坐标、照旧按基线口径监督（见 criterion 的 pred_point_abs）；
+                # 用初始框（mask2box，detach）换成绝对坐标后，作为第 1 层小穗 token 的初始参考点。
+                # 分组 decoder 的点输出只覆盖匹配 query，这里一并去掉 DN 段。
+                group_offset = mask_dict['pad_size'] if mask_dict is not None else 0
+                outputs_point_coord = outputs_point_coord[:, group_offset:]
+                outputs_point_logit = outputs_point_logit[:, group_offset:]
+                pt_refpoints = self._point_rel_to_abs(
+                    outputs_point_coord, refpoint_embed.sigmoid()).detach()           # bs, nq, K, 2
+                pt_tgt = self.point_slot_embed.weight[None, None] + \
+                    tgt[:, group_offset:, None, :].detach()                            # bs, nq, K, d
+
             predictions_class.append(outputs_class)
             predictions_mask.append(outputs_mask)
             predictions_point_coord.append(outputs_point_coord)
@@ -522,7 +579,11 @@ class MaskDINODecoder(nn.Module):
         '''
         # hs <-- intermediate, references <-- ref_points
         # hs List 9, references List (9+1=10)
-        hs, references = self.decoder(
+        group_kwargs = {}
+        if self.point_group:
+            group_kwargs = dict(pt_tgt=pt_tgt.transpose(0, 1), pt_refpoints=pt_refpoints.transpose(0, 1),
+                                group_offset=group_offset)
+        dec_out = self.decoder(
             tgt=tgt.transpose(0, 1),
             memory=src_flatten.transpose(0, 1),
             memory_key_padding_mask=mask_flatten,
@@ -531,8 +592,13 @@ class MaskDINODecoder(nn.Module):
             level_start_index=level_start_index,
             spatial_shapes=spatial_shapes,
             valid_ratios=valid_ratios,
-            tgt_mask=tgt_mask
+            tgt_mask=tgt_mask,
+            **group_kwargs
         )
+        hs, references = dec_out[0], dec_out[1]
+        if self.point_group:
+            # pt_hs: 每层 (bs, nq, K, d)；pt_references: 每层细化后的小穗点 (bs, nq, K, 2)，未 detach
+            pt_hs, pt_references = dec_out[2], dec_out[3]
         # 为所有 decoder 层的输出，添加预测头，得到每一层的分类和掩码预测，所有的特征层共用一个预测头，也就是说参数是共享的
         # PS：类别和掩码预测头的参数也是共享的，但是预测框的参数不共享
         # 所有的 hs 都是包含了 denoising query 的
@@ -543,7 +609,12 @@ class MaskDINODecoder(nn.Module):
 
             # 暂时注释
             outputs_class, outputs_mask, outputs_point_coord, outputs_point_logit = \
-                self.forward_prediction_heads(output.transpose(0, 1), mask_features, self.training or (i == len(hs)-1))
+                self.forward_prediction_heads(output.transpose(0, 1), mask_features, self.training or (i == len(hs)-1),
+                                              pred_points=not self.point_group)
+            if self.point_group:
+                # 小穗点 = 该层细化后的小穗 token 参考点；存在性由各 token 自己判别
+                outputs_point_coord = pt_references[i]
+                outputs_point_logit = self.point_exist_embed(pt_hs[i])
 
             # debug: 查看推理时每一层的预测结果
             # outputs_class, outputs_mask = self.forward_prediction_heads(output.transpose(0, 1), mask_features, pred_mask=True)
@@ -611,9 +682,17 @@ class MaskDINODecoder(nn.Module):
         }
         if self.two_stage:
             out['interm_outputs'] = interm_outputs
+        if self.point_group:
+            # 小穗点的坐标系（criterion 据此逐输出换算）：小穗 token（第 1 层起）输出图像归一化绝对坐标；
+            # layer-0（aux_outputs[0]）与 interm 仍是 MLP 点头的框相对坐标
+            out['pred_point_abs'] = True
+            for i, aux in enumerate(out['aux_outputs']):
+                aux['pred_point_abs'] = i > 0
+            if self.two_stage:
+                out['interm_outputs']['pred_point_abs'] = False
         return out, mask_dict
 
-    def forward_prediction_heads(self, output, mask_features, pred_mask=True):
+    def forward_prediction_heads(self, output, mask_features, pred_mask=True, pred_points=True):
         decoder_output = self.decoder_norm(output)
         decoder_output = decoder_output.transpose(0, 1)
         outputs_class = self.class_embed(decoder_output)
@@ -624,11 +703,25 @@ class MaskDINODecoder(nn.Module):
 
         # 小穗点头：每个 query 输出 num_points 个点的框相对坐标与存在性 logit。
         # 计算量很小，每一层都算，以支持逐层深监督（aux loss）。
-        b, q = decoder_output.shape[:2]
-        outputs_point_coord = self.point_coord_embed(decoder_output).reshape(b, q, self.num_points, 2).sigmoid()
-        outputs_point_logit = self.point_class_embed(decoder_output).reshape(b, q, self.num_points, 1)
+        # 分组 decoder 下只在 interm 与 layer-0 用它（decoder 各层的点来自小穗 token），pred_points=False 跳过。
+        outputs_point_coord = outputs_point_logit = None
+        if pred_points:
+            b, q = decoder_output.shape[:2]
+            outputs_point_coord = self.point_coord_embed(decoder_output).reshape(b, q, self.num_points, 2).sigmoid()
+            outputs_point_logit = self.point_class_embed(decoder_output).reshape(b, q, self.num_points, 1)
 
         return outputs_class, outputs_mask, outputs_point_coord, outputs_point_logit
+
+    @staticmethod
+    def _point_rel_to_abs(rel, boxes):
+        """框相对 [0,1] 坐标 → 图像归一化绝对坐标。
+        Args:
+            rel:   (bs, nq, K, 2)
+            boxes: (bs, nq, 4) cxcywh，图像归一化
+        """
+        wh = boxes[..., 2:]
+        xy0 = boxes[..., :2] - wh / 2
+        return xy0[:, :, None] + rel * wh[:, :, None]
 
     @torch.jit.unused
     def _set_aux_loss(self, outputs_class, outputs_seg_masks, out_boxes=None,
