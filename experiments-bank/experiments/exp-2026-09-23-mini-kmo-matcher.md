@@ -5,7 +5,7 @@
 | 验证想法 | [kmo-matcher](../ideas/kmo-matcher.md)。**已预注册**：判据随 commit `f3ced48` 在训练启动前提交 |
 | 对照 | mini/baseline（`output_v2/exp-0922-single-stage-mini`）：同配置、同数据、同 schedule、同样从 ImageNet 起步，**唯一差别是 `POINT_KMO`** |
 | 配置 | `configs/coco/instance-segmentation/wheat_joint_single_stage_mini_kmo.yaml`（`_BASE_` 为 mini 配置，只打开 `POINT_KMO`） |
-| 分支 | `mini/kmo-matcher` @ `f3ced48`，worktree 在 `.claude/worktrees/mini-kmo-matcher` |
+| 分支 | `mini/kmo-matcher` @ `f3ced48`，worktree 在 `.claude/worktrees/mini-kmo-matcher`。该 50 epoch 分支与 worktree 已于 2026-09-24 删除，原提交由 tag `archive/mini-kmo-matcher-pre-move` 保留；现名 `mini/kmo-matcher` 的是 100 epoch 复跑分支，`f3ced48` 在其上的重放提交是 `c8525dc` |
 | 输出 | `output_v2/exp-0923-mini-kmo-matcher`；M1/M2 诊断在其下的 `kmo_diag/` |
 | 训练 | 与基线相同：500 图 / bs4 / 6250 iter = 50 epoch / BASE_LR 1e-4 / WarmupCosineLR / warmup 250 / 无冻结；另加 `loss_point_knn` ×5（含 `_0`~`_8` 与 `_interm`） |
 | 初始权重 | ImageNet R-50（同基线）；`point_knn_embed` 随机初始化 |
@@ -15,10 +15,10 @@
 | 状态 | 6250/6250 iter · 25/25 评估 · 0 报错 |
 
 > **【2026-09-24 补记】对照基线的 schedule 不足。**
-> `mini/ep100` 分支的 `experiments-bank/experiments/exp-2026-09-23-mini-longer-schedule.md` 证明 mini 上 50 epoch 是被 cosine 掐断的：
+> [exp-2026-09-23-mini-longer-schedule](exp-2026-09-23-mini-longer-schedule.md)（原在已删除的 `mini/ep100` 分支，即 `mini/baseline`@`0f71161`）证明 mini 上 50 epoch 是被 cosine 掐断的：
 > 只把 schedule 拉到 100 epoch，基线 `matched_F1@8` 峰值就从 0.5783 升到 0.6331。
 > 本实验的 +0.024 是在这个训练不充分的基线上测的，可能有一部分只是 KMO 让训练收敛得更快。
-> 100 epoch 下的复核见 [kmo-matcher-ep100](../ideas/kmo-matcher-ep100.md)（分支 `mini/kmo-matcher-ep100`）。
+> 100 epoch 下的复核见 [kmo-matcher-ep100](../ideas/kmo-matcher-ep100.md)（分支 `mini/kmo-matcher`，原名 `mini/kmo-matcher-ep100`）。
 
 ## 判定（按预注册）
 

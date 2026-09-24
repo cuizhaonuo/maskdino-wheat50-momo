@@ -1,6 +1,6 @@
 # 想法：KMO-based 内层点匹配（CLTR, ECCV 2022）
 
-状态：**预注册判定：机制未启动**（M1 0.0189，未过 0.0158）；端到端主判据数值过线（`matched_F1@8` +0.024）｜ 提出 2026-09-23 ｜ 分支 `mini/kmo-matcher`（从 `exp/single-stage-joint-mini` 拉出）｜ 验证于 [exp-2026-09-23-mini-kmo-matcher](../experiments/exp-2026-09-23-mini-kmo-matcher.md)
+状态：**预注册判定：机制未启动**（M1 0.0189，未过 0.0158）；端到端主判据数值过线（`matched_F1@8` +0.024）｜ 提出 2026-09-23 ｜ 分支 `mini/kmo-matcher`（从 `exp/single-stage-joint-mini` 拉出；该 50 epoch 分支已于 2026-09-24 删除，原提交由 tag `archive/mini-kmo-matcher-pre-move` 保留，现名 `mini/kmo-matcher` 的是 100 epoch 复跑分支）｜ 验证于 [exp-2026-09-23-mini-kmo-matcher](../experiments/exp-2026-09-23-mini-kmo-matcher.md)
 
 ## 动机
 
@@ -180,6 +180,6 @@ KMO = 新的匹配代价 + `ŷ^k` 辅助回归损失，两者绑在一起。若�
 **下一步**（详见实验记录）：两臂各补一个种子 → 消融 `COST_POINT_KNN_WEIGHT=0` → 计数阈值扫描 →
 效应仍在则上全集（`full/kmo-matcher`）。
 
-**【2026-09-24】** `mini/ep100` 分支的 `exp-2026-09-23-mini-longer-schedule.md` 把 mini 的默认 schedule 改成了
+**【2026-09-24】** [exp-2026-09-23-mini-longer-schedule](../experiments/exp-2026-09-23-mini-longer-schedule.md)（原在已删除的 `mini/ep100` 分支，即 `mini/baseline`@`0f71161`）把 mini 的默认 schedule 改成了
 100 epoch，50 epoch 的基线训练不充分。因此下一步改为先在 100 epoch 下复核本实验：
-[kmo-matcher-ep100](kmo-matcher-ep100.md)（分支 `mini/kmo-matcher-ep100`）。
+[kmo-matcher-ep100](kmo-matcher-ep100.md)（分支 `mini/kmo-matcher`，原名 `mini/kmo-matcher-ep100`）。
