@@ -1,7 +1,10 @@
 # 想法：小穗点误差改用各向同性归一化
 
-状态：**待验证** ｜ 提出 2026-09-23 ｜ 分支 `mini/iso-norm`（从 `mini/baseline` 拉出）｜ 配置
-`wheat_joint_single_stage_mini_iso.yaml` ｜ 输出 `output_v2/exp-0923-mini-iso-norm`
+状态：**待验证（100 epoch 复跑）** ｜ 提出 2026-09-23 ｜ 分支 `mini/iso-norm`（从 `mini/baseline`@`0f71161` 开出，100 epoch）｜ 配置
+`wheat_joint_single_stage_mini_iso.yaml`（`_BASE_` 为 `wheat_joint_single_stage_mini_ep100.yaml`）｜ 输出 `output_v2/exp-<启动日期>-mini-iso-norm`
+
+50 epoch 版（输出 `output_v2/exp-0923-mini-iso-norm`，原提交由 tag `archive/mini-iso-norm-ep50` 保留）已判「主判据歧义 + 机制未启动」，
+判据与结论保留在文末，不再适用于 100 epoch 复跑。
 
 来源：GroupPose 结合方案讨论（E1）。分组 decoder（`mini/group-decoder`，E3）也用这一改动，
 本实验在现有 MLP 点头上单独量它的作用。
@@ -37,7 +40,57 @@ x 误差除以 w、y 误差除以 h，**两轴权重之比等于框的长宽比*
   `exp/single-stage-joint-mini` 的 **127 项 loss 逐位相等**，参数量同为 52,300,433。
 - **开启**：`iso` 时 `loss_point_coord` 由 1.709 变为 2.29（初值，量级如预期相近），其余损失不变。
 
-## 预期与判否线（跑之前写死）
+## 100 epoch 复跑：预期与判否线（跑之前写死，2026-09-24）
+
+2026-09-24 起 `mini/baseline` 就是 100 epoch 基线（原 `mini/ep100`，`0f71161`）。本节写于任何 100 epoch E1 结果之前，
+规则结构沿用 50 epoch 版，基线数值换成 100 epoch；裕量小于基线实测噪声的两处按噪声放宽（见各条说明）。
+
+对照 mini/baseline（100 epoch，`output_v2/exp-0923-mini-ep100`），唯一差别仍是 `POINT_COORD_NORM`。
+数值取自该 run 的 metrics.json：
+
+| 指标 | 峰值 | 末值 | 末 4 轮摆幅 |
+|:--|--:|--:|--:|
+| `matched_F1@8` | 0.6331（iter 11499） | 0.6312 | 0.004 |
+| `segm/AP` | 78.80（最终评估） | 78.80 | 0.70 |
+| `count_MAE_spike` | 2.46（iter 8999） | 2.60 | 0.07 |
+
+### 机制（先判）
+
+口径与 50 epoch 版相同（`point_token_diag.py`，最终 checkpoint，`POINT_THRESHOLD=0.35`）。
+100 epoch 基线最终 checkpoint 的实测值（跑 E1 之前测得，`output_v2/_diag-0924/exp-0923-mini-ep100.json`；
+自检：重算的 matched_F1@8 为 0.63116，与训练日志末值 0.6312 一致）：
+
+| | 沿轴中位 | 横轴中位 | 配对点数 |
+|:--|--:|--:|--:|
+| 全部配对 | **4.62 px** | **2.34 px** | 9153 |
+| 仅距离 ≤ 8 px 的配对 | 3.30 px | 1.93 px | 6251 |
+
+与 50 epoch 基线（4.65 / 2.90 px）相比，训练充分后横轴误差下降、沿轴几乎不动，沿轴 / 横轴之比从 1.6 升到 2.0。
+
+- **M1**（全部配对口径，规则同 50 epoch 版）：沿轴误差中位数 ≤ **4.16 px**（比基线低 ≥ 10%），
+  且横轴误差中位数 ≤ **2.57 px**（升幅 ≤ 10%）。M1 不通过 → 判「机制未启动」，端到端差异不归因于归一化。
+
+### 主判据：`matched_F1@8`
+
+| 条件 | 判定 |
+|:--|:--|
+| 峰值 ≥ **0.6481** 且末值 ≥ **0.6462**（基线 +0.015），护栏满足 | **成立** |
+| 峰值 ≤ **0.6331** | **判否** |
+| 介于两者之间 | **歧义** |
+
+裕量从 50 epoch 版的 +0.01 改为 +0.015：0.015 是 mini 实验族的噪声地板（来自 mini/baseline 末 8 轮的摆幅），
+与 kmo-matcher 100 epoch 复跑的判据一致。50 epoch 版写 +0.01 时噪声地板还没估出来；事后 E2 在没有预期机制的情况下
+末 5 轮均值也差了 +0.0145，说明单种子 run 间的波动就在这个量级。
+
+### 护栏与观察量
+
+- 护栏：`segm/AP` 峰值 ≥ **77.80**（基线 −1.0。50 epoch 版是 −0.5，但 100 epoch 基线末 4 轮的平台摆幅已有 0.70）；
+  `count_MAE_spike` 峰值 ≤ **2.71**（基线 × 1.1，规则同 50 epoch 版）。
+- 观察（不作判据）：`matched_F1@3` / `@5`；计数偏差的方向（50 epoch 时 E1 的计数变差约 8%）。
+- 固定 `POINT_THRESHOLD=0.35` 下比较；主判据落在歧义区时，对两臂最终 checkpoint 做阈值扫描、比 best-vs-best
+  （基线的扫描最优为 0.6355 @0.30，见上面诊断 json 的 `sweep`）。
+
+## 50 epoch 版：预期与判否线（2026-09-23 写死，已按此判，结论见文末）
 
 对照 mini/baseline（`output_v2/exp-0922-single-stage-mini`），唯一差别是 `POINT_COORD_NORM`：
 
@@ -87,9 +140,13 @@ mini/baseline 最终 checkpoint 的实测值（跑 E1 之前测得）：
 
 ## 成本
 
-6250 iter，约 7 h（与基线同配置）。
+100 epoch 版：12500 iter，约 10 ~ 13 h（视同卡并发而定）。50 epoch 版：6250 iter，约 7 h。
 
-## 结论（2026-09-24，按上面写死的规则判）
+## 100 epoch 结论
+
+（待填）
+
+## 50 epoch 版结论（2026-09-24，按 50 epoch 的判否线判）
 
 **主判据歧义；阈值扫描后 best-vs-best 刚过 +0.01；机制判据 M1 未通过 → 端到端的小幅改善不能归因于「沿轴加权」。**
 

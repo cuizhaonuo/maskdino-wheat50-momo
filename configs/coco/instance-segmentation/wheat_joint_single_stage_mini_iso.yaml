@@ -1,7 +1,7 @@
 # ============================================================================
 # 单阶段联合训练 · 500 图小集 · 小穗点误差改用各向同性归一化（mini/iso-norm，E1）
 #   预注册：experiments-bank/ideas/iso-point-norm.md
-#   对照：wheat_joint_single_stage_mini_ep100.yaml（mini/baseline = mini/ep100，output_v2/exp-0923-mini-ep100）
+#   对照：wheat_joint_single_stage_mini_ep100.yaml（mini/baseline@0f71161，100 epoch，output_v2/exp-0923-mini-ep100）
 #
 # 与父配置的差异【只有 POINT_COORD_NORM 一处】：
 #   box_axis（现状）：误差 = 框相对坐标差，x 除以 w、y 除以 h —— 两轴权重之比 = 框长宽比
@@ -16,7 +16,7 @@
 #     --config-file configs/coco/instance-segmentation/wheat_joint_single_stage_mini_iso.yaml \
 #     OUTPUT_DIR /public/home/zncui/pycharm_project/maskdino-wheat50/output_v2/<run-name>
 # 【100 epoch 版】_BASE_ 改为 wheat_joint_single_stage_mini_ep100.yaml（mini/baseline@0f71161），
-#   schedule 全部继承自它；50 epoch 版见 mini/iso-norm 分支。其余与 50 epoch 版逐字相同。
+#   schedule 全部继承自它；50 epoch 版的原提交由 tag archive/mini-iso-norm-ep50 保留。其余与 50 epoch 版逐字相同。
 # ============================================================================
 _BASE_: wheat_joint_single_stage_mini_ep100.yaml
 
