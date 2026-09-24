@@ -115,3 +115,7 @@ mini/baseline 最终 checkpoint 的实测值（跑 E1 之前测得）：
 
 读法：各向同性归一化带来约 +0.01 的 `matched_F1@8`（在种子方差量级），代价是计数变差约 0.3。
 不建议单独作为改进项；它在分组 decoder（E3）里的作用需结合 E3 与 E2 的对比看。
+
+补充（E2 跑完后）：`mini/q100` 只砍 query 数，`matched_F1@8` 末 5 轮均值同样 +0.0145、却没有预期机制，
+说明单种子 run 间的波动可能就有这个量级。详细数据见
+[exp-2026-09-23-mini-iso-norm](../experiments/exp-2026-09-23-mini-iso-norm.md)。
