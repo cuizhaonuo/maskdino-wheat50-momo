@@ -183,3 +183,6 @@ KMO = 新的匹配代价 + `ŷ^k` 辅助回归损失，两者绑在一起。若�
 **【2026-09-24】** [exp-2026-09-23-mini-longer-schedule](../experiments/exp-2026-09-23-mini-longer-schedule.md)（原在已删除的 `mini/ep100` 分支，即 `mini/baseline`@`0f71161`）把 mini 的默认 schedule 改成了
 100 epoch，50 epoch 的基线训练不充分。因此下一步改为先在 100 epoch 下复核本实验：
 [kmo-matcher-ep100](kmo-matcher-ep100.md)（分支 `mini/kmo-matcher`，原名 `mini/kmo-matcher-ep100`）。
+复核结果为**「未决」**（[exp-2026-09-24-mini-kmo-matcher-ep100](../experiments/exp-2026-09-24-mini-kmo-matcher-ep100.md)）：
+机制门通过；100 epoch 末段对基线的领先缩到约 +0.015（50 epoch 时 +0.024），`bbox/AP` 的 +1.97 消失。
+上面「两臂各补一个种子」一项按用户 2026-09-24 的决定不执行（mini 实验保持单种子）。
