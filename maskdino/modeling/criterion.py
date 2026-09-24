@@ -145,7 +145,7 @@ class SetCriterion(nn.Module):
     def __init__(self, num_classes, matcher, weight_dict, eos_coef, losses,
                  num_points, oversample_ratio, importance_sample_ratio,dn="no",dn_losses=[], panoptic_on=False, semantic_ce_loss=False,
                  num_spikelet_points=50, point_cost_coord=5.0, point_cost_class=2.0,
-                 point_focal_alpha=0.25, point_empty_cls_weight=1.0):
+                 point_focal_alpha=0.25, point_empty_cls_weight=1.0, point_coord_norm="box_axis"):
         """Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
@@ -183,6 +183,9 @@ class SetCriterion(nn.Module):
         self.point_focal_alpha = point_focal_alpha
         # Ni==0 实例的存在性损失权重（只作用于 cls_loss 的分子，不影响 denom）
         self.point_empty_cls_weight = point_empty_cls_weight
+        # 点坐标误差的归一化方式（内层代价与 L1 共用），见 _point_iso_scale
+        assert point_coord_norm in ("box_axis", "iso"), f"未知 POINT_COORD_NORM: {point_coord_norm}"
+        self.point_coord_norm = point_coord_norm
 
     def loss_labels_ce(self, outputs, targets, indices, num_masks):
         """Classification loss (NLL)
@@ -323,13 +326,31 @@ class SetCriterion(nn.Module):
         del target_masks
         return losses
 
+    def _point_iso_scale(self, box_wh, image_wh=None):
+        """POINT_COORD_NORM="iso" 时，框相对坐标换到各向同性空间的逐轴缩放因子；"box_axis" 时返回 None。
+        框相对坐标的 1 个单位在 x/y 上分别是 w/h 个像素；乘以 (w, h)/sqrt(w·h) 后两轴的
+        1 个单位都等于 sqrt(w·h) 个像素，即误差 = 像素误差 / sqrt(w·h)，两轴同权。
+        Args:
+            box_wh:   [2] GT 框 (w, h)，图像归一化
+            image_wh: [2] 图像像素 (W, H)，用于还原像素纵横比；LSJ 训练输入恒为 1024x1024，可不传
+        Returns:
+            [2] 或 None
+        """
+        if self.point_coord_norm != "iso":
+            return None
+        wh = box_wh.float()
+        if image_wh is not None:
+            wh = wh * image_wh.to(wh)
+        return wh / wh.prod().sqrt().clamp(min=1e-12)
+
     @torch.no_grad()
-    def _inner_point_match(self, pred_rel, pred_logit, gt_rel):
+    def _inner_point_match(self, pred_rel, pred_logit, gt_rel, iso_scale=None):
         """逐实例内层匈牙利匹配：把 P 个预测点匹配到 Ni 个 GT 小穗。
         Args:
             pred_rel:   [P, 2]  预测点（框相对归一化坐标）
             pred_logit: [P, 1]  预测点存在性 logit
             gt_rel:     [Ni, 2] GT 小穗（框相对归一化坐标）
+            iso_scale:  [2] 或 None，_point_iso_scale 的返回值；非 None 时坐标代价在各向同性空间算
         Returns:
             (row_ind, col_ind): 匹配的预测点索引与 GT 索引（长度均为 min(P, Ni)=Ni）
         """
@@ -341,6 +362,9 @@ class SetCriterion(nn.Module):
         # AMP 下统一用 float32 计算代价，避免 half 精度的 cdist / log 问题
         pred_rel = pred_rel.float()
         gt_rel = gt_rel.float()
+        if iso_scale is not None:
+            pred_rel = pred_rel * iso_scale
+            gt_rel = gt_rel * iso_scale
         prob = pred_logit.float().sigmoid()               # [P,1]
         neg_cost = (1 - alpha) * (prob ** gamma) * (-(1 - prob + 1e-8).log())
         pos_cost = alpha * ((1 - prob) ** gamma) * (-(prob + 1e-8).log())
@@ -357,6 +381,7 @@ class SetCriterion(nn.Module):
         """逐实例小穗点损失：对每个外层匹配到的实例，做内层匈牙利匹配后计算
         点坐标 L1 损失 + 点存在性 focal 损失。
         - 点坐标采用"实例框相对归一化"[0,1]：用匹配到的 GT 框把 GT 小穗换算到框相对坐标。
+          POINT_COORD_NORM="iso" 时，误差（内层代价与 L1）再换到各向同性空间计算，见 _point_iso_scale。
         - wheat 实例（无小穗，Ni=0）：无坐标损失，P 个点全部监督为不存在（背景）。
         """
         assert 'pred_point_coords' in outputs and 'pred_point_logits' in outputs
@@ -374,6 +399,7 @@ class SetCriterion(nn.Module):
                 continue
             boxes_b = targets[b]['boxes']      # [Ng, 4] cxcywh 图像归一化
             points_b = targets[b]['points']    # list[Tensor[Ni,2]] 图像归一化
+            image_wh = targets[b].get('image_wh')   # [2] 图像像素 (W, H)
             for q_i, g_j in zip(src_idx.tolist(), tgt_idx.tolist()):
                 # AMP 下预测为 half，GT 为 float32；统一转 float32 避免 dtype 不匹配
                 pred_rel = pred_coords[b, q_i].float()     # [P,2]
@@ -391,15 +417,18 @@ class SetCriterion(nn.Module):
                 else:
                     gt_rel = gt_pts_img.new_zeros((0, 2))
 
-                row_ind, col_ind = self._inner_point_match(pred_rel, pred_lg, gt_rel)
+                iso_scale = self._point_iso_scale(wh, image_wh)
+                row_ind, col_ind = self._inner_point_match(pred_rel, pred_lg, gt_rel, iso_scale)
 
                 # 存在性目标：匹配上的预测点为 1，其余为 0
                 tgt_exist = torch.zeros((self.num_spikelet_points, 1), device=device, dtype=pred_lg.dtype)
                 if row_ind.numel() > 0:
                     tgt_exist[row_ind] = 1.0
-                    # 坐标 L1 损失（仅匹配点）
-                    coord_loss = coord_loss + F.l1_loss(
-                        pred_rel[row_ind], gt_rel[col_ind], reduction='sum')
+                    # 坐标 L1 损失（仅匹配点），与内层代价同一个空间
+                    pred_m, gt_m = pred_rel[row_ind], gt_rel[col_ind]
+                    if iso_scale is not None:
+                        pred_m, gt_m = pred_m * iso_scale, gt_m * iso_scale
+                    coord_loss = coord_loss + F.l1_loss(pred_m, gt_m, reduction='sum')
 
                 # 存在性 focal 损失（全部 P 个点）
                 prob = pred_lg.sigmoid()

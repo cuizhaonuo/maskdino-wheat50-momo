@@ -94,7 +94,8 @@ def record(criterion, outputs, targets, indices, batched_inputs=None):
             cx, cy, bw, bh = boxes[g_j].to(pred_coords.device)
             wh = torch.stack([bw, bh]).clamp(min=1e-6)
             gt_rel = ((gt_pts - torch.stack([cx - bw / 2, cy - bh / 2])) / wh).clamp(0.0, 1.0)
-            row_ind, _ = criterion._inner_point_match(pred_coords[b, q_i], pred_lgts[b, q_i], gt_rel)
+            iso_scale = criterion._point_iso_scale(wh, targets[b].get("image_wh"))
+            row_ind, _ = criterion._inner_point_match(pred_coords[b, q_i], pred_lgts[b, q_i], gt_rel, iso_scale)
 
             slots = frozenset(row_ind.cpu().numpy().tolist())
             _S["hits"][list(slots)] += 1

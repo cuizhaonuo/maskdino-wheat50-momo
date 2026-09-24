@@ -199,6 +199,7 @@ class MaskDINO(nn.Module):
             point_cost_class=cfg.MODEL.MaskDINO.COST_POINT_CLASS_WEIGHT,
             point_focal_alpha=cfg.MODEL.MaskDINO.POINT_FOCAL_ALPHA,
             point_empty_cls_weight=cfg.MODEL.MaskDINO.POINT_EMPTY_CLS_WEIGHT,
+            point_coord_norm=cfg.MODEL.MaskDINO.POINT_COORD_NORM,
         )
 
         return {
@@ -379,6 +380,8 @@ class MaskDINO(nn.Module):
                     "masks": padded_masks,
                     "boxes":box_ops.box_xyxy_to_cxcywh(targets_per_image.gt_boxes.tensor)/image_size_xyxy,
                     "points": gt_points,
+                    # 图像像素尺寸 (W, H)：POINT_COORD_NORM="iso" 用它还原框的像素纵横比
+                    "image_wh": wh,
                 }
             )
         return new_targets
@@ -403,6 +406,8 @@ class MaskDINO(nn.Module):
                     "masks": padded_masks,
                     "boxes": box_ops.box_xyxy_to_cxcywh(targets_per_image.gt_boxes.tensor) / image_size_xyxy,
                     "points": gt_points,
+                    # 图像像素尺寸 (W, H)：POINT_COORD_NORM="iso" 用它还原框的像素纵横比
+                    "image_wh": wh,
                 }
             )
         return new_targets
