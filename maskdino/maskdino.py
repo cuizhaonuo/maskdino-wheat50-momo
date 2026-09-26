@@ -19,6 +19,7 @@ from detectron2.utils.memory import retry_if_cuda_oom
 
 from .modeling.criterion import SetCriterion
 from .modeling.matcher import HungarianMatcher
+from .modeling.coral import coral_predict
 from .utils import box_ops
 
 
@@ -155,6 +156,9 @@ class MaskDINO(nn.Module):
         weight_dict.update({"loss_bbox":box_weight,"loss_giou":giou_weight})
         # 小穗点损失（随 _interm / _{i} 深监督自动带上；dn 不计算点损失，其 _dn 权重存在但不会被产生，无害）
         weight_dict.update({"loss_point_coord": point_coord_weight, "loss_point_cls": point_cls_weight})
+        # 图级穗数头只有主输出产生 loss_img_count；展开出来的 _interm / _{i} / _dn 权重不会被用到，无害
+        if cfg.MODEL.MaskDINO.IMG_COUNT_HEAD:
+            weight_dict.update({"loss_img_count": cfg.MODEL.MaskDINO.IMG_COUNT_WEIGHT})
         # two stage is the query selection scheme
         if cfg.MODEL.MaskDINO.TWO_STAGE:
             interm_weight_dict = {}
@@ -180,6 +184,8 @@ class MaskDINO(nn.Module):
             losses = ["labels", "masks","boxes","points"]
         else:
             losses = ["labels", "masks","points"]
+        if cfg.MODEL.MaskDINO.IMG_COUNT_HEAD:
+            losses.append("img_count")
         # building criterion
         criterion = SetCriterion(
             sem_seg_head.num_classes,
@@ -307,6 +313,10 @@ class MaskDINO(nn.Module):
             # 小穗点预测（框相对归一化 [0,1]）
             point_coord_results = outputs["pred_point_coords"]   # [B, Q, P, 2]
             point_logit_results = outputs["pred_point_logits"]   # [B, Q, P, 1]
+            # 图级 wheat_2 穗数（IMG_COUNT_HEAD=False 时没有这个键）
+            img_count_results = outputs.get("pred_img_count_logits")   # [B, T] 或 None
+            if img_count_results is None:
+                img_count_results = [None] * len(point_logit_results)
             # upsample masks
             mask_pred_results = F.interpolate(
                 mask_pred_results,
@@ -318,12 +328,15 @@ class MaskDINO(nn.Module):
             del outputs
 
             processed_results = []
-            for mask_cls_result, mask_pred_result, mask_box_result, point_coord_result, point_logit_result, input_per_image, image_size in zip(
-                mask_cls_results, mask_pred_results, mask_box_results, point_coord_results, point_logit_results, batched_inputs, images.image_sizes
+            for mask_cls_result, mask_pred_result, mask_box_result, point_coord_result, point_logit_result, img_count_result, input_per_image, image_size in zip(
+                mask_cls_results, mask_pred_results, mask_box_results, point_coord_results, point_logit_results, img_count_results, batched_inputs, images.image_sizes
             ):  # image_size is augmented size, not divisible to 32
                 height = input_per_image.get("height", image_size[0])  # real size
                 width = input_per_image.get("width", image_size[1])
                 processed_results.append({})
+                if img_count_result is not None:
+                    # 该图 wheat_2 穗数 N = sum_k 1[sigmoid(l_k) > 0.5]，供 SpikeletPointEvaluator 的 topn 读法使用
+                    processed_results[-1]["img_spike_count"] = int(coral_predict(img_count_result).item())
                 new_size = mask_pred_result.shape[-2:]  # padded size (divisible to 32)
 
 

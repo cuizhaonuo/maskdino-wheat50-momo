@@ -18,6 +18,7 @@ from detectron2.structures import BitMasks
 from .dino_decoder import TransformerDecoder, DeformableTransformerDecoderLayer
 from ...utils.utils import MLP, gen_encoder_output_proposals, inverse_sigmoid
 from ...utils import box_ops
+from ..coral import CoralHead
 
 
 TRANSFORMER_DECODER_REGISTRY = Registry("TRANSFORMER_MODULE")
@@ -47,6 +48,8 @@ class MaskDINODecoder(nn.Module):
             num_queries: int,
             num_points: int,
             point_class_mlp: bool = False,
+            img_count_head: bool = False,
+            img_count_max: int = 15,
             nheads: int,
             dim_feedforward: int,
             dec_layers: int,
@@ -150,6 +153,10 @@ class MaskDINODecoder(nn.Module):
         # 仍会被 train_net.py 的 _POINT_HEAD_KEYS 子串匹配到、正确解冻。
         self.point_class_embed = (MLP(hidden_dim, hidden_dim, num_points, 3)
                                   if point_class_mlp else nn.Linear(hidden_dim, num_points))
+        # IMG_COUNT_HEAD=True：图级 wheat_2 穗数的 CORAL 头，吃 src_flatten 的全局均值池化。
+        # 训练与 val 的画布都是 1024x1024，均值与总量只差一个常数，所以均值池化能表达「数量」。
+        self.img_count_embed = (CoralHead(hidden_dim, hidden_dim, img_count_max, 3)
+                                if img_count_head else None)
 
         # init decoder
         self.decoder_norm = decoder_norm = nn.LayerNorm(hidden_dim)
@@ -183,6 +190,8 @@ class MaskDINODecoder(nn.Module):
         ret["num_queries"] = cfg.MODEL.MaskDINO.NUM_OBJECT_QUERIES
         ret["num_points"] = cfg.MODEL.MaskDINO.NUM_POINTS
         ret["point_class_mlp"] = cfg.MODEL.MaskDINO.POINT_CLASS_MLP
+        ret["img_count_head"] = cfg.MODEL.MaskDINO.IMG_COUNT_HEAD
+        ret["img_count_max"] = cfg.MODEL.MaskDINO.IMG_COUNT_MAX
         # Transformer parameters:
         ret["nheads"] = cfg.MODEL.MaskDINO.NHEADS
         ret["dim_feedforward"] = cfg.MODEL.MaskDINO.DIM_FEEDFORWARD
@@ -413,6 +422,12 @@ class MaskDINODecoder(nn.Module):
         spatial_shapes = torch.as_tensor(spatial_shapes, dtype=torch.long, device=src_flatten.device)
         level_start_index = torch.cat((spatial_shapes.new_zeros((1,)), spatial_shapes.prod(1).cumsum(0)[:-1]))
         valid_ratios = torch.stack([self.get_valid_ratio(m) for m in masks], 1)
+        # 图级穗数头：对 src_flatten 的有效位置做全局均值池化（mask_flatten 为 True 的是 padding）
+        img_count_logits = None
+        if self.img_count_embed is not None:
+            valid = (~mask_flatten).unsqueeze(-1).to(src_flatten.dtype)          # bs, \sum{hxw}, 1
+            pooled = (src_flatten * valid).sum(1) / valid.sum(1).clamp(min=1.0)  # bs, c
+            img_count_logits = self.img_count_embed(pooled)                       # bs, IMG_COUNT_MAX
         # 以上的代码主要是为了将多尺度的 feature map 展平，并计算相关的空间形状和有效比例
         # 主要关注：src_flatten, level_start_index
         # 其中 size_list 没有用到，而 mask_flatten 全为 False，valid_ratios 全是 1 可以不必过多关注
@@ -609,6 +624,8 @@ class MaskDINODecoder(nn.Module):
                 predictions_point_coord, predictions_point_logit
             )
         }
+        if img_count_logits is not None:
+            out['pred_img_count_logits'] = img_count_logits
         if self.two_stage:
             out['interm_outputs'] = interm_outputs
         return out, mask_dict

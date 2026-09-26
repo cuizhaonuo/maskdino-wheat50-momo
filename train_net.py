@@ -205,6 +205,7 @@ class Trainer(DefaultTrainer):
                         sigmas=cfg.MODEL.MaskDINO.TEST.SPIKELET_EVAL_SIGMAS,
                         score_thresh=cfg.MODEL.MaskDINO.TEST.SPIKELET_EVAL_SCORE_THRESH,
                         iou_thresh=cfg.MODEL.MaskDINO.TEST.SPIKELET_EVAL_IOU_THRESH,
+                        count_readout=cfg.MODEL.MaskDINO.TEST.IMG_COUNT_READOUT,
                     )
                 )
         # panoptic segmentation

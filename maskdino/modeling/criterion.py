@@ -23,6 +23,7 @@ from detectron2.projects.point_rend.point_features import (
 
 from ..utils.misc import is_dist_avail_and_initialized, nested_tensor_from_tensor_list
 from maskdino.utils import box_ops
+from .coral import coral_levels, coral_loss
 
 try:
     # 正负样本匹配的 debug 可视化。要关掉请改各模块顶部的 ENABLED = False，
@@ -422,6 +423,15 @@ class SetCriterion(nn.Module):
         }
         return losses
 
+    def loss_img_count(self, outputs, targets, indices, num_masks):
+        """图级 wheat_2 穗数的 CORAL 损失（IMG_COUNT_HEAD=True 时主输出才有这个键；aux / interm 没有，返回空）。
+        目标是增广并降级之后这张图里 wheat_2（连续 id=1）的实例数，与推理时要数的对象一致。"""
+        if 'pred_img_count_logits' not in outputs:
+            return {}
+        logits = outputs['pred_img_count_logits']                    # [B, T]
+        n = torch.stack([(t['labels'] == 1).sum() for t in targets])  # [B]
+        return {'loss_img_count': coral_loss(logits, coral_levels(n, logits.shape[-1]))}
+
     def prep_for_dn(self,mask_dict):
         output_known_lbs_bboxes = mask_dict['output_known_lbs_bboxes']
 
@@ -451,6 +461,7 @@ class SetCriterion(nn.Module):
             'masks': self.loss_masks,
             'boxes': self.loss_boxes_panoptic if self.panoptic_on else self.loss_boxes,
             'points': self.loss_points,
+            'img_count': self.loss_img_count,
         }
         assert loss in loss_map, f"do you really want to compute {loss} loss?"
         return loss_map[loss](outputs, targets, indices, num_masks)

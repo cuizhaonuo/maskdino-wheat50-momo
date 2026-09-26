@@ -15,6 +15,12 @@ COCOEvaluator 只评 mask/box AP，看不出点回归头学得怎么样。本评
     因此包含了检测误差，是部署时真正关心的数。
   - 仅配对实例（matched_*）：把检测误差剥离，单看点头本身。
 
+报出的穗（count_readout）：
+  - "thresh"：分数 >= score_thresh 的 wheat_2 预测全部算作报出的穗（原口径）；
+  - "topn"  ：按分数取前 N 个，N = 模型输出里的 img_spike_count（图级 CORAL 穗数头，IMG_COUNT_HEAD=True）。
+  两种读法下都额外报告 spike_count_MAE_img（逐图报出穗数 vs GT 穗数）；有 img_spike_count 时再报
+  img_count_head_MAE / img_count_head_bias（头本身的逐图误差 / 有符号偏差），并写 img_count_head.csv。
+
 坐标系：模型输出的 pred_spikelet_points 已经在原图像素系（maskdino.py 在 instance_inference
 之前就把 mask/box 还原回了原图尺寸，点是纯框相对还原），GT 的 points 也是原图绝对像素，
 两者可直接比对，σ 的像素单位即原图像素。
@@ -62,7 +68,8 @@ class SpikeletPointEvaluator(DatasetEvaluator):
     """评估每个 wheat_2 实例内部的小穗点定位与计数。"""
 
     def __init__(self, dataset_name, output_dir=None, sigmas=(3.0, 5.0, 8.0),
-                 score_thresh=0.5, iou_thresh=0.5, spikelet_class_id=1, distributed=True):
+                 score_thresh=0.5, iou_thresh=0.5, spikelet_class_id=1, distributed=True,
+                 count_readout="thresh"):
         self._logger = logging.getLogger(__name__)
         self._dataset_name = dataset_name
         self._output_dir = output_dir
@@ -71,6 +78,8 @@ class SpikeletPointEvaluator(DatasetEvaluator):
         self._iou_thresh = float(iou_thresh)
         self._spikelet_class_id = int(spikelet_class_id)
         self._distributed = distributed
+        assert count_readout in ("thresh", "topn"), count_readout
+        self._count_readout = count_readout
 
         # GT 直接取自 DatasetCatalog：wheat 数据集没有设 json_file metadata，COCOEvaluator 会回退到
         # convert_to_coco_json，而那个转换不保留 points；DatasetCatalog 的记录里则带着 points。
@@ -92,7 +101,8 @@ class SpikeletPointEvaluator(DatasetEvaluator):
         self._logger.info(
             f"[SpikeletPointEvaluator] {dataset_name}: {len(self._gt)} 图, "
             f"{n_inst} 个 wheat_2 实例, {n_pts} 个 GT 小穗点 | "
-            f"σ={list(self._sigmas)}px, score>={self._score_thresh}, IoU>={self._iou_thresh}"
+            f"σ={list(self._sigmas)}px, score>={self._score_thresh}, IoU>={self._iou_thresh}, "
+            f"readout={self._count_readout}"
         )
         self._predictions = []
 
@@ -109,11 +119,17 @@ class SpikeletPointEvaluator(DatasetEvaluator):
             classes = inst.pred_classes.detach().cpu().numpy()
             scores = inst.scores.detach().cpu().numpy()
             has_points = inst.has("pred_spikelet_points")
+            n_head = out.get("img_spike_count")   # 图级 CORAL 头给的 wheat_2 穗数，没有该头时为 None
+
+            cand = [i for i in range(len(inst)) if int(classes[i]) == self._spikelet_class_id]
+            if self._count_readout == "topn":
+                assert n_head is not None, "count_readout=topn 需要模型输出 img_spike_count（IMG_COUNT_HEAD=True）"
+                keep_idx = sorted(cand, key=lambda i: -float(scores[i]))[:int(n_head)]
+            else:
+                keep_idx = [i for i in cand if scores[i] >= self._score_thresh]
 
             points, rles, keep_scores = [], [], []
-            for i in range(len(inst)):
-                if int(classes[i]) != self._spikelet_class_id or scores[i] < self._score_thresh:
-                    continue
+            for i in keep_idx:
                 pts = inst.pred_spikelet_points[i] if has_points else None
                 pts = np.zeros((0, 2)) if pts is None else pts.detach().cpu().numpy()
                 m = inst.pred_masks[i].detach().cpu().numpy().astype(np.uint8)
@@ -124,7 +140,7 @@ class SpikeletPointEvaluator(DatasetEvaluator):
             # 零预测的图也要保留：它们对 recall 与计数 MAE 有贡献。
             self._predictions.append({
                 "image_id": inp["image_id"], "points": points,
-                "rles": rles, "scores": keep_scores,
+                "rles": rles, "scores": keep_scores, "n_head": n_head,
             })
 
     def evaluate(self):
@@ -151,6 +167,8 @@ class SpikeletPointEvaluator(DatasetEvaluator):
         spike_count_abs_err = []        # 配对实例上的每穗点数误差
         pair_rows = []                  # 逐 TP 穗的 (预测点数, GT点数)，供散点分析
         img_pred_tot, img_gt_tot = [], []
+        img_pred_spk, img_gt_spk = [], []   # 逐图报出穗数 / GT 穗数
+        head_rows = []                      # (file_name, GT 穗数, 头预测穗数, 报出穗数)
         n_gt_spike = n_pred_spike = n_matched_spike = 0
         rows = []
 
@@ -162,6 +180,10 @@ class SpikeletPointEvaluator(DatasetEvaluator):
             gp, pp = gt["points"], pred["points"]
             n_gt_spike += len(gp)
             n_pred_spike += len(pp)
+            img_gt_spk.append(len(gp))
+            img_pred_spk.append(len(pp))
+            if pred.get("n_head") is not None:
+                head_rows.append((gt["file_name"], len(gp), int(pred["n_head"]), len(pp)))
             gt_tot = int(sum(len(x) for x in gp))
             pred_tot = int(sum(len(x) for x in pp))
             n_gt_pts += gt_tot
@@ -218,6 +240,14 @@ class SpikeletPointEvaluator(DatasetEvaluator):
         res["count_MAE_img"] = float(np.mean(np.abs(pt_ - gt_))) if pt_.size else float("nan")
         res["count_RMSE_img"] = float(np.sqrt(np.mean((pt_ - gt_) ** 2))) if pt_.size else float("nan")
         res["spike_recall"] = n_matched_spike / n_gt_spike if n_gt_spike else float("nan")
+        # 逐图穗数：当前读法下报出的 wheat_2 数 vs GT（ep100 基线 thresh 读法末值为 1.350）
+        ps_, gs_ = np.asarray(img_pred_spk, float), np.asarray(img_gt_spk, float)
+        res["spike_count_MAE_img"] = float(np.mean(np.abs(ps_ - gs_))) if ps_.size else float("nan")
+        if head_rows:
+            hg = np.asarray([r[1] for r in head_rows], float)
+            hp = np.asarray([r[2] for r in head_rows], float)
+            res["img_count_head_MAE"] = float(np.mean(np.abs(hp - hg)))
+            res["img_count_head_bias"] = float(np.mean(hp - hg))
         res["spike_precision"] = n_matched_spike / n_pred_spike if n_pred_spike else float("nan")
         # ---- 假阳 wheat_2 的产出量 ----
         # count_MAE_spike 与 matched_F1@σ 都只在配对上的穗内部计算，
@@ -253,5 +283,13 @@ class SpikeletPointEvaluator(DatasetEvaluator):
                 wcsv.writerow(["file_name", "pred_points", "gt_points", "iou"])
                 wcsv.writerows(pair_rows)
             self._logger.info(f"[SpikeletPointEvaluator] 逐 TP 穗明细 -> {ppath}")
+
+            if head_rows:
+                hpath = os.path.join(self._output_dir, "img_count_head.csv")
+                with open(hpath, "w", newline="", encoding="utf-8") as f:
+                    wcsv = csv.writer(f)
+                    wcsv.writerow(["file_name", "gt_spikes", "head_spikes", "reported_spikes"])
+                    wcsv.writerows(sorted(head_rows))
+                self._logger.info(f"[SpikeletPointEvaluator] 图级穗数头逐图明细 -> {hpath}")
 
         return OrderedDict([("spikelet", copy.deepcopy(res))])

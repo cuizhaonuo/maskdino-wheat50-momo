@@ -100,6 +100,14 @@ def add_maskdino_config(cfg):
     # 【注意】开关会改变参数名（point_class_embed.weight/bias <-> .layers.{0,1,2}.*），
     # 两种设置下训出的 Stage2 checkpoint 不能互相加载（会被静默跳过）。
     cfg.MODEL.MaskDINO.POINT_CLASS_MLP = False
+    # True = 在 decoder 入口的多尺度特征 src_flatten 上做全局均值池化，接一个 CORAL 序数头
+    # img_count_embed（maskdino/modeling/coral.py），预测【整张图的 wheat_2 穗数】min(n, IMG_COUNT_MAX)。
+    # 多一项辅助损失 loss_img_count，只作用于主输出（不做深监督）。False 时不建参数，模型与基线逐位相同。
+    # 预注册见 experiments-bank/ideas/coral-img.md。
+    cfg.MODEL.MaskDINO.IMG_COUNT_HEAD = False
+    cfg.MODEL.MaskDINO.IMG_COUNT_WEIGHT = 2.0
+    # 序数类 0..IMG_COUNT_MAX，共 IMG_COUNT_MAX 个二分类任务。mini train 增广前每图最多 13 个、val 最多 8 个。
+    cfg.MODEL.MaskDINO.IMG_COUNT_MAX = 15
     # FREEZE_EXCEPT_POINT_HEAD=True 时，除点头外额外解冻的参数名子串。
     # 空 = 只训点头（Stage2 原设计）。例：["predictor.decoder"] 解冻 transformer decoder，
     # ["sem_seg_head"] 解冻整个分割头（decoder + pixel decoder + 各预测头），backbone 仍冻结。
@@ -134,6 +142,11 @@ def add_maskdino_config(cfg):
     cfg.MODEL.MaskDINO.TEST.POINT_THRESHOLD = 0.35
     # 评估时是否额外加挂小穗点评估器（SpikeletPointEvaluator，见 maskdino/evaluation/）
     cfg.MODEL.MaskDINO.TEST.SPIKELET_EVAL = False
+    # SpikeletPointEvaluator 里哪些 wheat_2 预测算作「报出的穗」：
+    #   "thresh" = 现状，分数 >= SPIKELET_EVAL_SCORE_THRESH 的全部算；
+    #   "topn"   = 按分数取前 N 个，N 是图级 CORAL 头给的该图 wheat_2 穗数（需要 IMG_COUNT_HEAD=True）。
+    # 只影响点评估与计数，不影响 COCO AP。同一 checkpoint 两种读法都能评。
+    cfg.MODEL.MaskDINO.TEST.IMG_COUNT_READOUT = "thresh"
     # 点匹配的距离阈值（原图像素，多档一起报）。GT 实测同穗内小穗最近邻间距中位 16px，
     # 故 8px 已是不产生歧义匹配的上限。
     cfg.MODEL.MaskDINO.TEST.SPIKELET_EVAL_SIGMAS = [3.0, 5.0, 8.0]

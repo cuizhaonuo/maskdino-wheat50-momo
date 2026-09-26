@@ -1,0 +1,30 @@
+# ============================================================================
+# mini/coral-img · 图级 wheat_2 穗数的 CORAL 序数头（C 臂）
+#   预注册：experiments-bank/ideas/coral-img.md（判否线已在跑之前写死）
+#   来源：Cao et al., Rank Consistent Ordinal Regression（arXiv 1901.07884），
+#         本地源码 /public/home/zncui/pycharm_project/coral-cnn
+#
+# 与 wheat_joint_single_stage_mini_ep100.yaml（mini/baseline 的 100 epoch 基线）的差异【只有两项】：
+#   MODEL.MaskDINO.IMG_COUNT_HEAD: True
+#     decoder 入口的多尺度特征 src_flatten 做全局均值池化 -> CoralHead（共享 1 维打分 + 15 个有序 bias），
+#     预测该图 wheat_2 穗数 min(n, 15)；辅助损失 loss_img_count（IMG_COUNT_WEIGHT 默认 2.0），只作用于主输出。
+#     实例 query、点头、内层匹配一行不动。
+#   MODEL.MaskDINO.TEST.IMG_COUNT_READOUT: topn
+#     点评估里「报出的穗」改为按分数取前 N 个 wheat_2（N 由图级头给出），替代分数阈值 0.4。
+#     COCO AP 不受影响。同一 checkpoint 用 CLI 覆盖 MODEL.MaskDINO.TEST.IMG_COUNT_READOUT thresh 可按基线读法再评一次。
+#
+# ⚠️ mini train 是按 wheat_2 数取的图，500 张在增广前每张都有 >= 4 个 wheat_2（val 均值 3.06，79% 的图 <= 4）。
+#   只有 LSJ 裁剪能产生更小的计数。头若只学到训练先验，会系统性多报 —— 预注册里的机制门就是查这个。
+#
+# 用法：
+#   python train_net.py --num-gpus 1 \
+#     --config-file configs/coco/instance-segmentation/wheat_joint_single_stage_mini_coral_img.yaml \
+#     OUTPUT_DIR /public/home/zncui/pycharm_project/maskdino-wheat50/output_v2/<run-name>
+# ============================================================================
+_BASE_: wheat_joint_single_stage_mini_ep100.yaml
+
+MODEL:
+  MaskDINO:
+    IMG_COUNT_HEAD: True
+    TEST:
+      IMG_COUNT_READOUT: "topn"
