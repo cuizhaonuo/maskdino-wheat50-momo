@@ -1,6 +1,6 @@
 # 想法：实例 query 300 → 100 的检测代价（为分组 decoder 定 Ni）
 
-状态：**待验证（100 epoch 复跑）** ｜ 提出 2026-09-23 ｜ 分支 `mini/q100`（从 `mini/baseline`@`0f71161` 开出，100 epoch）｜ 配置
+状态：**Ni=100 可用（100 epoch，2026-09-26）** ｜ 提出 2026-09-23 ｜ 分支 `mini/q100`（从 `mini/baseline`@`0f71161` 开出，100 epoch）｜ 配置
 `wheat_joint_single_stage_mini_q100.yaml`（`_BASE_` 为 `wheat_joint_single_stage_mini_ep100.yaml`）｜ 输出 `output_v2/exp-<启动日期>-mini-q100`
 
 50 epoch 版（输出 `output_v2/exp-0923-mini-q100`，原提交由 tag `archive/mini-q100-ep50` 保留）已判「Ni=100 可用」，
@@ -70,9 +70,15 @@ spike_recall 峰值 0.9282 / 末值 0.9103，matched_F1@8 峰值 0.5783。
 
 100 epoch 版：12500 iter，约 10 ~ 13 h（视同卡并发而定）。50 epoch 版：6250 iter，约 6~7 h。
 
-## 100 epoch 结论
+## 100 epoch 结论（2026-09-26）
 
-（待填）
+**Ni=100 可用。** 两条判据都满足：`segm/AP` 峰值 79.16（≥ 77.80，基线 78.80），`spike_recall` 峰值 0.9576
+（≥ 0.9311，基线 0.9511）。E3 的 Ni=100 设计在 100 epoch 下成立。
+详见 [exp-2026-09-25-mini-q100](../experiments/exp-2026-09-25-mini-q100.md)。
+
+观察：50 epoch 时意外出现的 `matched_F1@8` 增幅在 100 epoch 下仍在（末 5 轮 +0.0135，峰值 +0.014，
+best-vs-best +0.012），两次独立 run 方向、幅度一致；但仍在 0.015 的噪声地板附近，记为观察。
+代价是 `bbox/AP` −0.6、0.35 阈值下计数 MAE 变差约 0.3（各自最优阈值下持平）。
 
 ## 50 epoch 版结论（2026-09-24）
 
