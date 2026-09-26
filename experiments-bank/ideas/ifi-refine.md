@@ -1,6 +1,6 @@
 # 想法：只加 IFI 精修头，不加 APG（形式 B，APGCC 组的归因对照臂）
 
-状态：**待验证（预注册，未启动）** ｜ 提出 2026-09-26 ｜ 分支 `mini/ifi-refine`（从 `mini/baseline`@`0f71161` 开出）｜
+状态：**待验证（预注册完成、冒烟通过，未启动）** ｜ 提出 2026-09-26 ｜ 分支 `mini/ifi-refine`（从 `mini/baseline`@`0f71161` 开出）｜
 配置 `wheat_joint_single_stage_mini_ifi_refine.yaml`（`_BASE_` 为 `wheat_joint_single_stage_mini_ep100.yaml`）｜
 输出 `output_v2/exp-<启动日期>-mini-ifi-refine`
 
@@ -63,9 +63,17 @@ IFI 让点头第一次看到自己位置的图像特征。只靠主损失（匹�
 代码与 A 逐字相同，A 的单元测试与 GPU 首 batch 检查（开关全关逐位一致、Δ≡0 时精修损失等于 baseline 点损失、
 开关打开时 baseline 原有参数初始化不变）同样适用于本臂。本臂自己的：
 
+GPU 冒烟（qiuhao A100 GPU1，09-27 05:27 起；与另外两个训练共卡；产物在 `output_v2/_smoke-0926/ifi-refine/`，.pth 已删）：
+
 | 项 | 结果 |
 |:--|:--|
-| 50 iter 训练、`--eval_only`（refine / coarse 两个源）、诊断 `--limit 5`（qiuhao A100 GPU1） | **待测**：GPU1 当前被其他训练占满，已排队 |
+| 开关打开（本臂配置），训练集第一个 batch：baseline 原有 127 项损失、总损失 628.5845 与 baseline 逐值相同 | 通过 |
+| 同上：`ref_coord` / `ref_cls` 为 0（开训时没有 IoU ≥ 0.5 的预测框）；精修头梯度 0 | 符合预期 |
+| 50 iter 训练：新损失键在 metrics.json 里且有限；峰值显存 23458 MB（baseline 同阶段 23065 MB）；3.87~4.02 s/iter（共卡） | 通过 |
+| 载入 baseline 100 epoch `model_final.pth`，`POINT_SOURCE coarse`：segm AP 78.8017、`matched_F1@8` 0.6312、`count_MAE_spike` 2.5986、15665 点 | **与 baseline 末值逐值相同** |
+| 同上，默认源（refine，精修头未训练，Δ ≡ 0）：`matched_F1@8` 0.5881、21575 点 | 走通（存在性头未训练，几乎全部槽都过阈值） |
+| 同上，诊断 `--limit 20`：配对 84/90 穗，每穗 K = 25，AUC 0.497（未训练） | 走通 |
+| 同上，训练集第一个 batch：`loss_point_ref_coord` 0.4452 vs `loss_point_coord` 0.3802（Δ ≡ 0 时之比 1.17 = 框系误差）；精修头梯度 0.42 / 全模型 240.4 | 框准时精修主损失生效 |
 
 ## 用法
 
