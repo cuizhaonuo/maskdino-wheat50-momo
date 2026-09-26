@@ -1,7 +1,7 @@
 # 想法：秩一致存在性头 + 前缀内层匹配（B 臂）
 
-状态：**待验证（预注册，跑之前写死）** ｜ 提出 2026-09-26 ｜ 分支 `mini/coral-exist`（从 `mini/baseline`@`0f71161` 开出，100 epoch）｜ 配置
-`wheat_joint_single_stage_mini_coral_exist.yaml`（`_BASE_` 为 `wheat_joint_single_stage_mini_ep100.yaml`）｜ 输出 `output_v2/exp-<启动日期>-mini-coral-exist`
+状态：**运行中**（2026-09-26 15:11:56 启动于 `eb3e466`，qiuhao A100 GPU1，与 A 臂并发）｜ 预注册提交于 `eb3e466`（跑之前）｜ 提出 2026-09-26 ｜ 分支 `mini/coral-exist`（从 `mini/baseline`@`0f71161` 开出，100 epoch）｜ 配置
+`wheat_joint_single_stage_mini_coral_exist.yaml`（`_BASE_` 为 `wheat_joint_single_stage_mini_ep100.yaml`）｜ 输出 `output_v2/exp-0926-mini-coral-exist`
 
 来源：Cao, Mirjalili, Raschka, *Rank Consistent Ordinal Regression for Neural Networks with Application to Age Estimation*
 （Pattern Recognition Letters 2020，arXiv 1901.07884），本地源码 `/public/home/zncui/pycharm_project/coral-cnn`。
@@ -113,4 +113,25 @@ Ni=0 / 25 / 30 三种边界；`loss_point_cls` 与手算的 `coral_loss(前缀 l
 
 ## 冒烟
 
-（待 qiuhao A100 空出后补记：bs2 峰值显存、s/iter、新参数梯度非零、20 张 val 上能出点。）
+**GPU**（qiuhao A100 GPU1，2026-09-26 15:03，跑之前）：独立脚本 import `train_net.Trainer`（不经 `train_net.py` 的 main，
+不算一次训练 run），ImageNet R-50 起点，bs2 × 30 step（AMP），再在 20 张 val 上推理 + `SpikeletPointEvaluator`。
+（s/iter 不可比：第一个跑的臂要冷读 NFS 上的图，且当时别人的 vLLM 占着 GPU 的 100% 算力。）
+
+| 项 | 结果 |
+|:--|:--|
+| 30 步损失 | 全部有限；`loss_point_cls`（CORAL，×2 后）1.500 → 1.134 |
+| 每步产生的 `loss_point_cls*` | 11 个（主输出 + 9 份 aux + interm） |
+| 第 0 步梯度 | `point_class_embed.*`（CoralHead）全部非零 |
+| 峰值显存（bs2，torch 口径） | 11.97 GiB |
+
+**CPU**（`CUDA_VISIBLE_DEVICES=""`，一点不占 GPU；15:14~15:19）：把 ep100 基线的
+`output_v2/exp-0923-mini-ep100/model_final.pth` 载入本臂模型，与 `mini/baseline` 同权重的输出在 12 张 val
+（top-100 里 94 个 wheat_2 条目）上逐实例比对。补上 GPU 冒烟没走到的读法分支（30 步的模型还不出 wheat_2）。
+（存在性头的形状变了，ep100 的 `point_class_embed.*` 载不进来，本臂的存在性头是随机初始化；坐标头照常载入。）
+另跑一次基线的 `POINT_THRESHOLD -1`，让每个 wheat_2 按 slot 顺序输出全部 25 个点，作为「前 K 个 slot」的参照：
+- 实例（类别、分数）与基线逐项相同；
+- 94 个 wheat_2 的输出**逐位等于**基线全 slot 输出的前 K 行（存在性头未训练，K ∈ [23, 25]）。
+
+**正式 run 的早期实测**（与 A 臂并发）：iter 180 前后稳定 2.50 s/iter，比 A 臂快约三成——前缀匹配的代价矩阵更小、
+不算 focal 代价，存在性损失也从逐实例 focal 换成了一次批量的 CORAL。`max_mem` 23.0 GB（torch 口径），
+nvidia-smi 占用约 32 GiB。按这个速度训练约 8.7 h，另加 25 次评估。
