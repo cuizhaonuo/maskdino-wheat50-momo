@@ -1,6 +1,6 @@
 # 想法：图级 wheat_2 穗数的 CORAL 序数头（C 臂）
 
-状态：**待验证（预注册，跑之前写死）** ｜ 提出 2026-09-26 ｜ 分支 `mini/coral-img`（从 `mini/baseline`@`0f71161` 开出，100 epoch）｜ 配置
+状态：**排队中**（qiuhao A100 GPU1 被 A、B 两臂占满，等其中一臂结束、空闲显存 ≥ 30 GiB 后由队列自动启动；输出 `output_v2/exp-<启动日期>-mini-coral-img`）｜ 预注册提交于 `1ab1978`（跑之前）｜ 提出 2026-09-26 ｜ 分支 `mini/coral-img`（从 `mini/baseline`@`0f71161` 开出，100 epoch）｜ 配置
 `wheat_joint_single_stage_mini_coral_img.yaml`（`_BASE_` 为 `wheat_joint_single_stage_mini_ep100.yaml`）｜ 输出 `output_v2/exp-<启动日期>-mini-coral-img`
 
 来源：Cao, Mirjalili, Raschka, *Rank Consistent Ordinal Regression for Neural Networks with Application to Age Estimation*
@@ -137,4 +137,27 @@ GPU 冒烟（bs2，30 step）的实测显存与速度见下节。
 
 ## 冒烟
 
-（待 qiuhao A100 空出后补记：bs2 峰值显存、s/iter、新参数梯度非零、两种读法在 20 张 val 上都能跑通。）
+**GPU**（qiuhao A100 GPU1，2026-09-26 15:03，跑之前）：独立脚本 import `train_net.Trainer`（不经 `train_net.py` 的 main，
+不算一次训练 run），ImageNet R-50 起点，bs2 × 30 step（AMP），再在 20 张 val 上推理 + `SpikeletPointEvaluator`。
+（s/iter 不可比：第一个跑的臂要冷读 NFS 上的图，且当时别人的 vLLM 占着 GPU 的 100% 算力。）
+
+| 项 | 结果 |
+|:--|:--|
+| 30 步损失 | 全部有限；`loss_img_count`（×2 后）1.561 → 1.098 |
+| 每步产生的 `loss_img_count*` | 1 个（只有主输出，符合设计） |
+| 第 0 步梯度 | `img_count_embed.*` 全部非零 |
+| 峰值显存（bs2，torch 口径） | 11.91 GiB |
+| 20 张 val | 两种读法都跑通；30 步时头对 20 张图都给出 N=2（这 20 张 GT 均值 4.5），`img_count_head_bias` −2.5 |
+
+**CPU**（`CUDA_VISIBLE_DEVICES=""`，一点不占 GPU；15:14~15:19）：把 ep100 基线的
+`output_v2/exp-0923-mini-ep100/model_final.pth` 载入本臂模型，与 `mini/baseline` 同权重的输出在 12 张 val
+（top-100 里 94 个 wheat_2 条目）上逐实例比对。补上 GPU 冒烟没走到的读法分支（30 步的模型还不出 wheat_2）。
+
+- 实例、每穗点数、点坐标与基线**逐项相同**；`thresh` 读法下原有的点评估指标全部相同，新增 `spike_count_MAE_img` 1.000；
+- `topn` 读法跑通。未训练的头对每张图都给 N=15（bias 按降序正值初始化，15 个任务全部 > 0.5），
+  于是报出的穗变多、`spike_precision` 0.553——这只说明读法生效，不代表训练后的行为。
+  **早期几轮评估的 topn 指标会因此偏差很大，读曲线时从头学会计数之后再看。**
+
+**显存与排队**：A、B 两臂的正式 run 在 nvidia-smi 上各占 32~39 GiB（缓存占了大头），GPU1 只剩约 8 GiB，
+本臂由队列在其中一臂结束、空闲显存 ≥ 30 GiB 后自动启动。启动时 worktree 的 HEAD 可能是本文档的后续提交，
+代码与 `1ab1978` 相同。
