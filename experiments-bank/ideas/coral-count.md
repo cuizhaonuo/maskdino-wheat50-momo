@@ -1,6 +1,6 @@
 # 想法：每个实例 query 挂一个 CORAL 序数计数头（A 臂）
 
-状态：**运行中**（2026-09-26 15:10:56 启动于 `c2fcc4b`，qiuhao A100 GPU1，与 B 臂并发）｜ 预注册提交于 `c2fcc4b`（跑之前）｜ 提出 2026-09-26 ｜ 分支 `mini/coral-count`（从 `mini/baseline`@`0f71161` 开出，100 epoch）｜ 配置
+状态：**成立**（预注册：机制门通过、`count_MAE_spike` 峰值 1.99 / 末值 2.29 过线）；**事后对照改写含义**：各自校准阈值后，收益来自辅助损失改善了存在性头（threshold 读法 1.314 vs 基线 1.467，r 0.70 vs 0.62），计数头自己的 coral 读法（2.285）不可取 ｜ 验证于 [exp-2026-09-26-mini-coral-count](../experiments/exp-2026-09-26-mini-coral-count.md) ｜ 2026-09-26 15:10:56 启动于 `c2fcc4b`，qiuhao A100 GPU1 ｜ 预注册提交于 `c2fcc4b`（跑之前）｜ 提出 2026-09-26 ｜ 分支 `mini/coral-count`（从 `mini/baseline`@`0f71161` 开出，100 epoch）｜ 配置
 `wheat_joint_single_stage_mini_coral_count.yaml`（`_BASE_` 为 `wheat_joint_single_stage_mini_ep100.yaml`）｜ 输出 `output_v2/exp-0926-mini-coral-count`
 
 来源：Cao, Mirjalili, Raschka, *Rank Consistent Ordinal Regression for Neural Networks with Application to Age Estimation*
