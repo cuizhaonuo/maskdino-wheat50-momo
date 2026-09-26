@@ -1,7 +1,7 @@
 # 想法：图级 wheat_2 穗数的 CORAL 序数头（C 臂）
 
-状态：**排队中**（qiuhao A100 GPU1 被 A、B 两臂占满，等其中一臂结束、空闲显存 ≥ 30 GiB 后由队列自动启动；输出 `output_v2/exp-<启动日期>-mini-coral-img`）｜ 预注册提交于 `1ab1978`（跑之前）｜ 提出 2026-09-26 ｜ 分支 `mini/coral-img`（从 `mini/baseline`@`0f71161` 开出，100 epoch）｜ 配置
-`wheat_joint_single_stage_mini_coral_img.yaml`（`_BASE_` 为 `wheat_joint_single_stage_mini_ep100.yaml`）｜ 输出 `output_v2/exp-<启动日期>-mini-coral-img`
+状态：**运行中**（B 臂跑完后由队列于 2026-09-27 00:43:51 自动启动，HEAD `b307eba`、代码与 `1ab1978` 相同；qiuhao A100 GPU1，与 A 臂并发）｜ 预注册提交于 `1ab1978`（跑之前）｜ 提出 2026-09-26 ｜ 分支 `mini/coral-img`（从 `mini/baseline`@`0f71161` 开出，100 epoch）｜ 配置
+`wheat_joint_single_stage_mini_coral_img.yaml`（`_BASE_` 为 `wheat_joint_single_stage_mini_ep100.yaml`）｜ 输出 `output_v2/exp-0927-mini-coral-img`
 
 来源：Cao, Mirjalili, Raschka, *Rank Consistent Ordinal Regression for Neural Networks with Application to Age Estimation*
 （Pattern Recognition Letters 2020，arXiv 1901.07884），本地源码 `/public/home/zncui/pycharm_project/coral-cnn`。
