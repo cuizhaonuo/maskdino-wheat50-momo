@@ -1,0 +1,37 @@
+# ============================================================================
+# 单阶段联合训练 · 500 图小集 · 100 epoch · IFI 精修头 + APG 辅助点（mini/apg-refine，形式 A）
+#   来源：Chen et al., "Improving Point-based Crowd Counting and Localization Based on Auxiliary
+#         Point Guidance"（APGCC, ECCV 2024, arXiv 2405.10589），本地源码 /public/home/zncui/pycharm_project/APGCC
+#   预注册：experiments-bank/ideas/apg-refine.md（判否线已在跑之前写死）
+#   对照：wheat_joint_single_stage_mini_ep100.yaml（mini/baseline@0f71161，output_v2/exp-0923-mini-ep100）
+#   归因对照：wheat_joint_single_stage_mini_ifi_refine.yaml（mini/ifi-refine：同一份代码，只关 APG）
+#
+# 结构：25 槽 query 头及其全部损失原样保留，作为粗定位。最后一层 decoder 之后接一个 IFI 精修头：
+#   u = 预测框（detach）∘ 粗坐标（detach）→ 在 u 处按 IFI 取 1/4、1/8 两层局部特征，拼实例 query，
+#   求偏移 r = u + Δ(u)；再在 r 处求存在性。推理输出 r 与 σ(logit(r))（TEST.POINT_SOURCE auto -> refine）。
+#   精修损失 loss_point_ref_coord/cls 与 loss_point_coord/cls 同口径（内层匈牙利 + L1 + focal）。
+# APG：每个带点实例的 GT 小穗周围撒 2 正 2 负辅助点，半径 (0.125, 0.5)·d̄（d̄ 为该穗 GT 小穗平均最近邻
+#   距离；原生尺度约 (2, 8) px，与论文相同），不经匹配直接送进同一个精修头：存在性正→1、负→0；
+#   定位上正负都吸附到最近 GT（与论文负点 Δ→0 不同，理由见预注册）。权重 = 0.2 × 主点损失权重。
+#
+# 与对照的差异：只多了 POINT_REFINE / POINT_APG 两个开关打开后的精修头与三项损失（及其参数）。
+#   数据、schedule、七项原损失与权重、匹配代价、点头五个旋钮、INPUT 全部继承不动。
+#
+# 用法：
+#   python train_net.py --num-gpus 1 \
+#     --config-file configs/coco/instance-segmentation/wheat_joint_single_stage_mini_apg_refine.yaml \
+#     OUTPUT_DIR /public/home/zncui/pycharm_project/maskdino-wheat50/output_v2/<run-name>
+# 同一次训练内「只用 25 槽头出点」的消融：评估时追加 MODEL.MaskDINO.TEST.POINT_SOURCE coarse
+# ============================================================================
+_BASE_: wheat_joint_single_stage_mini_ep100.yaml
+
+MODEL:
+  MaskDINO:
+    POINT_REFINE: True
+    POINT_APG: True
+    POINT_APG_NUM: [2, 2]
+    POINT_APG_RADII: [0.125, 0.5]
+    POINT_APG_NEG_EXCLUDE: 0.125
+    POINT_APG_NEG_LOC: "snap"
+    POINT_APG_CLS_WEIGHT: 0.4
+    POINT_APG_LOC_WEIGHT: 1.0

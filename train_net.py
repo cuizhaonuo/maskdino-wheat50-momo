@@ -73,7 +73,7 @@ from data_register import wheat_data, maize_rice_data, xinxiang_data, gwhd2021_d
 
 
 # 小穗点头的参数名子串（decoder 中的 point_coord_embed / point_class_embed）。
-_POINT_HEAD_KEYS = ("point_coord_embed", "point_class_embed")
+_POINT_HEAD_KEYS = ("point_coord_embed", "point_class_embed", "point_refiner")
 
 
 def freeze_all_but_point_head(model, extra_keys=()):
