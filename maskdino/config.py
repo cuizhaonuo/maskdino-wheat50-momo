@@ -100,6 +100,13 @@ def add_maskdino_config(cfg):
     # 【注意】开关会改变参数名（point_class_embed.weight/bias <-> .layers.{0,1,2}.*），
     # 两种设置下训出的 Stage2 checkpoint 不能互相加载（会被静默跳过）。
     cfg.MODEL.MaskDINO.POINT_CLASS_MLP = False
+    # True = 存在性头改成 CORAL 秩一致结构（maskdino/modeling/coral.py）：P 个 slot 的 logit
+    # = 共享 1 维打分 + P 个有序 bias，目标是有序前缀「slot k 亮 <=> k < Ni」。配套地，内层匹配只让前
+    # min(Ni, P) 个 slot 参与匈牙利（代价只用坐标 L1），存在性损失由 focal 换成 CORAL 的 BCE，
+    # 推理时 K = sum_k 1[sigmoid(l_k) > POINT_THRESHOLD]、取前 K 个 slot。
+    # 打开后 POINT_CLASS_MLP 不起作用（打分固定是 3 层 MLP），POINT_FOCAL_ALPHA / COST_POINT_CLASS_WEIGHT
+    # 也不再参与点头。False 时模型与基线逐位相同。预注册见 experiments-bank/ideas/coral-exist.md。
+    cfg.MODEL.MaskDINO.POINT_CORAL_EXIST = False
     # FREEZE_EXCEPT_POINT_HEAD=True 时，除点头外额外解冻的参数名子串。
     # 空 = 只训点头（Stage2 原设计）。例：["predictor.decoder"] 解冻 transformer decoder，
     # ["sem_seg_head"] 解冻整个分割头（decoder + pixel decoder + 各预测头），backbone 仍冻结。

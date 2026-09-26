@@ -54,6 +54,7 @@ class MaskDINO(nn.Module):
         transform_eval: bool = False,
         semantic_ce_loss: bool = False,
         point_threshold: float = 0.35,
+        point_coral_exist: bool = False,
     ):
         """
         Args:
@@ -111,6 +112,8 @@ class MaskDINO(nn.Module):
         # 小穗点推理：存在性阈值 + 带小穗的类别（wheat_2 的连续 id=1，只有该类输出点）
         self.point_threshold = point_threshold
         self.spikelet_class_id = 1
+        # POINT_CORAL_EXIST：K = 超过阈值的 slot 数（CORAL 的求和规则），输出前 K 个 slot
+        self.point_coral_exist = point_coral_exist
 
         if not self.semantic_on:
             assert self.sem_seg_postprocess_before_inference
@@ -199,6 +202,7 @@ class MaskDINO(nn.Module):
             point_cost_class=cfg.MODEL.MaskDINO.COST_POINT_CLASS_WEIGHT,
             point_focal_alpha=cfg.MODEL.MaskDINO.POINT_FOCAL_ALPHA,
             point_empty_cls_weight=cfg.MODEL.MaskDINO.POINT_EMPTY_CLS_WEIGHT,
+            point_coral_exist=cfg.MODEL.MaskDINO.POINT_CORAL_EXIST,
         )
 
         return {
@@ -228,6 +232,7 @@ class MaskDINO(nn.Module):
             "pano_temp": cfg.MODEL.MaskDINO.TEST.PANO_TEMPERATURE,
             "semantic_ce_loss": cfg.MODEL.MaskDINO.TEST.SEMANTIC_ON and cfg.MODEL.MaskDINO.SEMANTIC_CE_LOSS and not cfg.MODEL.MaskDINO.TEST.PANOPTIC_ON,
             "point_threshold": cfg.MODEL.MaskDINO.TEST.POINT_THRESHOLD,
+            "point_coral_exist": cfg.MODEL.MaskDINO.POINT_CORAL_EXIST,
         }
 
     @property
@@ -543,6 +548,10 @@ class MaskDINO(nn.Module):
                     bh = (y1 - y0).clamp(min=0)
                     score_k = point_logits[k].sigmoid().squeeze(-1)   # [P]
                     keep_pt = score_k > self.point_threshold
+                    if self.point_coral_exist:
+                        # 按求和计数、取前缀，不要求 bias 已经排好序（定理 1 只保证最优点有序）
+                        n_k = int(keep_pt.sum().item())
+                        keep_pt = torch.arange(score_k.numel(), device=score_k.device) < n_k
                     rel = point_coords[k][keep_pt]                    # [Ki, 2] 框相对
                     xy = torch.stack([x0, y0]) + rel * torch.stack([bw, bh])  # [Ki, 2] 像素
                     spikelet_points.append(xy)
