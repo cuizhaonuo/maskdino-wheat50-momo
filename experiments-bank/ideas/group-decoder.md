@@ -1,6 +1,6 @@
 # 想法：GroupPose 式分组 decoder —— 麦穗实例 token + 小穗 token
 
-状态：**待验证（100 epoch 复跑）** ｜ 提出 2026-09-23 ｜ 分支 `mini/group-decoder`（从 `mini/baseline`@`0f71161` 开出，100 epoch）｜ 配置
+状态：**判否（100 epoch，2026-09-26；机制未启动，计数次判据勉强成立）** ｜ 提出 2026-09-23 ｜ 分支 `mini/group-decoder`（从 `mini/baseline`@`0f71161` 开出，100 epoch）｜ 配置
 `wheat_joint_single_stage_mini_group.yaml`（`_BASE_` 为 `wheat_joint_single_stage_mini_ep100.yaml`）｜ 输出 `output_v2/exp-<启动日期>-mini-group-decoder`
 
 50 epoch 版（输出 `output_v2/exp-0923-mini-group-decoder`，原提交由 tag `archive/mini-group-decoder-ep50` 保留）已判
@@ -175,9 +175,26 @@ M1 不通过 → 判「机制未启动」，端到端差异不归因于局部存
 100 epoch 版：12500 iter，按 50 epoch 实测的 3.56 s/iter（与另一个 run 并发）约 12 ~ 13 h + 25 次评估。峰值显存约 26 GB，需 A100。
 50 epoch 版：6250 iter，约 6.5 h + 25 次评估。
 
-## 100 epoch 结论
+## 100 epoch 结论（2026-09-26，对照 E2 的 100 epoch 复跑，按上面 100 epoch 的判否线判）
 
-（待填）
+**判否；机制未启动（M1 未通过）；计数次判据成立但余量很小；护栏全过。**
+详见 [exp-2026-09-25-mini-group-decoder](../experiments/exp-2026-09-25-mini-group-decoder.md)。
+
+| 判据 | 要求 | 实测 | |
+|:--|:--|:--|:--:|
+| M1 存在性 AUC | ≥ E2 + 0.05 = 0.7329 | 0.6991（E2 0.6829） | ❌ |
+| M2 重复点（护栏） | ≤ 1% | 0.39% | ✅ |
+| 主判据 `matched_F1@8` | 判否线：峰值 ≤ E2 峰值 | 峰值 0.6456 vs 0.6475；末值 0.6378 vs 0.6421 | 判否 |
+| 阈值扫描 best-vs-best | （判否时的预定补充） | 0.6465 vs 0.6478（−0.0013） | 判否不变 |
+| 次判据 计数 | 峰值 ≤ E2 峰值 × 0.9 = 2.353 | 2.349（末值 −3.4%，末 5 轮 −5.9%） | ✅ 余量 0.004 |
+| 护栏 `segm/AP` | 峰值 ≥ 78.16 | 78.35（末值比 E2 低 0.81） | ✅ |
+| 护栏 `spike_recall` | 峰值 ≥ 0.9376 | 0.9657 | ✅ |
+
+诊断在 qiuhao 的 CPU 上跑（`output_v2/_diag-0926/`），与训练日志自检一致（差 ≤ 1e-4）。
+
+读法：训练充分后分组 decoder 在定位上不优于同 query 预算的 E2；50 epoch 时的计数优势（末值 −12%）
+收窄到 −3%，差距随训练变长而缩小，更像收敛更快而不是终点更好；末段 `segm/AP` 比 E2 低约 0.8。
+按现在的结构不值得继续推进。
 
 ## 50 epoch 版结论（2026-09-24，对照 E2，按 50 epoch 的判否线判）
 
