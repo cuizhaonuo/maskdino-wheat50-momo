@@ -1,6 +1,6 @@
 # 想法：秩一致存在性头 + 前缀内层匹配（B 臂）
 
-状态：**成立**（`count_MAE_spike` 峰值 1.67 / 末值 2.02，基线 2.46 / 2.60；`matched_F1@8` 峰值 0.6301，末 4 轮比基线低 0.0097，在噪声内）｜ 验证于 [exp-2026-09-26-mini-coral-exist](../experiments/exp-2026-09-26-mini-coral-exist.md) ｜ 2026-09-26 15:11:56 启动于 `eb3e466`，qiuhao A100 GPU1，与 A 臂并发 ｜ 预注册提交于 `eb3e466`（跑之前）｜ 提出 2026-09-26 ｜ 分支 `mini/coral-exist`（从 `mini/baseline`@`0f71161` 开出，100 epoch）｜ 配置
+状态：**成立**（`count_MAE_spike` 峰值 1.67 / 末值 2.02，基线 2.46 / 2.60；`matched_F1@8` 峰值 0.6301，末 4 轮比基线低 0.0097，在噪声内）；**事后对照**：各自校准阈值后计数与基线持平（1.453 vs 1.467），优势在同等计数下定位更好（0.6118 vs 0.6059）｜ 验证于 [exp-2026-09-26-mini-coral-exist](../experiments/exp-2026-09-26-mini-coral-exist.md) ｜ 2026-09-26 15:11:56 启动于 `eb3e466`，qiuhao A100 GPU1，与 A 臂并发 ｜ 预注册提交于 `eb3e466`（跑之前）｜ 提出 2026-09-26 ｜ 分支 `mini/coral-exist`（从 `mini/baseline`@`0f71161` 开出，100 epoch）｜ 配置
 `wheat_joint_single_stage_mini_coral_exist.yaml`（`_BASE_` 为 `wheat_joint_single_stage_mini_ep100.yaml`）｜ 输出 `output_v2/exp-0926-mini-coral-exist`
 
 来源：Cao, Mirjalili, Raschka, *Rank Consistent Ordinal Regression for Neural Networks with Application to Age Estimation*
