@@ -1,6 +1,6 @@
 # 想法：APGCC 的 IFI 精修头 + APG 辅助点（形式 A）
 
-状态：**待验证（预注册，未启动）** ｜ 提出 2026-09-26 ｜ 分支 `mini/apg-refine`（从 `mini/baseline`@`0f71161` 开出）｜
+状态：**待验证（预注册完成、冒烟通过，未启动）** ｜ 提出 2026-09-26 ｜ 分支 `mini/apg-refine`（从 `mini/baseline`@`0f71161` 开出）｜
 配置 `wheat_joint_single_stage_mini_apg_refine.yaml`（`_BASE_` 为 `wheat_joint_single_stage_mini_ep100.yaml`）｜
 输出 `output_v2/exp-<启动日期>-mini-apg-refine`
 
@@ -172,13 +172,31 @@ CPU 单元测试（脚本不进仓库，与 KMO 相同做法）：
 | 开关打开时，baseline 原有 732 个参数张量的初始化与 baseline 相同 | 通过 |
 | 精修源在 Δ ≡ 0 时输出的像素坐标与 coarse 源逐值相同（0.0 px） | 通过 |
 
-GPU（qiuhao A100 GPU1，训练集第一个 batch，AMP，固定种子）：
+GPU 冒烟（qiuhao A100 GPU1，09-27 05:14 起；与另外两个训练共卡；产物在 `output_v2/_smoke-0926/`，.pth 已删）。
+
+第一轮：从 ImageNet 起步，与正式训练相同的配置。
 
 | 项 | 结果 |
 |:--|:--|
-| 开关全关：127 项损失与 baseline 逐值相同（总损失 628.5845） | 通过（梯度范数的 1e-5 级差异是 MSDeformAttn 反传的原子加法，baseline 自己重跑也有） |
-| 开关打开（门控前）：峰值显存 21.16 GB（baseline 20.83） | 已测 |
-| 开关打开（门控后）、50 iter 训练、`--eval_only`（refine / coarse 两个源）、诊断 `--limit 5` | **待测**：GPU1 当前被其他训练占满（09-26 起两个 mini_coral 训练共约 73 GB），已排队 |
+| 开关全关，训练集第一个 batch（AMP、固定种子）：127 项损失与 baseline 逐值相同（总损失 628.5845） | 通过（梯度范数 1e-5 级的差异来自 MSDeformAttn 反传的原子加法，baseline 自己重跑也有） |
+| **开关打开**，第一个 batch：baseline 原有 127 项损失与 baseline 逐值相同 | 通过（初始化与 RNG 都没被新头扰动） |
+| 同上：新损失（已加权）`apg_cls` 0.555、`apg_loc` 0.100；`ref_coord` / `ref_cls` 为 0 | 符合预期：开训时没有预测框与 GT 的 IoU ≥ 0.5，精修主损失尚未生效（见下面第二轮） |
+| 同上：梯度范数 精修头 0.04 / 全模型 7253.41（baseline 7253.47） | 新损失在开训时不扰动全模型裁剪 |
+| 50 iter 训练：新损失键都在 metrics.json 里且有限；训练末自带的 val 评估走通 | 通过（50 iter 时 segm AP 为 0，baseline iter 499 也只有 1.9，点指标无从读） |
+| 峰值显存（训练日志 max_mem）| 23471 MB（baseline 同阶段 23065 MB，+0.4 GB） |
+| 速度 | 4.00~4.13 s/iter（与两个训练共卡）；baseline 同阶段 3.79~3.82（当时与 p30 共卡），约 +5% |
+
+第二轮：载入 mini/baseline 100 epoch 的 `model_final.pth`（开关打开，精修头保持初始化，Δ ≡ 0），在真实预测上走一遍。
+
+| 项 | 结果 |
+|:--|:--|
+| `--eval_only`，`POINT_SOURCE coarse`：segm AP 78.8017、`matched_F1@3/5/8` 0.1580 / 0.3502 / 0.6312、`count_MAE_spike` 2.5986、预测 15665 点 | **与 baseline 末值逐值相同** |
+| `--eval_only`，默认源（refine）：`matched_F1@8` 0.5881、`count_MAE_spike` 9.07、预测 21575 点 | 走通。点的位置与 coarse 相同（Δ ≡ 0），存在性头未训练（σ≈0.5，几乎全部 25 槽都过 0.35），所以多数 |
+| 诊断 `--limit 20`：配对 84/90 穗，每穗 K = 25（2100 个 token），AUC 0.480（未训练，约等于随机），沿轴中位误差 4.27 px | 走通 |
+| 训练集第一个 batch：`loss_point_ref_coord` 0.4452 vs `loss_point_coord` 0.3802（都已 ×5）；`ref_cls` 0.4367 vs 0.1611 | 框准时精修主损失生效。Δ ≡ 0 时两者之比 **1.17** 就是「预测框 vs GT 框」的框系误差，这是精修要消掉的量 |
+| 同上：梯度范数 精修头 0.41 / 全模型 240.4 | 训练中后期新头的梯度量级也不大 |
+
+据此补一条观察量的参照：训练日志里 `loss_point_ref_coord / loss_point_coord` 在 Δ ≡ 0 时是 1.17；训练后 < 1.17 说明精修在消框系误差，< 1 说明精修点比粗点（在 GT 框系下）还准。
 
 ## 用法
 
