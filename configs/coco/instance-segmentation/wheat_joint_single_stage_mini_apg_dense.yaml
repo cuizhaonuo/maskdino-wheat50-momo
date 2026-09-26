@@ -1,0 +1,41 @@
+# ============================================================================
+# 单阶段联合训练 · 500 图小集 · 100 epoch · APGCC 原样的稠密锚点小穗头 + APG（mini/apg-dense，形式 C）
+#   来源：Chen et al., "Improving Point-based Crowd Counting and Localization Based on Auxiliary
+#         Point Guidance"（APGCC, ECCV 2024, arXiv 2405.10589），本地源码 /public/home/zncui/pycharm_project/APGCC
+#   预注册：experiments-bank/ideas/apg-dense.md（判否线已在跑之前写死）
+#   对照：wheat_joint_single_stage_mini_ep100.yaml（mini/baseline@0f71161，output_v2/exp-0923-mini-ep100）
+#
+# 结构：每个 1/4 格中心一个锚点（1024² 下 65,536 个，与 APGCC「stride 8、每格 2×2 锚点」同一组像素位置），
+#   类别无关、不看实例 query 的 IFI 头（1/4 + 1/8 两层特征、4 邻格插值）在每个锚点处预测存在性与偏移。
+#   训练：逐个 wheat_2 穗在其区域内做匈牙利（代价 ‖a+Δ−g‖₂/d̄ − σ(conf)），配上为正、其余为负；
+#   wheat 类穗内的锚点忽略（小穗看得见但没标），背景权重 0.1；每图至多监督 16384 个锚点。
+#   推理：全图取存在性最高的 4000 个提议，按 1/4 掩码概率归给 wheat_2 类分数 ≥ 0.3、掩码概率最高的 query，
+#   每个实例 64 个候选（TEST.POINT_SOURCE auto -> dense）。
+# APG（完全按论文）：每个 GT 小穗周围撒 2 正 2 负辅助点，半径 (0.125, 0.5)·d̄（原生尺度约 (2, 8) px），
+#   送进同一个稠密头：存在性正→1、负→0；定位上正点吸附到 GT、负点 Δ→0（论文 Eq.6）。权重 = 0.2 × 主点损失权重。
+# 25 槽 query 头及其全部原损失【保留】，只作训练期辅助监督：监督上唯一的变化是多了稠密损失与 APG，
+#   推理上唯一的变化是点改由稠密头产出。
+#
+# 与对照的差异：只多了 POINT_DENSE / POINT_APG 两个开关打开后的稠密头与四项损失（及其参数）。
+#   数据、schedule、七项原损失与权重、匹配代价、点头五个旋钮、INPUT 全部继承不动。
+#
+# 用法：
+#   python train_net.py --num-gpus 1 \
+#     --config-file configs/coco/instance-segmentation/wheat_joint_single_stage_mini_apg_dense.yaml \
+#     OUTPUT_DIR /public/home/zncui/pycharm_project/maskdino-wheat50/output_v2/<run-name>
+# 同一次训练内「只用 25 槽头出点」的消融：评估时追加 MODEL.MaskDINO.TEST.POINT_SOURCE coarse
+# ============================================================================
+_BASE_: wheat_joint_single_stage_mini_ep100.yaml
+
+MODEL:
+  MaskDINO:
+    POINT_DENSE: True
+    POINT_DENSE_MAX_ANCHORS: 16384
+    POINT_DENSE_WHEAT_WEIGHT: 0.0
+    POINT_APG: True
+    POINT_APG_NUM: [2, 2]
+    POINT_APG_RADII: [0.125, 0.5]
+    POINT_APG_NEG_EXCLUDE: 0.125
+    POINT_APG_NEG_LOC: "zero"
+    POINT_APG_CLS_WEIGHT: 0.4
+    POINT_APG_LOC_WEIGHT: 1.0

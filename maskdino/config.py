@@ -108,6 +108,53 @@ def add_maskdino_config(cfg):
     # 只训练点头。冻结的 trunk 在训练时也强制保持 eval（固定 BN/dropout），与推理一致。
     cfg.MODEL.MaskDINO.FREEZE_EXCEPT_POINT_HEAD = False
 
+    # ===== APGCC 移植：稠密锚点小穗头（IFI）+ APG 辅助点（maskdino/modeling/point_ifi.py）=====
+    # 全部开关默认关闭；关闭时不建任何参数，模型与 baseline 逐位一致。
+    # IFI 头的结构：1/4（mask_features）与 1/8 两层特征，各自 1×1 投影到 FEAT_DIM 后按 4 邻格插值，
+    # f_θ 宽 IFI_HIDDEN，位置编码 2+PE_DIM 维（频率 2^linspace(0, PE_SIGMA)），再过宽 HEAD_HIDDEN 的 2 层 MLP。
+    # （这 6 项与 mini/apg-refine 的同名键数值相同）
+    cfg.MODEL.MaskDINO.POINT_IFI_FEAT_DIM = 64
+    cfg.MODEL.MaskDINO.POINT_IFI_HIDDEN = 128
+    cfg.MODEL.MaskDINO.POINT_IFI_PE_DIM = 32
+    cfg.MODEL.MaskDINO.POINT_IFI_PE_SIGMA = 6.0
+    cfg.MODEL.MaskDINO.POINT_HEAD_HIDDEN = 256
+    # 偏移输出的单位：1/4 格（原生尺度 4 px）
+    cfg.MODEL.MaskDINO.POINT_OFFSET_SCALE_CELLS = 1.0
+    # 稠密锚点头：每个 1/4 格中心一个锚点（= APGCC stride 8、每格 2×2 锚点的同一组像素位置），类别无关、不看实例 query，
+    # 每个锚点预测存在性与偏移。25 槽头及其损失保留作训练期辅助监督；推理时点改由本头产出，按预测掩码归到各个穗。
+    cfg.MODEL.MaskDINO.POINT_DENSE = False
+    cfg.MODEL.MaskDINO.POINT_DENSE_CLASS_WEIGHT = 2.0   # 存在性 focal（与 POINT_CLASS_WEIGHT 同值）
+    cfg.MODEL.MaskDINO.POINT_DENSE_COORD_WEIGHT = 5.0   # 配上锚点的 L1（GT 框相对系，与 POINT_COORD_WEIGHT 同值）
+    # 逐穗匈牙利的代价：COST_POINT·‖a+Δ−g‖₂/d̄ − COST_CLASS·σ(conf)（APGCC Eq.1 的形式；τ=0.05/px ≈ 1/d̄）
+    cfg.MODEL.MaskDINO.POINT_DENSE_COST_POINT = 1.0
+    cfg.MODEL.MaskDINO.POINT_DENSE_COST_CLASS = 1.0
+    # wheat_2 区域 = GT 掩码在 1/4 分辨率上覆盖 ≥ 0.5 的格，再膨胀 REGION_DILATE·d̄
+    cfg.MODEL.MaskDINO.POINT_DENSE_REGION_DILATE = 0.5
+    # 每张图最多监督的锚点数（显存上限）：先 GT 小穗 n_neg 以内的锚点，再 wheat_2 区域其余锚点，再随机背景
+    cfg.MODEL.MaskDINO.POINT_DENSE_MAX_ANCHORS = 16384
+    # wheat 类 GT 掩码内锚点的存在性权重。0 = 忽略：wheat 穗的小穗看得见但没标，对类别无关的头当负样本是标注噪声。
+    # 区域外背景用 POINT_EMPTY_CLS_WEIGHT。
+    cfg.MODEL.MaskDINO.POINT_DENSE_WHEAT_WEIGHT = 0.0
+    # 存在性先验（cls 偏置初始化为 −log((1−π)/π)），否则开训时 6.5 万个锚点的 focal 损失很大
+    cfg.MODEL.MaskDINO.POINT_DENSE_PRIOR = 0.01
+    # Ni = 1 的穗没有最近邻距离，d̄ 取 FALLBACK·max(框宽, 框高)（像素）
+    cfg.MODEL.MaskDINO.POINT_DBAR_FALLBACK = 0.1
+    # APG 辅助点（只在训练时，送进稠密头）。半径以每穗 GT 小穗的平均最近邻距离 d̄ 为单位（LSJ 缩放 0.1~2.0，不能用固定像素）：
+    # 正点每轴 U(±RADII[0])，负点每轴 ±U(RADII[0], RADII[1])；原生尺度 d̄≈16.7px 时约 (2, 8) px，与论文相同。
+    cfg.MODEL.MaskDINO.POINT_APG = False
+    cfg.MODEL.MaskDINO.POINT_APG_NUM = [2, 2]            # (k_pos, k_neg)，每个 GT 点各撒几个
+    cfg.MODEL.MaskDINO.POINT_APG_RADII = [0.125, 0.5]    # (n_pos, n_neg) / d̄
+    cfg.MODEL.MaskDINO.POINT_APG_NEG_EXCLUDE = 0.125     # 负点离本穗任一 GT 近于此值·d̄ 即丢弃
+    # 负点的定位目标："zero" = Δ→0（论文 Eq.6）；"snap" = 吸附到最近 GT
+    cfg.MODEL.MaskDINO.POINT_APG_NEG_LOC = "zero"
+    cfg.MODEL.MaskDINO.POINT_APG_NEG_LOC_COEF = 1.0
+    # 论文 λ5=0.2：APG 损失权重 = 0.2 × 主点损失权重（存在性 2.0、坐标 5.0）
+    cfg.MODEL.MaskDINO.POINT_APG_CLS_WEIGHT = 0.4
+    cfg.MODEL.MaskDINO.POINT_APG_LOC_WEIGHT = 1.0
+    cfg.MODEL.MaskDINO.POINT_APG_SEED = 0
+    # d̄ 低于此值（像素，约为 LSJ 缩放 < 0.24）的穗：区域忽略、不参与匹配、不撒 APG 点
+    cfg.MODEL.MaskDINO.POINT_MIN_DBAR_PX = 4.0
+
     # MSDeformAttn encoder configs
     cfg.MODEL.SEM_SEG_HEAD.DEFORMABLE_TRANSFORMER_ENCODER_IN_FEATURES = ["res3", "res4", "res5"]
     cfg.MODEL.SEM_SEG_HEAD.DEFORMABLE_TRANSFORMER_ENCODER_N_POINTS = 4
@@ -132,6 +179,15 @@ def add_maskdino_config(cfg):
     cfg.MODEL.MaskDINO.TEST.PANO_TEMPERATURE = 0.06
     # 小穗点存在性置信度阈值（sigmoid 后 > 该值的点才输出）
     cfg.MODEL.MaskDINO.TEST.POINT_THRESHOLD = 0.35
+    # 推理时点从哪个头出："auto" 按开关选（POINT_DENSE -> dense，否则 coarse）；
+    # 在开关打开的 checkpoint 上指定 "coarse"，即得到同一次训练内「只用 25 槽头」的消融。
+    cfg.MODEL.MaskDINO.TEST.POINT_SOURCE = "auto"
+    # 稠密头推理：全图取存在性最高的 PRE_TOPN 个提议，按 1/4 掩码概率归给「wheat_2 类分数 ≥ OWNER_SCORE 且掩码概率最高」
+    # 的 query（要求掩码概率 ≥ MASK_THRESH），每个实例输出 TOPK 个候选点（未归属的候选分数为 0）。
+    cfg.MODEL.MaskDINO.TEST.POINT_DENSE_TOPK = 64
+    cfg.MODEL.MaskDINO.TEST.POINT_DENSE_PRE_TOPN = 4000
+    cfg.MODEL.MaskDINO.TEST.POINT_DENSE_OWNER_SCORE = 0.3
+    cfg.MODEL.MaskDINO.TEST.POINT_DENSE_MASK_THRESH = 0.5
     # 评估时是否额外加挂小穗点评估器（SpikeletPointEvaluator，见 maskdino/evaluation/）
     cfg.MODEL.MaskDINO.TEST.SPIKELET_EVAL = False
     # 点匹配的距离阈值（原图像素，多档一起报）。GT 实测同穗内小穗最近邻间距中位 16px，

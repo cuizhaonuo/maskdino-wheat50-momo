@@ -54,6 +54,11 @@ class MaskDINO(nn.Module):
         transform_eval: bool = False,
         semantic_ce_loss: bool = False,
         point_threshold: float = 0.35,
+        point_source: str = "coarse",
+        dense_topk: int = 64,
+        dense_pre_topn: int = 4000,
+        dense_owner_score: float = 0.3,
+        dense_mask_thresh: float = 0.5,
     ):
         """
         Args:
@@ -111,6 +116,15 @@ class MaskDINO(nn.Module):
         # 小穗点推理：存在性阈值 + 带小穗的类别（wheat_2 的连续 id=1，只有该类输出点）
         self.point_threshold = point_threshold
         self.spikelet_class_id = 1
+        # 点从哪个头出："coarse" = 25 槽头（框相对坐标）；"dense" = 稠密锚点头（padded 图像归一化绝对坐标，
+        # 按预测掩码归到各个穗，不再经预测框换算）
+        assert point_source in ("coarse", "dense"), point_source
+        self.point_source = point_source
+        self.point_abs_coords = point_source == "dense"
+        self.dense_topk = dense_topk
+        self.dense_pre_topn = dense_pre_topn
+        self.dense_owner_score = dense_owner_score
+        self.dense_mask_thresh = dense_mask_thresh
 
         if not self.semantic_on:
             assert self.sem_seg_postprocess_before_inference
@@ -176,6 +190,18 @@ class MaskDINO(nn.Module):
             for i in range(dec_layers):
                 aux_weight_dict.update({k + f"_{i}": v for k, v in weight_dict.items()})
             weight_dict.update(aux_weight_dict)
+        # APGCC 移植的损失每次前向只算一次，放在 interm / dn / 深监督展开之后注册，不生成 _interm/_dn/_i 副本
+        if cfg.MODEL.MaskDINO.POINT_DENSE:
+            weight_dict.update({"loss_point_dense_coord": cfg.MODEL.MaskDINO.POINT_DENSE_COORD_WEIGHT,
+                                "loss_point_dense_cls": cfg.MODEL.MaskDINO.POINT_DENSE_CLASS_WEIGHT})
+        if cfg.MODEL.MaskDINO.POINT_APG:
+            assert cfg.MODEL.MaskDINO.POINT_DENSE, "POINT_APG needs POINT_DENSE (APG 训练的是稠密锚点头)"
+            weight_dict.update({"loss_point_apg_cls": cfg.MODEL.MaskDINO.POINT_APG_CLS_WEIGHT,
+                                "loss_point_apg_loc": cfg.MODEL.MaskDINO.POINT_APG_LOC_WEIGHT})
+        point_source = cfg.MODEL.MaskDINO.TEST.POINT_SOURCE
+        if point_source == "auto":
+            point_source = "dense" if cfg.MODEL.MaskDINO.POINT_DENSE else "coarse"
+        assert point_source != "dense" or cfg.MODEL.MaskDINO.POINT_DENSE, "POINT_SOURCE=dense needs POINT_DENSE"
         if cfg.MODEL.MaskDINO.BOX_LOSS:
             losses = ["labels", "masks","boxes","points"]
         else:
@@ -199,6 +225,21 @@ class MaskDINO(nn.Module):
             point_cost_class=cfg.MODEL.MaskDINO.COST_POINT_CLASS_WEIGHT,
             point_focal_alpha=cfg.MODEL.MaskDINO.POINT_FOCAL_ALPHA,
             point_empty_cls_weight=cfg.MODEL.MaskDINO.POINT_EMPTY_CLS_WEIGHT,
+            point_dense=cfg.MODEL.MaskDINO.POINT_DENSE,
+            point_dense_cost_point=cfg.MODEL.MaskDINO.POINT_DENSE_COST_POINT,
+            point_dense_cost_class=cfg.MODEL.MaskDINO.POINT_DENSE_COST_CLASS,
+            point_dense_region_dilate=cfg.MODEL.MaskDINO.POINT_DENSE_REGION_DILATE,
+            point_dense_max_anchors=cfg.MODEL.MaskDINO.POINT_DENSE_MAX_ANCHORS,
+            point_dense_wheat_weight=cfg.MODEL.MaskDINO.POINT_DENSE_WHEAT_WEIGHT,
+            point_dbar_fallback=cfg.MODEL.MaskDINO.POINT_DBAR_FALLBACK,
+            point_apg=cfg.MODEL.MaskDINO.POINT_APG,
+            point_apg_num=cfg.MODEL.MaskDINO.POINT_APG_NUM,
+            point_apg_radii=cfg.MODEL.MaskDINO.POINT_APG_RADII,
+            point_apg_neg_exclude=cfg.MODEL.MaskDINO.POINT_APG_NEG_EXCLUDE,
+            point_apg_neg_loc=cfg.MODEL.MaskDINO.POINT_APG_NEG_LOC,
+            point_apg_neg_loc_coef=cfg.MODEL.MaskDINO.POINT_APG_NEG_LOC_COEF,
+            point_apg_seed=cfg.MODEL.MaskDINO.POINT_APG_SEED,
+            point_min_dbar_px=cfg.MODEL.MaskDINO.POINT_MIN_DBAR_PX,
         )
 
         return {
@@ -228,6 +269,11 @@ class MaskDINO(nn.Module):
             "pano_temp": cfg.MODEL.MaskDINO.TEST.PANO_TEMPERATURE,
             "semantic_ce_loss": cfg.MODEL.MaskDINO.TEST.SEMANTIC_ON and cfg.MODEL.MaskDINO.SEMANTIC_CE_LOSS and not cfg.MODEL.MaskDINO.TEST.PANOPTIC_ON,
             "point_threshold": cfg.MODEL.MaskDINO.TEST.POINT_THRESHOLD,
+            "point_source": point_source,
+            "dense_topk": cfg.MODEL.MaskDINO.TEST.POINT_DENSE_TOPK,
+            "dense_pre_topn": cfg.MODEL.MaskDINO.TEST.POINT_DENSE_PRE_TOPN,
+            "dense_owner_score": cfg.MODEL.MaskDINO.TEST.POINT_DENSE_OWNER_SCORE,
+            "dense_mask_thresh": cfg.MODEL.MaskDINO.TEST.POINT_DENSE_MASK_THRESH,
         }
 
     @property
@@ -304,9 +350,13 @@ class MaskDINO(nn.Module):
             mask_cls_results = outputs["pred_logits"]
             mask_pred_results = outputs["pred_masks"]
             mask_box_results = outputs["pred_boxes"]
-            # 小穗点预测（框相对归一化 [0,1]）
-            point_coord_results = outputs["pred_point_coords"]   # [B, Q, P, 2]
-            point_logit_results = outputs["pred_point_logits"]   # [B, Q, P, 1]
+            # 小穗点预测：coarse 为框相对归一化 [0,1]；dense 为 padded 图像归一化绝对坐标（每个实例 K 个候选）
+            if self.point_source == "dense":
+                point_coord_results, point_logit_results = self._dense_to_query_candidates(
+                    mask_cls_results, mask_pred_results, outputs["pred_dense_points"], outputs["pred_dense_logits"])
+            else:
+                point_coord_results = outputs["pred_point_coords"]   # [B, Q, P, 2]
+                point_logit_results = outputs["pred_point_logits"]   # [B, Q, P, 1]
             # upsample masks
             mask_pred_results = F.interpolate(
                 mask_pred_results,
@@ -353,6 +403,9 @@ class MaskDINO(nn.Module):
                     height = new_size[0]/image_size[0]*height
                     width = new_size[1]/image_size[1]*width
                     mask_box_result = self.box_postprocess(mask_box_result, height, width)
+                    if self.point_abs_coords:
+                        # 稠密头的小穗点与框同为 padded 图像归一化坐标，用同一套缩放换到原图像素
+                        point_coord_result = point_coord_result * point_coord_result.new_tensor([width, height])
 
                     instance_r = retry_if_cuda_oom(self.instance_inference)(mask_cls_result, mask_pred_result, mask_box_result, point_coord_result, point_logit_result)
                     processed_results[-1]["instances"] = instance_r
@@ -379,6 +432,9 @@ class MaskDINO(nn.Module):
                     "masks": padded_masks,
                     "boxes":box_ops.box_xyxy_to_cxcywh(targets_per_image.gt_boxes.tensor)/image_size_xyxy,
                     "points": gt_points,
+                    # 图像与 padded 张量的像素尺寸 (W, H)：稠密头 / APG 做像素与两种归一化坐标之间的换算
+                    "image_wh": wh,
+                    "pad_wh": torch.as_tensor([w_pad, h_pad], dtype=torch.float, device=self.device),
                 }
             )
         return new_targets
@@ -403,9 +459,57 @@ class MaskDINO(nn.Module):
                     "masks": padded_masks,
                     "boxes": box_ops.box_xyxy_to_cxcywh(targets_per_image.gt_boxes.tensor) / image_size_xyxy,
                     "points": gt_points,
+                    # 图像与 padded 张量的像素尺寸 (W, H)：稠密头 / APG 做像素与两种归一化坐标之间的换算
+                    "image_wh": wh,
+                    "pad_wh": torch.as_tensor([w_pad, h_pad], dtype=torch.float, device=self.device),
                 }
             )
         return new_targets
+
+    @torch.no_grad()
+    def _dense_to_query_candidates(self, mask_cls, mask_pred, dense_pts, dense_logits):
+        """把稠密头的全图提议归到各个 query，整理成与 25 槽头同形的输出，供 instance_inference 与诊断脚本直接使用。
+
+        Args:
+            mask_cls:     [B,Q,C] 类别 logit
+            mask_pred:    [B,Q,h,w] 掩码 logit（1/4 分辨率，padded 坐标系）
+            dense_pts:    [B,A,2] 提议位置 a + Δ(a)（padded 归一化）
+            dense_logits: [B,A]   提议存在性 logit
+        Returns:
+            coords [B,Q,K,2]（padded 归一化），logits [B,Q,K,1]。
+        每图：取存在性最高的 PRE_TOPN 个提议；在掩码上采样得到 M[q,j]；wheat_2 类分数 ≥ OWNER_SCORE 的 query 为候选主人，
+        提议 j 归给其中 M 最大者（要求 M ≥ MASK_THRESH）。S[q,j] = σ(conf_j)（q 拥有 j）；
+        非候选主人的 query 只要 M ≥ MASK_THRESH 也可得分（不排他，它们类别分数低，评估器不会用到）；其余为 0。
+        每个 query 取 S 最高的 K 个，分数 0 的候选 logit 为 −20（任何阈值都滤掉）。
+        """
+        B, Q = mask_cls.shape[:2]
+        K = self.dense_topk
+        coords = dense_pts.new_zeros((B, Q, K, 2))
+        logits = dense_pts.new_full((B, Q, K, 1), -20.0)
+        for b in range(B):
+            n = min(self.dense_pre_topn, dense_logits.shape[1])
+            top_lg, top_i = dense_logits[b].topk(n)
+            pts = dense_pts[b, top_i]                                          # [n,2]
+            conf = top_lg.sigmoid()
+            grid = (pts * 2 - 1).view(1, 1, n, 2).expand(Q, 1, n, 2)
+            M = F.grid_sample(mask_pred[b][:, None].float(), grid.float(), mode="bilinear",
+                              padding_mode="zeros", align_corners=False)[:, 0, 0].sigmoid()   # [Q,n]
+            eligible = mask_cls[b, :, self.spikelet_class_id].sigmoid() >= self.dense_owner_score
+            S = torch.zeros_like(M)
+            if eligible.any():
+                M_el = M.masked_fill(~eligible[:, None], -1.0)
+                best, owner = M_el.max(dim=0)                                  # [n]
+                ok = best >= self.dense_mask_thresh
+                j = torch.nonzero(ok).flatten()
+                S[owner[j], j] = conf[j]
+            S[~eligible] = (M[~eligible] >= self.dense_mask_thresh).float() * conf[None]
+            k = min(K, n)
+            _, idx = (S + 1e-4 * conf[None] * M).topk(k, dim=1)               # [Q,k]
+            s_k = S.gather(1, idx)
+            coords[b, :, :k] = pts[idx]
+            logits[b, :, :k, 0] = torch.where(s_k > 0, torch.logit(s_k.clamp(1e-6, 1 - 1e-6)),
+                                              torch.full_like(s_k, -20.0))
+        return coords, logits
 
     def semantic_inference(self, mask_cls, mask_pred):
         # if use cross-entropy loss in training, evaluate with softmax
@@ -500,7 +604,7 @@ class MaskDINO(nn.Module):
         mask_pred = mask_pred[topk_indices]
         # 同步按 topk 选出每个实例的小穗点预测
         if point_coords is not None:
-            point_coords = point_coords[topk_indices]   # [K, P, 2] 框相对 [0,1]
+            point_coords = point_coords[topk_indices]   # [K, P, 2] 框相对 [0,1]（dense 源下为像素）
             point_logits = point_logits[topk_indices]   # [K, P, 1]
         # if this is panoptic segmentation, we only keep the "thing" classes
         if self.panoptic_on:
@@ -538,13 +642,16 @@ class MaskDINO(nn.Module):
             boxes_xyxy = mask_box_result  # [K, 4] 像素 xyxy
             for k in range(len(result)):
                 if int(labels_per_image[k].item()) == self.spikelet_class_id:
-                    x0, y0, x1, y1 = boxes_xyxy[k]
-                    bw = (x1 - x0).clamp(min=0)
-                    bh = (y1 - y0).clamp(min=0)
                     score_k = point_logits[k].sigmoid().squeeze(-1)   # [P]
                     keep_pt = score_k > self.point_threshold
-                    rel = point_coords[k][keep_pt]                    # [Ki, 2] 框相对
-                    xy = torch.stack([x0, y0]) + rel * torch.stack([bw, bh])  # [Ki, 2] 像素
+                    if self.point_abs_coords:
+                        xy = point_coords[k][keep_pt]                 # [Ki, 2] 已是像素（见 forward）
+                    else:
+                        x0, y0, x1, y1 = boxes_xyxy[k]
+                        bw = (x1 - x0).clamp(min=0)
+                        bh = (y1 - y0).clamp(min=0)
+                        rel = point_coords[k][keep_pt]                # [Ki, 2] 框相对
+                        xy = torch.stack([x0, y0]) + rel * torch.stack([bw, bh])  # [Ki, 2] 像素
                     spikelet_points.append(xy)
                     spikelet_counts.append(int(keep_pt.sum().item()))
                 else:

@@ -18,6 +18,7 @@ from detectron2.structures import BitMasks
 from .dino_decoder import TransformerDecoder, DeformableTransformerDecoderLayer
 from ...utils.utils import MLP, gen_encoder_output_proposals, inverse_sigmoid
 from ...utils import box_ops
+from ..point_ifi import IFIPointHead, PointHeadProbe, dense_anchor_grid, pick_stride8
 
 
 TRANSFORMER_DECODER_REGISTRY = Registry("TRANSFORMER_MODULE")
@@ -68,6 +69,9 @@ class MaskDINODecoder(nn.Module):
             query_dim: int = 4,
             dec_layer_share: bool = False,
             semantic_ce_loss: bool = False,
+            point_dense: bool = False,
+            point_ifi_cfg: dict = None,
+            point_dense_prior: float = 0.01,
     ):
         """
         NOTE: this interface is experimental.
@@ -171,6 +175,14 @@ class MaskDINODecoder(nn.Module):
         self.bbox_embed = nn.ModuleList(box_embed_layerlist)
         self.decoder.bbox_embed = self.bbox_embed
 
+        # APGCC 的稠密锚点小穗头（POINT_DENSE）：关着时不建参数，模型与 baseline 逐位一致。
+        # 输入 1/4 的 mask_features（mask_dim 维）与 1/8 的多尺度特征（hidden_dim 维），类别无关、不看实例 query。
+        # 放在 __init__ 最后建：开着时其余参数的随机初始化也与 baseline 相同（不插队消耗 RNG）。
+        self.point_dense = point_dense
+        if point_dense:
+            self.point_dense_head = IFIPointHead(in_channels=(mask_dim, hidden_dim), q_dim=None,
+                                                 cls_prior=point_dense_prior, **point_ifi_cfg)
+
 
     @classmethod
     def from_config(cls, cfg, in_channels, mask_classification):
@@ -198,6 +210,16 @@ class MaskDINODecoder(nn.Module):
         ret["learn_tgt"] = cfg.MODEL.MaskDINO.LEARN_TGT
         ret["total_num_feature_levels"] = cfg.MODEL.SEM_SEG_HEAD.TOTAL_NUM_FEATURE_LEVELS
         ret["semantic_ce_loss"] = cfg.MODEL.MaskDINO.TEST.SEMANTIC_ON and cfg.MODEL.MaskDINO.SEMANTIC_CE_LOSS and ~cfg.MODEL.MaskDINO.TEST.PANOPTIC_ON
+        ret["point_dense"] = cfg.MODEL.MaskDINO.POINT_DENSE
+        ret["point_dense_prior"] = cfg.MODEL.MaskDINO.POINT_DENSE_PRIOR
+        ret["point_ifi_cfg"] = dict(
+            feat_dim=cfg.MODEL.MaskDINO.POINT_IFI_FEAT_DIM,
+            ifi_hidden=cfg.MODEL.MaskDINO.POINT_IFI_HIDDEN,
+            pe_dim=cfg.MODEL.MaskDINO.POINT_IFI_PE_DIM,
+            pe_sigma=cfg.MODEL.MaskDINO.POINT_IFI_PE_SIGMA,
+            hidden=cfg.MODEL.MaskDINO.POINT_HEAD_HIDDEN,
+            offset_scale_cells=cfg.MODEL.MaskDINO.POINT_OFFSET_SCALE_CELLS,
+        )
 
         return ret
 
@@ -611,7 +633,36 @@ class MaskDINODecoder(nn.Module):
         }
         if self.two_stage:
             out['interm_outputs'] = interm_outputs
+        if self.point_dense:
+            # 只进主 out：不进 aux_outputs / interm_outputs / mask_dict
+            out.update(self._point_dense_outputs(mask_features, x))
         return out, mask_dict
+
+    @torch.jit.unused
+    def _point_dense_outputs(self, mask_features, feats, chunk=16384):
+        """稠密锚点头的输出。锚点 = 每个 1/4 格中心（padded 图像归一化坐标）。
+
+        训练：只下发 PointHeadProbe 与 1/4 网格尺寸，由 criterion 对选中的锚点与 APG 辅助点按需求值。
+        推理：全网格分块求值，返回每个锚点吸附后的位置 a + Δ(a) [B,A,2] 与存在性 logit [B,A]。
+        """
+        proj = self.point_dense_head.prepare([mask_features, pick_stride8(feats, mask_features)])
+        probe = PointHeadProbe(self.point_dense_head, proj, None)
+        H4, W4 = mask_features.shape[-2:]
+        if self.training:
+            return {'point_dense_probe': probe, 'point_dense_hw': (H4, W4)}
+        B = mask_features.shape[0]
+        anchors = dense_anchor_grid(H4, W4, mask_features.device)       # [A,2]
+        A = anchors.shape[0]
+        pts = anchors.new_zeros((B, A, 2))
+        lgs = anchors.new_zeros((B, A))
+        for b in range(B):
+            for s0 in range(0, A, chunk):
+                a = anchors[s0:s0 + chunk]
+                b_idx = torch.full((a.shape[0],), b, device=a.device, dtype=torch.long)
+                lg, d = probe(b_idx, a)
+                pts[b, s0:s0 + chunk] = a + d
+                lgs[b, s0:s0 + chunk] = lg
+        return {'pred_dense_points': pts, 'pred_dense_logits': lgs}
 
     def forward_prediction_heads(self, output, mask_features, pred_mask=True):
         decoder_output = self.decoder_norm(output)

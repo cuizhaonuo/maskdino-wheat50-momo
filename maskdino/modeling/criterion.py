@@ -9,6 +9,7 @@
 MaskFormer criterion.
 """
 import logging
+import math
 
 import torch
 import torch.nn.functional as F
@@ -23,6 +24,7 @@ from detectron2.projects.point_rend.point_features import (
 
 from ..utils.misc import is_dist_avail_and_initialized, nested_tensor_from_tensor_list
 from maskdino.utils import box_ops
+from .point_ifi import dense_anchor_grid, instance_dbar_px, sample_apg
 
 try:
     # 正负样本匹配的 debug 可视化。要关掉请改各模块顶部的 ENABLED = False，
@@ -145,7 +147,12 @@ class SetCriterion(nn.Module):
     def __init__(self, num_classes, matcher, weight_dict, eos_coef, losses,
                  num_points, oversample_ratio, importance_sample_ratio,dn="no",dn_losses=[], panoptic_on=False, semantic_ce_loss=False,
                  num_spikelet_points=50, point_cost_coord=5.0, point_cost_class=2.0,
-                 point_focal_alpha=0.25, point_empty_cls_weight=1.0):
+                 point_focal_alpha=0.25, point_empty_cls_weight=1.0,
+                 point_dense=False, point_dense_cost_point=1.0, point_dense_cost_class=1.0,
+                 point_dense_region_dilate=0.5, point_dense_max_anchors=16384, point_dense_wheat_weight=0.0,
+                 point_dbar_fallback=0.1, point_apg=False, point_apg_num=(2, 2), point_apg_radii=(0.125, 0.5),
+                 point_apg_neg_exclude=0.125, point_apg_neg_loc="zero", point_apg_neg_loc_coef=1.0,
+                 point_apg_seed=0, point_min_dbar_px=4.0):
         """Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
@@ -183,6 +190,26 @@ class SetCriterion(nn.Module):
         self.point_focal_alpha = point_focal_alpha
         # Ni==0 实例的存在性损失权重（只作用于 cls_loss 的分子，不影响 denom）
         self.point_empty_cls_weight = point_empty_cls_weight
+
+        # APGCC 移植：稠密锚点头的损失与 APG 辅助点（见 maskdino/modeling/point_ifi.py）。
+        # 不进 self.losses —— 稠密头不随 decoder 层走，每次前向只算一次。
+        self.point_dense = point_dense
+        self.point_dense_cost_point = point_dense_cost_point
+        self.point_dense_cost_class = point_dense_cost_class
+        self.point_dense_region_dilate = point_dense_region_dilate
+        self.point_dense_max_anchors = point_dense_max_anchors
+        self.point_dense_wheat_weight = point_dense_wheat_weight
+        self.point_dbar_fallback = point_dbar_fallback
+        self.point_apg = point_apg
+        self.point_apg_num = tuple(point_apg_num)
+        self.point_apg_radii = tuple(point_apg_radii)
+        self.point_apg_neg_exclude = point_apg_neg_exclude
+        assert point_apg_neg_loc in ("snap", "zero"), point_apg_neg_loc
+        self.point_apg_neg_loc = point_apg_neg_loc
+        self.point_apg_neg_loc_coef = point_apg_neg_loc_coef
+        self.point_apg_seed = point_apg_seed
+        self.point_min_dbar_px = point_min_dbar_px
+        self._apg_gen = None   # CPU Generator，首次用到时按 seed + rank 建，与 DN 用的全局 RNG 隔离
 
     def loss_labels_ce(self, outputs, targets, indices, num_masks):
         """Classification loss (NLL)
@@ -422,6 +449,211 @@ class SetCriterion(nn.Module):
         }
         return losses
 
+    def _point_focal(self, logit, tgt):
+        """与 loss_points 相同的逐元素存在性 focal（α=POINT_FOCAL_ALPHA, γ=2），未求和。"""
+        alpha, gamma = self.point_focal_alpha, 2.0
+        prob = logit.sigmoid()
+        ce = F.binary_cross_entropy_with_logits(logit, tgt, reduction='none')
+        p_t = prob * tgt + (1 - prob) * (1 - tgt)
+        alpha_t = alpha * tgt + (1 - alpha) * (1 - tgt)
+        return alpha_t * ce * ((1 - p_t) ** gamma)
+
+    def _apg_generator(self):
+        if self._apg_gen is None:
+            rank = torch.distributed.get_rank() if is_dist_avail_and_initialized() else 0
+            self._apg_gen = torch.Generator().manual_seed(int(self.point_apg_seed) + rank)
+        return self._apg_gen
+
+    def _dense_supervision(self, targets, H4, W4, device):
+        """逐图选出要监督的锚点及其权重，并整理每个有效 wheat_2 穗的信息。
+
+        权重：有效 wheat_2 区域（GT 掩码在 1/4 上覆盖 ≥ 0.5，再膨胀 REGION_DILATE·d̄）为 1；
+              wheat 类 GT 掩码内为 POINT_DENSE_WHEAT_WEIGHT；d̄ 过小的 wheat_2 为 0；其余背景为 POINT_EMPTY_CLS_WEIGHT。
+        选择（每图至多 MAX_ANCHORS 个）：先 GT 小穗 n_neg·d̄ 以内的锚点，再 wheat_2 区域其余锚点，再随机背景补足；权重为 0 的不选。
+        """
+        gen = self._apg_generator()
+        anchors = dense_anchor_grid(H4, W4, device)                    # [A,2] padded 归一化
+        A = anchors.shape[0]
+        budget = int(self.point_dense_max_anchors)
+        n_neg = self.point_apg_radii[1]
+
+        def cover(m):   # [N,Hp,Wp] bool -> [N,H4,W4] bool
+            return F.adaptive_avg_pool2d(m.float()[:, None], (H4, W4))[:, 0] >= 0.5
+
+        chosen_all, weights_all, insts = [], [], []
+        for b, t in enumerate(targets):
+            img_wh = t['image_wh'].to(device).float()
+            pad_wh = t['pad_wh'].to(device).float()
+            cell_px = float((pad_wh / pad_wh.new_tensor([W4, H4])).mean())
+            anchor_px = anchors * pad_wh
+            labels, masks = t['labels'], t['masks']
+            weight = torch.full((H4, W4), float(self.point_empty_cls_weight), device=device)
+            wheat = labels == 0
+            if wheat.any():
+                weight[cover(masks[wheat].any(0, keepdim=True))[0]] = float(self.point_dense_wheat_weight)
+            weight = weight.flatten()
+            region_any = torch.zeros(A, dtype=torch.bool, device=device)
+            near_any = torch.zeros(A, dtype=torch.bool, device=device)
+            for g in torch.nonzero(labels == 1).flatten().tolist():
+                gt = t['points'][g]
+                if gt.shape[0] == 0:
+                    continue
+                gt_px = gt.to(device).float() * img_wh
+                box_px = t['boxes'][g, 2:].to(device).float() * img_wh
+                dbar = instance_dbar_px(gt_px)
+                dbar = float(dbar) if dbar is not None else float(self.point_dbar_fallback * box_px.max())
+                cov_g = cover(masks[g][None])[0]
+                if dbar < self.point_min_dbar_px:
+                    weight[cov_g.flatten()] = 0.0          # 太小：忽略，不参与匹配与 APG
+                    continue
+                r = int(math.ceil(self.point_dense_region_dilate * dbar / cell_px))
+                reg = cov_g if r == 0 else \
+                    F.max_pool2d(cov_g.float()[None, None], 2 * r + 1, stride=1, padding=r)[0, 0] > 0
+                reg = reg.flatten()
+                cand = torch.nonzero(reg).flatten()
+                if cand.numel() > 0:
+                    near = cand[torch.cdist(anchor_px[cand], gt_px).min(dim=1).values <= n_neg * dbar]
+                    near_any[near] = True
+                region_any |= reg
+                insts.append(dict(b=b, gt_px=gt_px, dbar=dbar, reg=reg, box_px=box_px,
+                                  img_wh=img_wh, pad_wh=pad_wh))
+            weight[region_any] = 1.0
+            region_idx = torch.nonzero(region_any).flatten()
+            if region_idx.numel() > budget:
+                near_idx = torch.nonzero(near_any).flatten()[:budget]
+                rest = region_idx[~near_any[region_idx]]
+                keep = budget - near_idx.numel()
+                perm = torch.randperm(rest.numel(), generator=gen)[:max(keep, 0)].to(device)
+                chosen = torch.cat([near_idx, rest[perm]])
+            else:
+                chosen = region_idx
+            bg_idx = torch.nonzero((weight > 0) & ~region_any).flatten()
+            n_bg = min(budget - chosen.numel(), bg_idx.numel())
+            if n_bg > 0:
+                perm = torch.randperm(bg_idx.numel(), generator=gen)[:n_bg].to(device)
+                chosen = torch.cat([chosen, bg_idx[perm]])
+            chosen_all.append(chosen)
+            weights_all.append(weight[chosen])
+        return anchors, chosen_all, weights_all, insts
+
+    def loss_points_dense(self, outputs, targets):
+        """稠密锚点头的点损失 + APG 辅助点损失（APGCC 原样的形式）。
+
+        每个选中的锚点 a 在自己的位置求 (存在性, 偏移)，提议位置 p = a + Δ(a)（padded 归一化坐标）。
+        逐个有效 wheat_2 穗做匈牙利：候选 = 该穗区域内、尚未被别的穗配走的选中锚点；
+        代价 COST_POINT·‖p−g‖₂/d̄ − COST_CLASS·σ(conf)（APGCC Eq.1 的形式）。配上的锚点为正，其余为负。
+        存在性：focal（α=POINT_FOCAL_ALPHA, γ=2）× 锚点权重，全部选中锚点求和 / ΣNi；
+        坐标：配上锚点的 L1（GT 框相对系）求和 / ΣNi。
+        APG：每个有效穗的 GT 小穗周围撒正/负辅助点送进同一个头（不看 query）：存在性 BCE（正→1、负→0，正负各取均值再相加）；
+             定位 L1（GT 框相对系）：正点吸附到最近 GT，负点按 POINT_APG_NEG_LOC（"zero" = 论文 Eq.6 的 Δ→0）。
+        """
+        probe = outputs['point_dense_probe']
+        H4, W4 = outputs['point_dense_hw']
+        device = outputs['pred_logits'].device
+        anchors, chosen_all, weights_all, insts = self._dense_supervision(targets, H4, W4, device)
+
+        pos_list = [anchors[c] for c in chosen_all]
+        b_list = [torch.full((c.numel(),), b, device=device, dtype=torch.long) for b, c in enumerate(chosen_all)]
+        n_sel = [c.numel() for c in chosen_all]
+        offs = [0]
+        for n in n_sel:
+            offs.append(offs[-1] + n)
+        N_sel = offs[-1]
+
+        aux_pos, aux_b, aux_is_pos, aux_tgt_px, aux_box_px, aux_pad = [], [], [], [], [], []
+        if self.point_apg:
+            gen = self._apg_generator()
+            for it in insts:
+                if it['gt_px'].shape[0] < 1:
+                    continue
+                pos_px, pos_near, neg_px, neg_near = sample_apg(
+                    it['gt_px'], it['dbar'], it['img_wh'].tolist(), self.point_apg_num, self.point_apg_radii,
+                    self.point_apg_neg_exclude, gen)
+                for pts, near, is_pos in ((pos_px, pos_near, True), (neg_px, neg_near, False)):
+                    n = pts.shape[0]
+                    if n == 0:
+                        continue
+                    aux_pos.append(pts / it['pad_wh'])
+                    aux_b.append(torch.full((n,), it['b'], device=device, dtype=torch.long))
+                    aux_is_pos.append(torch.full((n,), is_pos, device=device, dtype=torch.bool))
+                    aux_tgt_px.append(it['gt_px'][near])
+                    aux_box_px.append(it['box_px'].expand(n, 2))
+                    aux_pad.append(it['pad_wh'].expand(n, 2))
+        n_aux = sum(a.shape[0] for a in aux_pos)
+
+        zero = outputs['pred_logits'].sum() * 0.0
+        losses = {'loss_point_dense_cls': zero, 'loss_point_dense_coord': zero}
+        if self.point_apg:
+            losses.update({'loss_point_apg_cls': zero, 'loss_point_apg_loc': zero})
+        if N_sel + n_aux == 0:
+            return losses
+        lg, d = probe(torch.cat(b_list + aux_b), torch.cat(pos_list + aux_pos))
+
+        # ---- 逐穗匈牙利（每个锚点至多配一次）----
+        tgt = torch.zeros(N_sel, device=device)
+        coord_loss = torch.zeros([], device=device)
+        num_pos = 0
+        pad_all = torch.stack([t['pad_wh'] for t in targets]).to(device).float()
+        for b in range(len(targets)):
+            chosen = chosen_all[b]
+            if chosen.numel() == 0:
+                continue
+            local = torch.full((anchors.shape[0],), -1, device=device, dtype=torch.long)
+            local[chosen] = torch.arange(chosen.numel(), device=device)
+            taken = torch.zeros(chosen.numel(), dtype=torch.bool, device=device)
+            lg_b = lg[offs[b]:offs[b + 1]]
+            p_px = (anchors[chosen] + d[offs[b]:offs[b + 1]]) * pad_all[b]      # [n,2]，带梯度
+            for it in insts:
+                if it['b'] != b:
+                    continue
+                gt_px = it['gt_px']
+                Ni = gt_px.shape[0]
+                num_pos += Ni
+                cand = local[it['reg']]
+                cand = cand[cand >= 0]
+                cand = cand[~taken[cand]]
+                if cand.numel() == 0:
+                    continue
+                with torch.no_grad():
+                    C = self.point_dense_cost_point * torch.cdist(p_px[cand].float(), gt_px) / it['dbar'] \
+                        - self.point_dense_cost_class * lg_b[cand].sigmoid()[:, None]
+                row, col = linear_sum_assignment(C.cpu())
+                row = torch.as_tensor(row, device=device, dtype=torch.long)
+                col = torch.as_tensor(col, device=device, dtype=torch.long)
+                m = cand[row]
+                taken[m] = True
+                tgt[offs[b] + m] = 1.0
+                coord_loss = coord_loss + ((p_px[m] - gt_px[col]) / it['box_px'].clamp(min=1e-6)).abs().sum()
+        denom = max(num_pos, 1)
+        w = torch.cat(weights_all) if N_sel else lg.new_zeros(0)
+        losses['loss_point_dense_cls'] = (self._point_focal(lg[:N_sel], tgt) * w).sum() / denom
+        losses['loss_point_dense_coord'] = coord_loss / denom
+
+        if self.point_apg and n_aux:
+            a_lg = lg[N_sel:]
+            is_pos = torch.cat(aux_is_pos)
+            pad_px = torch.cat(aux_pad)
+            a_px = torch.cat(aux_pos) * pad_px
+            d_px = d[N_sel:] * pad_px
+            tgt_px = torch.cat(aux_tgt_px)
+            box_px = torch.cat(aux_box_px).clamp(min=1e-6)
+            bce = F.binary_cross_entropy_with_logits(a_lg, is_pos.float(), reduction='none')
+            snap = ((a_px + d_px - tgt_px) / box_px).abs().sum(-1)      # 吸附到最近 GT 的 L1（框相对）
+            stay = (d_px / box_px).abs().sum(-1)                        # Δ→0（论文 Eq.6）
+            neg = ~is_pos
+            cls_apg = zero
+            loc_apg = zero
+            if is_pos.any():
+                cls_apg = cls_apg + bce[is_pos].mean()
+                loc_apg = loc_apg + snap[is_pos].mean()
+            if neg.any():
+                cls_apg = cls_apg + bce[neg].mean()
+                neg_loc = snap[neg] if self.point_apg_neg_loc == "snap" else stay[neg]
+                loc_apg = loc_apg + self.point_apg_neg_loc_coef * neg_loc.mean()
+            losses['loss_point_apg_cls'] = cls_apg
+            losses['loss_point_apg_loc'] = loc_apg
+        return losses
+
     def prep_for_dn(self,mask_dict):
         output_known_lbs_bboxes = mask_dict['output_known_lbs_bboxes']
 
@@ -505,6 +737,9 @@ class SetCriterion(nn.Module):
         losses = {}
         for loss in self.losses:
             losses.update(self.get_loss(loss, outputs, targets, indices, num_masks))
+        # 稠密锚点头 / APG：与 query 匹配无关，每次前向只算一次
+        if self.point_dense and 'point_dense_probe' in outputs:
+            losses.update(self.loss_points_dense(outputs, targets))
 
         if self.dn != "no" and mask_dict is not None:
             l_dict={}
