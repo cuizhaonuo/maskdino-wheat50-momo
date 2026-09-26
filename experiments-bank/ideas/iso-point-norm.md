@@ -1,6 +1,6 @@
 # 想法：小穗点误差改用各向同性归一化
 
-状态：**待验证（100 epoch 复跑）** ｜ 提出 2026-09-23 ｜ 分支 `mini/iso-norm`（从 `mini/baseline`@`0f71161` 开出，100 epoch）｜ 配置
+状态：**判否（100 epoch，2026-09-26；M1 未通过）** ｜ 提出 2026-09-23 ｜ 分支 `mini/iso-norm`（从 `mini/baseline`@`0f71161` 开出，100 epoch）｜ 配置
 `wheat_joint_single_stage_mini_iso.yaml`（`_BASE_` 为 `wheat_joint_single_stage_mini_ep100.yaml`）｜ 输出 `output_v2/exp-<启动日期>-mini-iso-norm`
 
 50 epoch 版（输出 `output_v2/exp-0923-mini-iso-norm`，原提交由 tag `archive/mini-iso-norm-ep50` 保留）已判「主判据歧义 + 机制未启动」，
@@ -142,9 +142,21 @@ mini/baseline 最终 checkpoint 的实测值（跑 E1 之前测得）：
 
 100 epoch 版：12500 iter，约 10 ~ 13 h（视同卡并发而定）。50 epoch 版：6250 iter，约 7 h。
 
-## 100 epoch 结论
+## 100 epoch 结论（2026-09-26，按上面 100 epoch 的判否线判）
 
-（待填）
+**判否；机制判据 M1 未通过。** 详见 [exp-2026-09-24-mini-iso-norm](../experiments/exp-2026-09-24-mini-iso-norm.md)。
+
+| 判据 | 要求 | 实测（E1 vs 100 epoch 基线） | |
+|:--|:--|:--|:--:|
+| M1 沿轴误差中位 | ≤ 4.16 px | 4.43 px（基线 4.62，−4.1%） | ❌ |
+| M1 横轴误差中位 | ≤ 2.57 px | 2.63 px（基线 2.34，+12.5%） | ❌ |
+| 主判据 `matched_F1@8` | 判否线：峰值 ≤ 0.6331 | 峰值 0.6285、末值 0.6285（基线 0.6331 / 0.6312） | 判否 |
+| 护栏 `segm/AP` | 峰值 ≥ 77.80 | 78.48 | ✅ |
+| 护栏 `count_MAE_spike` | 峰值 ≤ 2.71 | 2.64（末值 2.82 vs 2.60，仍比基线差） | ✅ |
+
+诊断在 qiuhao 的 CPU 上跑（`output_v2/_diag-0926/`），两臂同口径；自检值与训练日志一致（差 ≤ 1e-4）。
+阈值扫描 best-vs-best 0.6345 vs 0.6355，也无提升；`matched_F1@3` −0.018、`@5` −0.011，精细定位反而变差。
+50 epoch 版的 +0.015（歧义）没有复现。本项不再作为独立改进项推进。
 
 ## 50 epoch 版结论（2026-09-24，按 50 epoch 的判否线判）
 
