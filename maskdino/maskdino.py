@@ -56,7 +56,6 @@ class MaskDINO(nn.Module):
         point_threshold: float = 0.35,
         point_source: str = "coarse",
         dense_topk: int = 64,
-        dense_pre_topn: int = 4000,
         dense_owner_score: float = 0.3,
         dense_mask_thresh: float = 0.5,
     ):
@@ -122,7 +121,6 @@ class MaskDINO(nn.Module):
         self.point_source = point_source
         self.point_abs_coords = point_source == "dense"
         self.dense_topk = dense_topk
-        self.dense_pre_topn = dense_pre_topn
         self.dense_owner_score = dense_owner_score
         self.dense_mask_thresh = dense_mask_thresh
 
@@ -271,7 +269,6 @@ class MaskDINO(nn.Module):
             "point_threshold": cfg.MODEL.MaskDINO.TEST.POINT_THRESHOLD,
             "point_source": point_source,
             "dense_topk": cfg.MODEL.MaskDINO.TEST.POINT_DENSE_TOPK,
-            "dense_pre_topn": cfg.MODEL.MaskDINO.TEST.POINT_DENSE_PRE_TOPN,
             "dense_owner_score": cfg.MODEL.MaskDINO.TEST.POINT_DENSE_OWNER_SCORE,
             "dense_mask_thresh": cfg.MODEL.MaskDINO.TEST.POINT_DENSE_MASK_THRESH,
         }
@@ -477,38 +474,39 @@ class MaskDINO(nn.Module):
             dense_logits: [B,A]   提议存在性 logit
         Returns:
             coords [B,Q,K,2]（padded 归一化），logits [B,Q,K,1]。
-        每图：取存在性最高的 PRE_TOPN 个提议；在掩码上采样得到 M[q,j]；wheat_2 类分数 ≥ OWNER_SCORE 的 query 为候选主人，
-        提议 j 归给其中 M 最大者（要求 M ≥ MASK_THRESH）。S[q,j] = σ(conf_j)（q 拥有 j）；
-        非候选主人的 query 只要 M ≥ MASK_THRESH 也可得分（不排他，它们类别分数低，评估器不会用到）；其余为 0。
-        每个 query 取 S 最高的 K 个，分数 0 的候选 logit 为 −20（任何阈值都滤掉）。
+        每图：在掩码上采样得到每个 query 对每个提议的掩码概率 M[q,j]；wheat_2 类分数 ≥ OWNER_SCORE 的 query 为候选主人，
+        提议 j 归给其中 M 最大者（要求 M ≥ MASK_THRESH）；非候选主人的 query 取 M ≥ MASK_THRESH 的提议（不排他，
+        它们类别分数低，评估器不会用到）。每个 query 从【自己的】提议里按存在性取前 K 个，分数 = σ(conf)。
+        候选因此都在该实例掩码内，与 25 槽头「每个槽都属于这个实例」同口径；只有拥有的提议不足 K 个时，
+        才用掩码概率次高的提议补位，补位分数为 0（logit −20，任何阈值都滤掉）。
         """
         B, Q = mask_cls.shape[:2]
         K = self.dense_topk
         coords = dense_pts.new_zeros((B, Q, K, 2))
         logits = dense_pts.new_full((B, Q, K, 1), -20.0)
         for b in range(B):
-            n = min(self.dense_pre_topn, dense_logits.shape[1])
-            top_lg, top_i = dense_logits[b].topk(n)
-            pts = dense_pts[b, top_i]                                          # [n,2]
-            conf = top_lg.sigmoid()
-            grid = (pts * 2 - 1).view(1, 1, n, 2).expand(Q, 1, n, 2)
+            pts = dense_pts[b]                                                 # [A,2]
+            A = pts.shape[0]
+            conf = dense_logits[b].sigmoid()
+            grid = (pts * 2 - 1).view(1, 1, A, 2).expand(Q, 1, A, 2)
             M = F.grid_sample(mask_pred[b][:, None].float(), grid.float(), mode="bilinear",
-                              padding_mode="zeros", align_corners=False)[:, 0, 0].sigmoid()   # [Q,n]
+                              padding_mode="zeros", align_corners=False)[:, 0, 0].sigmoid()   # [Q,A]
             eligible = mask_cls[b, :, self.spikelet_class_id].sigmoid() >= self.dense_owner_score
-            S = torch.zeros_like(M)
+            own = M >= self.dense_mask_thresh                                  # [Q,A]
             if eligible.any():
                 M_el = M.masked_fill(~eligible[:, None], -1.0)
-                best, owner = M_el.max(dim=0)                                  # [n]
-                ok = best >= self.dense_mask_thresh
-                j = torch.nonzero(ok).flatten()
-                S[owner[j], j] = conf[j]
-            S[~eligible] = (M[~eligible] >= self.dense_mask_thresh).float() * conf[None]
-            k = min(K, n)
-            _, idx = (S + 1e-4 * conf[None] * M).topk(k, dim=1)               # [Q,k]
-            s_k = S.gather(1, idx)
+                owner = M_el.argmax(dim=0)                                     # [A]
+                excl = torch.zeros_like(own)
+                excl[owner, torch.arange(A, device=pts.device)] = True
+                own[eligible] &= excl[eligible]
+            # 自己的提议按 σ(conf) 排在前面（+1 保证排在所有补位之前）；补位按掩码概率
+            rank = torch.where(own, 1.0 + conf[None], M * 1e-3)
+            k = min(K, A)
+            _, idx = rank.topk(k, dim=1)                                       # [Q,k]
+            owned_k = own.gather(1, idx)
             coords[b, :, :k] = pts[idx]
-            logits[b, :, :k, 0] = torch.where(s_k > 0, torch.logit(s_k.clamp(1e-6, 1 - 1e-6)),
-                                              torch.full_like(s_k, -20.0))
+            logits[b, :, :k, 0] = torch.where(owned_k, dense_logits[b][idx].float(),
+                                              torch.full_like(idx, -20, dtype=torch.float))
         return coords, logits
 
     def semantic_inference(self, mask_cls, mask_pred):

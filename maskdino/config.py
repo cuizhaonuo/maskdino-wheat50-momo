@@ -182,10 +182,9 @@ def add_maskdino_config(cfg):
     # 推理时点从哪个头出："auto" 按开关选（POINT_DENSE -> dense，否则 coarse）；
     # 在开关打开的 checkpoint 上指定 "coarse"，即得到同一次训练内「只用 25 槽头」的消融。
     cfg.MODEL.MaskDINO.TEST.POINT_SOURCE = "auto"
-    # 稠密头推理：全图取存在性最高的 PRE_TOPN 个提议，按 1/4 掩码概率归给「wheat_2 类分数 ≥ OWNER_SCORE 且掩码概率最高」
-    # 的 query（要求掩码概率 ≥ MASK_THRESH），每个实例输出 TOPK 个候选点（未归属的候选分数为 0）。
+    # 稠密头推理：全部提议按 1/4 掩码概率归给「wheat_2 类分数 ≥ OWNER_SCORE 且掩码概率最高」的 query
+    # （要求掩码概率 ≥ MASK_THRESH），每个实例从自己的提议里按存在性取 TOPK 个候选点（候选都在该实例掩码内）。
     cfg.MODEL.MaskDINO.TEST.POINT_DENSE_TOPK = 64
-    cfg.MODEL.MaskDINO.TEST.POINT_DENSE_PRE_TOPN = 4000
     cfg.MODEL.MaskDINO.TEST.POINT_DENSE_OWNER_SCORE = 0.3
     cfg.MODEL.MaskDINO.TEST.POINT_DENSE_MASK_THRESH = 0.5
     # 评估时是否额外加挂小穗点评估器（SpikeletPointEvaluator，见 maskdino/evaluation/）
