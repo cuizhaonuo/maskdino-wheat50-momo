@@ -108,6 +108,39 @@ def add_maskdino_config(cfg):
     # 只训练点头。冻结的 trunk 在训练时也强制保持 eval（固定 BN/dropout），与推理一致。
     cfg.MODEL.MaskDINO.FREEZE_EXCEPT_POINT_HEAD = False
 
+    # ===== APGCC 移植：IFI 局部特征头 + APG 辅助点（maskdino/modeling/point_ifi.py）=====
+    # 全部开关默认关闭；关闭时不建任何参数，模型与 baseline 逐位一致。
+    # IFI 头的结构：1/4（mask_features）与 1/8 两层特征，各自 1×1 投影到 FEAT_DIM 后按 4 邻格插值，
+    # f_θ 宽 IFI_HIDDEN，位置编码 2+PE_DIM 维（频率 2^linspace(0, PE_SIGMA)），再过宽 HEAD_HIDDEN 的 2 层 MLP。
+    cfg.MODEL.MaskDINO.POINT_IFI_FEAT_DIM = 64
+    cfg.MODEL.MaskDINO.POINT_IFI_HIDDEN = 128
+    cfg.MODEL.MaskDINO.POINT_IFI_PE_DIM = 32
+    cfg.MODEL.MaskDINO.POINT_IFI_PE_SIGMA = 6.0
+    cfg.MODEL.MaskDINO.POINT_HEAD_HIDDEN = 256
+    # 偏移输出的单位：1/4 格（原生尺度 4 px）
+    cfg.MODEL.MaskDINO.POINT_OFFSET_SCALE_CELLS = 1.0
+    # 精修头：在 25 槽粗预测 u 处取局部特征求偏移 Δ，r = u + Δ；再在 r 处求存在性。推理输出 r 与 σ(logit(r))。
+    cfg.MODEL.MaskDINO.POINT_REFINE = False
+    cfg.MODEL.MaskDINO.POINT_REFINE_COORD_WEIGHT = 5.0
+    cfg.MODEL.MaskDINO.POINT_REFINE_CLASS_WEIGHT = 2.0
+    # 精修主损失只算预测框与 GT 框 IoU ≥ 此值的配对（u 由预测框换算；框差时局部头修不了，只会把大梯度灌进共享特征）
+    cfg.MODEL.MaskDINO.POINT_REFINE_MIN_IOU = 0.5
+    # APG 辅助点（只在训练时）。半径以每穗 GT 小穗的平均最近邻距离 d̄ 为单位（LSJ 缩放 0.1~2.0，不能用固定像素）：
+    # 正点每轴 U(±RADII[0])，负点每轴 ±U(RADII[0], RADII[1])；原生尺度 d̄≈16.7px 时约 (2, 8) px，与论文相同。
+    cfg.MODEL.MaskDINO.POINT_APG = False
+    cfg.MODEL.MaskDINO.POINT_APG_NUM = [2, 2]            # (k_pos, k_neg)，每个 GT 点各撒几个
+    cfg.MODEL.MaskDINO.POINT_APG_RADII = [0.125, 0.5]    # (n_pos, n_neg) / d̄
+    cfg.MODEL.MaskDINO.POINT_APG_NEG_EXCLUDE = 0.125     # 负点离本穗任一 GT 近于此值·d̄ 即丢弃
+    # 负点的定位目标："snap" = 吸附到最近 GT（精修头：存在性在吸附之后判）；"zero" = Δ→0（论文 Eq.6）
+    cfg.MODEL.MaskDINO.POINT_APG_NEG_LOC = "snap"
+    cfg.MODEL.MaskDINO.POINT_APG_NEG_LOC_COEF = 1.0
+    # 论文 λ5=0.2：APG 损失权重 = 0.2 × 主点损失权重（存在性 2.0、坐标 5.0）
+    cfg.MODEL.MaskDINO.POINT_APG_CLS_WEIGHT = 0.4
+    cfg.MODEL.MaskDINO.POINT_APG_LOC_WEIGHT = 1.0
+    cfg.MODEL.MaskDINO.POINT_APG_SEED = 0
+    # d̄ 低于此值（像素，约为 LSJ 缩放 < 0.24）的穗不撒 APG 点
+    cfg.MODEL.MaskDINO.POINT_MIN_DBAR_PX = 4.0
+
     # MSDeformAttn encoder configs
     cfg.MODEL.SEM_SEG_HEAD.DEFORMABLE_TRANSFORMER_ENCODER_IN_FEATURES = ["res3", "res4", "res5"]
     cfg.MODEL.SEM_SEG_HEAD.DEFORMABLE_TRANSFORMER_ENCODER_N_POINTS = 4
@@ -132,6 +165,9 @@ def add_maskdino_config(cfg):
     cfg.MODEL.MaskDINO.TEST.PANO_TEMPERATURE = 0.06
     # 小穗点存在性置信度阈值（sigmoid 后 > 该值的点才输出）
     cfg.MODEL.MaskDINO.TEST.POINT_THRESHOLD = 0.35
+    # 推理时点从哪个头出："auto" 按开关选（POINT_REFINE -> refine，否则 coarse）；
+    # 在开关打开的 checkpoint 上指定 "coarse"，即得到同一次训练内「只用 25 槽头」的消融。
+    cfg.MODEL.MaskDINO.TEST.POINT_SOURCE = "auto"
     # 评估时是否额外加挂小穗点评估器（SpikeletPointEvaluator，见 maskdino/evaluation/）
     cfg.MODEL.MaskDINO.TEST.SPIKELET_EVAL = False
     # 点匹配的距离阈值（原图像素，多档一起报）。GT 实测同穗内小穗最近邻间距中位 16px，

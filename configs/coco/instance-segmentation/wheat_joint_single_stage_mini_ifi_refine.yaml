@@ -1,0 +1,25 @@
+# ============================================================================
+# 单阶段联合训练 · 500 图小集 · 100 epoch · IFI 精修头，不加 APG（mini/ifi-refine，形式 B：归因对照臂）
+#   来源：APGCC（ECCV 2024, arXiv 2405.10589）的 IFI 部分
+#   预注册：experiments-bank/ideas/ifi-refine.md（判否线已在跑之前写死）
+#   对照：wheat_joint_single_stage_mini_ep100.yaml（mini/baseline@0f71161，output_v2/exp-0923-mini-ep100）
+#   配对臂：wheat_joint_single_stage_mini_apg_refine.yaml（mini/apg-refine，形式 A）
+#
+# 代码与 mini/apg-refine@2c77bb2 逐字相同（按文件带入），本配置与形式 A 的唯一差别是 POINT_APG: False：
+#   A − B = APG 的贡献，B − baseline = IFI 精修头本身的贡献。
+# 结构：25 槽 query 头及其全部损失原样保留，作为粗定位；最后一层 decoder 之后接 IFI 精修头：
+#   u = 预测框（detach）∘ 粗坐标（detach）→ r = u + Δ(u) → 在 r 处求存在性。推理输出 r 与 σ(logit(r))。
+#   精修损失 loss_point_ref_coord/cls 与 loss_point_coord/cls 同口径，只算预测框 IoU ≥ 0.5 的配对。
+#
+# 用法：
+#   python train_net.py --num-gpus 1 \
+#     --config-file configs/coco/instance-segmentation/wheat_joint_single_stage_mini_ifi_refine.yaml \
+#     OUTPUT_DIR /public/home/zncui/pycharm_project/maskdino-wheat50/output_v2/<run-name>
+# 同一次训练内「只用 25 槽头出点」的消融：评估时追加 MODEL.MaskDINO.TEST.POINT_SOURCE coarse
+# ============================================================================
+_BASE_: wheat_joint_single_stage_mini_ep100.yaml
+
+MODEL:
+  MaskDINO:
+    POINT_REFINE: True
+    POINT_APG: False

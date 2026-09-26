@@ -18,6 +18,7 @@ from detectron2.structures import BitMasks
 from .dino_decoder import TransformerDecoder, DeformableTransformerDecoderLayer
 from ...utils.utils import MLP, gen_encoder_output_proposals, inverse_sigmoid
 from ...utils import box_ops
+from ..point_ifi import IFIPointHead, PointHeadProbe, pick_stride8
 
 
 TRANSFORMER_DECODER_REGISTRY = Registry("TRANSFORMER_MODULE")
@@ -68,6 +69,8 @@ class MaskDINODecoder(nn.Module):
             query_dim: int = 4,
             dec_layer_share: bool = False,
             semantic_ce_loss: bool = False,
+            point_refine: bool = False,
+            point_ifi_cfg: dict = None,
     ):
         """
         NOTE: this interface is experimental.
@@ -171,6 +174,14 @@ class MaskDINODecoder(nn.Module):
         self.bbox_embed = nn.ModuleList(box_embed_layerlist)
         self.decoder.bbox_embed = self.bbox_embed
 
+        # APGCC 的 IFI 精修头（POINT_REFINE）：关着时不建参数，模型与 baseline 逐位一致。
+        # 输入 1/4 的 mask_features（mask_dim 维）与 1/8 的多尺度特征（hidden_dim 维），以实例 query 为条件。
+        # 放在 __init__ 最后建：开着时其余参数的随机初始化也与 baseline 相同（不插队消耗 RNG）。
+        self.point_refine = point_refine
+        if point_refine:
+            self.point_refiner = IFIPointHead(in_channels=(mask_dim, hidden_dim), q_dim=hidden_dim,
+                                              **point_ifi_cfg)
+
 
     @classmethod
     def from_config(cls, cfg, in_channels, mask_classification):
@@ -198,6 +209,15 @@ class MaskDINODecoder(nn.Module):
         ret["learn_tgt"] = cfg.MODEL.MaskDINO.LEARN_TGT
         ret["total_num_feature_levels"] = cfg.MODEL.SEM_SEG_HEAD.TOTAL_NUM_FEATURE_LEVELS
         ret["semantic_ce_loss"] = cfg.MODEL.MaskDINO.TEST.SEMANTIC_ON and cfg.MODEL.MaskDINO.SEMANTIC_CE_LOSS and ~cfg.MODEL.MaskDINO.TEST.PANOPTIC_ON
+        ret["point_refine"] = cfg.MODEL.MaskDINO.POINT_REFINE
+        ret["point_ifi_cfg"] = dict(
+            feat_dim=cfg.MODEL.MaskDINO.POINT_IFI_FEAT_DIM,
+            ifi_hidden=cfg.MODEL.MaskDINO.POINT_IFI_HIDDEN,
+            pe_dim=cfg.MODEL.MaskDINO.POINT_IFI_PE_DIM,
+            pe_sigma=cfg.MODEL.MaskDINO.POINT_IFI_PE_SIGMA,
+            hidden=cfg.MODEL.MaskDINO.POINT_HEAD_HIDDEN,
+            offset_scale_cells=cfg.MODEL.MaskDINO.POINT_OFFSET_SCALE_CELLS,
+        )
 
         return ret
 
@@ -611,7 +631,37 @@ class MaskDINODecoder(nn.Module):
         }
         if self.two_stage:
             out['interm_outputs'] = interm_outputs
+        if self.point_refine:
+            # 只进主 out：不进 aux_outputs / interm_outputs / mask_dict，criterion 只在最后一层上算精修损失
+            out.update(self._point_refine_outputs(hs, mask_dict, out_boxes[-1], predictions_point_coord[-1],
+                                                  mask_features, x))
         return out, mask_dict
+
+    @torch.jit.unused
+    def _point_refine_outputs(self, hs, mask_dict, boxes, point_rel, mask_features, feats):
+        """IFI 精修头的输出。
+
+        u = 预测框（detach）∘ 25 槽粗坐标（detach），padded 图像归一化坐标 [B,Q,P,2]。
+        训练：只返回 u 与一个 PointHeadProbe，由 criterion 对匹配上的实例与 APG 辅助点按需求值。
+        推理：两遍 —— 先在 u 处求偏移 r = u + Δ(u)，再在 r 处求存在性 logit。
+        """
+        pad = mask_dict['pad_size'] if mask_dict is not None else 0
+        q_last = self.decoder_norm(hs[-1])[:, pad:]                 # [B,Q,C]，与点头看到的是同一个向量
+        boxes = boxes.detach().float()                              # [B,Q,4] cxcywh
+        rel = point_rel.detach().float()                            # [B,Q,P,2] 框相对
+        xy0 = boxes[..., :2] - boxes[..., 2:] / 2
+        u = xy0[:, :, None] + rel * boxes[:, :, None, 2:]           # [B,Q,P,2]
+        proj = self.point_refiner.prepare([mask_features, pick_stride8(feats, mask_features)])
+        probe = PointHeadProbe(self.point_refiner, proj, q_last)
+        if self.training:
+            return {'point_refine_probe': probe, 'pred_point_ref_anchor': u}
+        B, Q, P, _ = u.shape
+        b_idx = torch.arange(B, device=u.device)[:, None, None].expand(B, Q, P).reshape(-1)
+        q_idx = torch.arange(Q, device=u.device)[None, :, None].expand(B, Q, P).reshape(-1)
+        _, delta = probe(b_idx, u.reshape(-1, 2), q_idx)
+        r = u.reshape(-1, 2) + delta
+        logit, _ = probe(b_idx, r, q_idx)
+        return {'pred_point_coords_ref': r.view(B, Q, P, 2), 'pred_point_logits_ref': logit.view(B, Q, P, 1)}
 
     def forward_prediction_heads(self, output, mask_features, pred_mask=True):
         decoder_output = self.decoder_norm(output)
