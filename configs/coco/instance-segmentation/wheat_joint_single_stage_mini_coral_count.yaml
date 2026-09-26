@@ -1,0 +1,27 @@
+# ============================================================================
+# mini/coral-count · 每个实例 query 挂一个 CORAL 序数计数头（A 臂）
+#   预注册：experiments-bank/ideas/coral-count.md（判否线已在跑之前写死）
+#   来源：Cao et al., Rank Consistent Ordinal Regression（arXiv 1901.07884），
+#         本地源码 /public/home/zncui/pycharm_project/coral-cnn
+#
+# 与 wheat_joint_single_stage_mini_ep100.yaml（mini/baseline 的 100 epoch 基线）的差异【只有两项】：
+#   MODEL.MaskDINO.POINT_COUNT_HEAD: True
+#     每个 query 多一个 CoralHead（共享 1 维打分 + 25 个有序 bias），预测该穗小穗数 min(Ni, 25)，
+#     多一项辅助损失 loss_point_count（POINT_COUNT_WEIGHT 默认 2.0，与 POINT_CLASS_WEIGHT 同值），
+#     随 _interm / _{i} 深监督带上。原点头的坐标 / 存在性 / 内层匹配一行不动。
+#   MODEL.MaskDINO.TEST.POINT_COUNT_READOUT: coral
+#     每穗报几个点改由计数头决定：K = sum_k 1[sigmoid(l_k) > 0.5]，再按存在性分数取 top-K 个槽。
+#     同一 checkpoint 用 CLI 覆盖 MODEL.MaskDINO.TEST.POINT_COUNT_READOUT threshold 可按基线的读法再评一次。
+#
+# 用法：
+#   python train_net.py --num-gpus 1 \
+#     --config-file configs/coco/instance-segmentation/wheat_joint_single_stage_mini_coral_count.yaml \
+#     OUTPUT_DIR /public/home/zncui/pycharm_project/maskdino-wheat50/output_v2/<run-name>
+# ============================================================================
+_BASE_: wheat_joint_single_stage_mini_ep100.yaml
+
+MODEL:
+  MaskDINO:
+    POINT_COUNT_HEAD: True
+    TEST:
+      POINT_COUNT_READOUT: "coral"

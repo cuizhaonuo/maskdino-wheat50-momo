@@ -100,6 +100,12 @@ def add_maskdino_config(cfg):
     # 【注意】开关会改变参数名（point_class_embed.weight/bias <-> .layers.{0,1,2}.*），
     # 两种设置下训出的 Stage2 checkpoint 不能互相加载（会被静默跳过）。
     cfg.MODEL.MaskDINO.POINT_CLASS_MLP = False
+    # True = 每个实例 query 额外挂一个 CORAL 序数计数头 point_count_embed（maskdino/modeling/coral.py），
+    # 直接预测该穗的小穗数 min(Ni, NUM_POINTS)：共享 1 维打分 + NUM_POINTS 个有序 bias。
+    # 只加一项辅助损失 loss_point_count，原点头（坐标 / 存在性 / 内层匹配）一行不动。
+    # False 时一个参数都不建，模型与基线逐位相同。预注册见 experiments-bank/ideas/coral-count.md。
+    cfg.MODEL.MaskDINO.POINT_COUNT_HEAD = False
+    cfg.MODEL.MaskDINO.POINT_COUNT_WEIGHT = 2.0
     # FREEZE_EXCEPT_POINT_HEAD=True 时，除点头外额外解冻的参数名子串。
     # 空 = 只训点头（Stage2 原设计）。例：["predictor.decoder"] 解冻 transformer decoder，
     # ["sem_seg_head"] 解冻整个分割头（decoder + pixel decoder + 各预测头），backbone 仍冻结。
@@ -132,6 +138,11 @@ def add_maskdino_config(cfg):
     cfg.MODEL.MaskDINO.TEST.PANO_TEMPERATURE = 0.06
     # 小穗点存在性置信度阈值（sigmoid 后 > 该值的点才输出）
     cfg.MODEL.MaskDINO.TEST.POINT_THRESHOLD = 0.35
+    # 每穗输出几个点的决策方式：
+    #   "threshold" = 现状，存在性 sigmoid > POINT_THRESHOLD 的槽全部输出；
+    #   "coral"     = 先由 CORAL 计数头给出 K = sum_k 1[sigmoid(l_k) > 0.5]，再按存在性分数取 top-K 个槽。
+    # 需要 POINT_COUNT_HEAD=True；同一 checkpoint 两种读法都能评，用来拆开「表征」与「读出」两个效应。
+    cfg.MODEL.MaskDINO.TEST.POINT_COUNT_READOUT = "threshold"
     # 评估时是否额外加挂小穗点评估器（SpikeletPointEvaluator，见 maskdino/evaluation/）
     cfg.MODEL.MaskDINO.TEST.SPIKELET_EVAL = False
     # 点匹配的距离阈值（原图像素，多档一起报）。GT 实测同穗内小穗最近邻间距中位 16px，

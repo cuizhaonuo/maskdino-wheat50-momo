@@ -19,6 +19,7 @@ from detectron2.utils.memory import retry_if_cuda_oom
 
 from .modeling.criterion import SetCriterion
 from .modeling.matcher import HungarianMatcher
+from .modeling.coral import coral_predict
 from .utils import box_ops
 
 
@@ -54,6 +55,7 @@ class MaskDINO(nn.Module):
         transform_eval: bool = False,
         semantic_ce_loss: bool = False,
         point_threshold: float = 0.35,
+        point_count_readout: str = "threshold",
     ):
         """
         Args:
@@ -111,6 +113,12 @@ class MaskDINO(nn.Module):
         # 小穗点推理：存在性阈值 + 带小穗的类别（wheat_2 的连续 id=1，只有该类输出点）
         self.point_threshold = point_threshold
         self.spikelet_class_id = 1
+        # 每穗报几个点："threshold" 按存在性阈值；"coral" 按 CORAL 计数头给出的 K 取 top-K 槽
+        assert point_count_readout in ("threshold", "coral"), point_count_readout
+        if point_count_readout == "coral":
+            assert getattr(sem_seg_head.predictor, "point_count_embed", None) is not None, \
+                "TEST.POINT_COUNT_READOUT=coral 需要 MODEL.MaskDINO.POINT_COUNT_HEAD=True"
+        self.point_count_readout = point_count_readout
 
         if not self.semantic_on:
             assert self.sem_seg_postprocess_before_inference
@@ -155,6 +163,9 @@ class MaskDINO(nn.Module):
         weight_dict.update({"loss_bbox":box_weight,"loss_giou":giou_weight})
         # 小穗点损失（随 _interm / _{i} 深监督自动带上；dn 不计算点损失，其 _dn 权重存在但不会被产生，无害）
         weight_dict.update({"loss_point_coord": point_coord_weight, "loss_point_cls": point_cls_weight})
+        # CORAL 计数头的辅助损失，同样随 _interm / _{i} 深监督带上
+        if cfg.MODEL.MaskDINO.POINT_COUNT_HEAD:
+            weight_dict.update({"loss_point_count": cfg.MODEL.MaskDINO.POINT_COUNT_WEIGHT})
         # two stage is the query selection scheme
         if cfg.MODEL.MaskDINO.TWO_STAGE:
             interm_weight_dict = {}
@@ -228,6 +239,7 @@ class MaskDINO(nn.Module):
             "pano_temp": cfg.MODEL.MaskDINO.TEST.PANO_TEMPERATURE,
             "semantic_ce_loss": cfg.MODEL.MaskDINO.TEST.SEMANTIC_ON and cfg.MODEL.MaskDINO.SEMANTIC_CE_LOSS and not cfg.MODEL.MaskDINO.TEST.PANOPTIC_ON,
             "point_threshold": cfg.MODEL.MaskDINO.TEST.POINT_THRESHOLD,
+            "point_count_readout": cfg.MODEL.MaskDINO.TEST.POINT_COUNT_READOUT,
         }
 
     @property
@@ -307,6 +319,10 @@ class MaskDINO(nn.Module):
             # 小穗点预测（框相对归一化 [0,1]）
             point_coord_results = outputs["pred_point_coords"]   # [B, Q, P, 2]
             point_logit_results = outputs["pred_point_logits"]   # [B, Q, P, 1]
+            # CORAL 计数头（POINT_COUNT_HEAD=False 时没有这个键）
+            point_count_results = outputs.get("pred_point_count_logits")   # [B, Q, P] 或 None
+            if point_count_results is None:
+                point_count_results = [None] * len(point_logit_results)
             # upsample masks
             mask_pred_results = F.interpolate(
                 mask_pred_results,
@@ -318,8 +334,8 @@ class MaskDINO(nn.Module):
             del outputs
 
             processed_results = []
-            for mask_cls_result, mask_pred_result, mask_box_result, point_coord_result, point_logit_result, input_per_image, image_size in zip(
-                mask_cls_results, mask_pred_results, mask_box_results, point_coord_results, point_logit_results, batched_inputs, images.image_sizes
+            for mask_cls_result, mask_pred_result, mask_box_result, point_coord_result, point_logit_result, point_count_result, input_per_image, image_size in zip(
+                mask_cls_results, mask_pred_results, mask_box_results, point_coord_results, point_logit_results, point_count_results, batched_inputs, images.image_sizes
             ):  # image_size is augmented size, not divisible to 32
                 height = input_per_image.get("height", image_size[0])  # real size
                 width = input_per_image.get("width", image_size[1])
@@ -354,7 +370,7 @@ class MaskDINO(nn.Module):
                     width = new_size[1]/image_size[1]*width
                     mask_box_result = self.box_postprocess(mask_box_result, height, width)
 
-                    instance_r = retry_if_cuda_oom(self.instance_inference)(mask_cls_result, mask_pred_result, mask_box_result, point_coord_result, point_logit_result)
+                    instance_r = retry_if_cuda_oom(self.instance_inference)(mask_cls_result, mask_pred_result, mask_box_result, point_coord_result, point_logit_result, point_count_result)
                     processed_results[-1]["instances"] = instance_r
 
             return processed_results
@@ -488,7 +504,8 @@ class MaskDINO(nn.Module):
 
             return panoptic_seg, segments_info
 
-    def instance_inference(self, mask_cls, mask_pred, mask_box_result, point_coords=None, point_logits=None):
+    def instance_inference(self, mask_cls, mask_pred, mask_box_result, point_coords=None, point_logits=None,
+                           point_count_logits=None):
         # mask_pred is already processed to have the same shape as original input
         image_size = mask_pred.shape[-2:]
         scores = mask_cls.sigmoid()  # [100, 80]
@@ -502,6 +519,8 @@ class MaskDINO(nn.Module):
         if point_coords is not None:
             point_coords = point_coords[topk_indices]   # [K, P, 2] 框相对 [0,1]
             point_logits = point_logits[topk_indices]   # [K, P, 1]
+            if point_count_logits is not None:
+                point_count_logits = point_count_logits[topk_indices]   # [K, P]
         # if this is panoptic segmentation, we only keep the "thing" classes
         if self.panoptic_on:
             keep = torch.zeros_like(scores_per_image).bool()
@@ -513,6 +532,8 @@ class MaskDINO(nn.Module):
             if point_coords is not None:
                 point_coords = point_coords[keep]
                 point_logits = point_logits[keep]
+                if point_count_logits is not None:
+                    point_count_logits = point_count_logits[keep]
         result = Instances(image_size)
         # mask (before sigmoid)
         result.pred_masks = (mask_pred > 0).float()
@@ -542,7 +563,13 @@ class MaskDINO(nn.Module):
                     bw = (x1 - x0).clamp(min=0)
                     bh = (y1 - y0).clamp(min=0)
                     score_k = point_logits[k].sigmoid().squeeze(-1)   # [P]
-                    keep_pt = score_k > self.point_threshold
+                    if self.point_count_readout == "coral":
+                        # 先由 CORAL 计数头定 K，再按存在性分数取 top-K 个槽（存在性只负责排序）
+                        n_k = int(coral_predict(point_count_logits[k]).item())
+                        keep_pt = torch.zeros_like(score_k, dtype=torch.bool)
+                        keep_pt[score_k.topk(n_k).indices] = True
+                    else:
+                        keep_pt = score_k > self.point_threshold
                     rel = point_coords[k][keep_pt]                    # [Ki, 2] 框相对
                     xy = torch.stack([x0, y0]) + rel * torch.stack([bw, bh])  # [Ki, 2] 像素
                     spikelet_points.append(xy)

@@ -23,6 +23,7 @@ from detectron2.projects.point_rend.point_features import (
 
 from ..utils.misc import is_dist_avail_and_initialized, nested_tensor_from_tensor_list
 from maskdino.utils import box_ops
+from .coral import coral_levels, coral_loss
 
 try:
     # 正负样本匹配的 debug 可视化。要关掉请改各模块顶部的 ENABLED = False，
@@ -368,6 +369,9 @@ class SetCriterion(nn.Module):
         coord_loss = torch.zeros([], device=device)
         cls_loss = torch.zeros([], device=device)
         num_pos = 0  # 总匹配小穗数，用于归一化
+        # CORAL 计数头（POINT_COUNT_HEAD=True 时才有这个键）：逐实例收集 logit / 小穗数 / 权重
+        count_logits_all = outputs.get('pred_point_count_logits')   # [B, Q, P] 或 None
+        count_logits, count_targets, count_weights = [], [], []
 
         for b, (src_idx, tgt_idx) in enumerate(indices):
             if src_idx.numel() == 0:
@@ -413,6 +417,12 @@ class SetCriterion(nn.Module):
                 w = 1.0 if Ni > 0 else self.point_empty_cls_weight
                 cls_loss = cls_loss + focal.sum() * w
 
+                if count_logits_all is not None:
+                    # 目标取 Ni（coral_levels 内部截到 P）；Ni==0 的 wheat 与存在性损失同一口径降权
+                    count_logits.append(count_logits_all[b, q_i])
+                    count_targets.append(Ni)
+                    count_weights.append(w)
+
                 num_pos += Ni
 
         denom = max(num_pos, 1)
@@ -420,6 +430,15 @@ class SetCriterion(nn.Module):
             'loss_point_coord': coord_loss / denom,
             'loss_point_cls': cls_loss / denom,
         }
+        if count_logits_all is not None:
+            # 每实例 = P 个二分类任务的 BCE 均值，实例之间按 w 加权平均（见 maskdino/modeling/coral.py）
+            if count_logits:
+                lg = torch.stack(count_logits).float()                              # [N, P]
+                y = torch.as_tensor(count_targets, device=device)
+                wt = torch.as_tensor(count_weights, device=device, dtype=torch.float32)
+                losses['loss_point_count'] = coral_loss(lg, coral_levels(y, lg.shape[-1]), wt)
+            else:
+                losses['loss_point_count'] = count_logits_all.sum() * 0.0
         return losses
 
     def prep_for_dn(self,mask_dict):
