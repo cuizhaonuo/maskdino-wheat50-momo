@@ -1,7 +1,7 @@
 # 想法：每个实例 query 挂一个 CORAL 序数计数头（A 臂）
 
-状态：**待验证（预注册，跑之前写死）** ｜ 提出 2026-09-26 ｜ 分支 `mini/coral-count`（从 `mini/baseline`@`0f71161` 开出，100 epoch）｜ 配置
-`wheat_joint_single_stage_mini_coral_count.yaml`（`_BASE_` 为 `wheat_joint_single_stage_mini_ep100.yaml`）｜ 输出 `output_v2/exp-<启动日期>-mini-coral-count`
+状态：**运行中**（2026-09-26 15:10:56 启动于 `c2fcc4b`，qiuhao A100 GPU1，与 B 臂并发）｜ 预注册提交于 `c2fcc4b`（跑之前）｜ 提出 2026-09-26 ｜ 分支 `mini/coral-count`（从 `mini/baseline`@`0f71161` 开出，100 epoch）｜ 配置
+`wheat_joint_single_stage_mini_coral_count.yaml`（`_BASE_` 为 `wheat_joint_single_stage_mini_ep100.yaml`）｜ 输出 `output_v2/exp-0926-mini-coral-count`
 
 来源：Cao, Mirjalili, Raschka, *Rank Consistent Ordinal Regression for Neural Networks with Application to Age Estimation*
 （Pattern Recognition Letters 2020，arXiv 1901.07884），本地源码 `/public/home/zncui/pycharm_project/coral-cnn`。
@@ -121,4 +121,25 @@ python train_net.py --eval_only --config-file <out>/config.yaml MODEL.WEIGHTS <o
 
 ## 冒烟
 
-（待 qiuhao A100 空出后补记：bs2 峰值显存、s/iter、新参数梯度非零、两种读法在 20 张 val 上都能出点。）
+**GPU**（qiuhao A100 GPU1，2026-09-26 15:03，跑之前）：独立脚本 import `train_net.Trainer`（不经 `train_net.py` 的 main，
+不算一次训练 run），ImageNet R-50 起点，bs2 × 30 step（AMP），再在 20 张 val 上推理 + `SpikeletPointEvaluator`。
+（s/iter 不可比：第一个跑的臂要冷读 NFS 上的图，且当时别人的 vLLM 占着 GPU 的 100% 算力。）
+
+| 项 | 结果 |
+|:--|:--|
+| 30 步损失 | 全部有限；`loss_point_count`（×2 后）1.552 → 1.090 |
+| 每步产生的 `loss_point_count*` | 11 个（主输出 + 9 份 aux + interm，与 `loss_point_cls` 相同） |
+| 第 0 步梯度 | `point_count_embed.*` 全部非零 |
+| 峰值显存（bs2，torch 口径） | 11.77 GiB |
+
+**CPU**（`CUDA_VISIBLE_DEVICES=""`，一点不占 GPU；15:14~15:19）：把 ep100 基线的
+`output_v2/exp-0923-mini-ep100/model_final.pth` 载入本臂模型，与 `mini/baseline` 同权重的输出在 12 张 val
+（top-100 里 94 个 wheat_2 条目）上逐实例比对。补上 GPU 冒烟没走到的读法分支（30 步的模型还不出 wheat_2）。
+
+- `threshold` 读法：类别、分数、每穗点数、点坐标、点评估指标与基线**逐项相同**（`matched_F1@8` 0.5792 / `count_MAE_spike` 2.2745）；
+- `coral` 读法：每个 wheat_2 都恰好输出 K 个点（计数头未训练，K ∈ [20, 25]），且 94 个都与阈值读法的点集嵌套
+  ——两者都是「按存在性分数排序的前缀」，与 top-K 的定义一致。
+
+**正式 run 的早期实测**（与 B 臂并发）：iter 100 前后 3.5~3.7 s/iter（B 臂 2.5），`data_time` 约 0.05 s，
+主进程单核 100%——瓶颈是逐实例的 Python 循环与匈牙利匹配，不是 dataloader。`max_mem` 22.7 GB（torch 口径），
+nvidia-smi 占用约 39 GiB（缓存占了大头；ep100 基线笔记里的 27G 偏低）。按这个速度训练约 12.5 h，另加 25 次评估。
