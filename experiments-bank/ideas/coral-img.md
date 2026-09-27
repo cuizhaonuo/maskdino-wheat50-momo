@@ -1,6 +1,6 @@
 # 想法：图级 wheat_2 穗数的 CORAL 序数头（C 臂）
 
-状态：**运行中**（B 臂跑完后由队列于 2026-09-27 00:43:51 自动启动，HEAD `b307eba`、代码与 `1ab1978` 相同；qiuhao A100 GPU1，与 A 臂并发）｜ 预注册提交于 `1ab1978`（跑之前）｜ 提出 2026-09-26 ｜ 分支 `mini/coral-img`（从 `mini/baseline`@`0f71161` 开出，100 epoch）｜ 配置
+状态：**机制门不过**（`img_count_head_MAE` 1.560 ≥ 1.455，比常数 3 还差；头被 bias 学习率上限卡住，属实现缺陷，不能据此否定想法）｜ 验证于 [exp-2026-09-27-mini-coral-img](../experiments/exp-2026-09-27-mini-coral-img.md) ｜ 2026-09-27 00:43:51 由队列启动于 `b307eba`（代码与 `1ab1978` 相同）｜ 预注册提交于 `1ab1978`（跑之前）｜ 提出 2026-09-26 ｜ 分支 `mini/coral-img`（从 `mini/baseline`@`0f71161` 开出，100 epoch）｜ 配置
 `wheat_joint_single_stage_mini_coral_img.yaml`（`_BASE_` 为 `wheat_joint_single_stage_mini_ep100.yaml`）｜ 输出 `output_v2/exp-0927-mini-coral-img`
 
 来源：Cao, Mirjalili, Raschka, *Rank Consistent Ordinal Regression for Neural Networks with Application to Age Estimation*
