@@ -1,6 +1,6 @@
 # 想法：APGCC 原样的稠密锚点小穗头 + APG（形式 C）
 
-状态：**训练中（2026-10-06 启动）** ｜ 提出 2026-09-26 ｜ 分支 `mini/apg-dense`（从 `mini/baseline`@`0f71161` 开出）｜
+状态：**排队中（2026-10-06 起，等 GPU1 空出显存后自动启动）** ｜ 提出 2026-09-26 ｜ 分支 `mini/apg-dense`（从 `mini/baseline`@`0f71161` 开出）｜
 配置 `wheat_joint_single_stage_mini_apg_dense.yaml`（`_BASE_` 为 `wheat_joint_single_stage_mini_ep100.yaml`）｜
 输出 `output_v2/exp-<启动日期>-mini-apg-dense`
 
@@ -131,6 +131,13 @@ APG 半径 (0.125, 0.5)·d̄（原生尺度约 (2, 8) px，与论文一致），
 `output_v2/_diag-0927-coral/`）：默认阈值下的 `count_MAE_spike` 主要量的是系统多报（基线 τ 0.35 时偏差 +2.40），
 只调阈值的基线就从 2.60 降到 1.467，全部预测常数 16 也有 1.86。本组换了出点的头（存在性校准与 25 槽头不同），
 默认阈值的计数读数更不可比。主判据、机制门、其余护栏不变。
+
+## 启动记录
+
+2026-10-06 10:15:25 与 `mini/apg-refine`、`mini/ifi-refine` 一起在 qiuhao A100（GPU1）上启动，第 0 iter 就 OOM：
+另两个进程的缓存分配器各自预留了 51 GB / 28 GB（实际分配峰值都只有 23.5 GB），剩下的不够第三个。该次输出目录已删，不计入任何结果。
+改为排队（`output_v2/_queue-apg-dense/run.sh`）：GPU1 空闲显存连续 3 次（约 6 分钟）≥ 32 GB 后，从本分支 HEAD 自动启动，
+输出按实际启动日命名为 `output_v2/exp-<MMDD>-mini-apg-dense`，启动提交记在其 `stdout.log` 首行附近与 `_queue-apg-dense/queue.log`。
 
 ## 实施前已完成的验证
 
