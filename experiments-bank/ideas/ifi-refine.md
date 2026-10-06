@@ -1,6 +1,6 @@
 # 想法：只加 IFI 精修头，不加 APG（形式 B，APGCC 组的归因对照臂）
 
-状态：**待验证（预注册完成、冒烟通过，未启动）** ｜ 提出 2026-09-26 ｜ 分支 `mini/ifi-refine`（从 `mini/baseline`@`0f71161` 开出）｜
+状态：**训练中（2026-10-06 启动）** ｜ 提出 2026-09-26 ｜ 分支 `mini/ifi-refine`（从 `mini/baseline`@`0f71161` 开出）｜
 配置 `wheat_joint_single_stage_mini_ifi_refine.yaml`（`_BASE_` 为 `wheat_joint_single_stage_mini_ep100.yaml`）｜
 输出 `output_v2/exp-<启动日期>-mini-ifi-refine`
 
@@ -46,7 +46,10 @@ IFI 让点头第一次看到自己位置的图像特征。只靠主损失（匹�
 
 ### 护栏
 
-`segm/AP` 峰值 ≥ **77.80**；`count_MAE_spike` 峰值 ≤ **2.71**；诊断的重复点率 ≤ **1%**（基线 0.08%）。
+- `segm/AP` 峰值 ≥ **77.80**；诊断的重复点率 ≤ **1%**（基线 0.08%）。
+- `count_MAE_spike` 按**校准后最优档**判：用 `point_token_diag.py --sweep 0.1 0.15 … 0.9`（步长 0.05，与逐档 `--eval_only` 等价）
+  在 val 上扫 `POINT_THRESHOLD`，取最优档 ≤ **1.61**（基线最优档 1.467 @ τ 0.5，× 1.1；该值来自 0.35~0.7 的扫描，判定时用同一脚本、同一网格在基线上重扫核对）。
+  在该档补一次 `--eval_only`，由 `spikelet_pair_counts.csv` 报 Pearson r、有符号偏差，并与「全部预测常数 16」的 MAE（1.86）并列。
 
 ### 归因（与 A 对比，结论写在两边的实验记录里）
 
@@ -57,6 +60,14 @@ IFI 让点头第一次看到自己位置的图像特征。只靠主损失（匹�
 
 `matched_F1@3 / @5`；同一 checkpoint 用 `TEST.POINT_SOURCE coarse` 再评一次；诊断阈值扫描的最优档；
 训练日志里 `loss_point_ref_coord` 与 `loss_point_coord` 之比。
+
+## 预注册修订（2026-10-06，启动前）
+
+计数护栏原写「`count_MAE_spike` 峰值 ≤ 2.71（默认阈值 0.35，2.46 × 1.1）」，启动前改为按校准后最优档判（见上文护栏）。
+理由来自 CORAL 三臂的事后对照（`mini/coral-count` 分支 `experiments-bank/experiments/exp-2026-09-26-mini-coral-count.md`，
+`output_v2/_diag-0927-coral/`）：默认阈值下的 `count_MAE_spike` 主要量的是系统多报（基线 τ 0.35 时偏差 +2.40），
+只调阈值的基线就从 2.60 降到 1.467，全部预测常数 16 也有 1.86。本组换了出点的头（存在性校准与 25 槽头不同），
+默认阈值的计数读数更不可比。主判据、机制门、其余护栏不变。
 
 ## 实施前已完成的验证
 
