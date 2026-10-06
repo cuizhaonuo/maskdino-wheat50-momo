@@ -2,7 +2,7 @@
 
 状态：**训练中（2026-10-06 启动）** ｜ 提出 2026-09-26 ｜ 分支 `mini/apg-refine`（从 `mini/baseline`@`0f71161` 开出）｜
 配置 `wheat_joint_single_stage_mini_apg_refine.yaml`（`_BASE_` 为 `wheat_joint_single_stage_mini_ep100.yaml`）｜
-输出 `output_v2/exp-<启动日期>-mini-apg-refine`
+输出 `output_v2/exp-1006-mini-apg-refine`
 
 同组的另外两个形式：`mini/ifi-refine`（本形式去掉 APG 的归因对照臂，代码逐字相同）、`mini/apg-dense`（APGCC 原样的稠密锚点头）。
 
@@ -163,6 +163,12 @@ val，σ=8，阈值 0.35，读 `model_final.pth`。baseline 数值取自 `output
 `output_v2/_diag-0927-coral/`）：默认阈值下的 `count_MAE_spike` 主要量的是系统多报（基线 τ 0.35 时偏差 +2.40），
 只调阈值的基线就从 2.60 降到 1.467，全部预测常数 16 也有 1.86。本组换了出点的头（存在性校准与 25 槽头不同），
 默认阈值的计数读数更不可比。主判据、机制门、其余护栏不变。
+
+## 启动记录
+
+2026-10-06 10:13:24 在 qiuhao A100（GPU1）上从 `68eb2de` 启动（预注册修订之后、代码与 `2c77bb2` 逐字相同），输出 `output_v2/exp-1006-mini-apg-refine`，与 `mini/ifi-refine`（10:14:25 启动）共卡并发。
+同时启动的 `mini/apg-dense` 在开训第 0 iter OOM（两个进程的缓存分配器各自预留了 51 GB / 28 GB，实际分配峰值都只有 23.5 GB），
+其输出目录已删，改为排队到 GPU1 空出 32 GB 再自动启动，不影响本臂。
 
 ## 实施前已完成的验证
 
