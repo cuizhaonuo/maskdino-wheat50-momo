@@ -1,6 +1,6 @@
 # 想法：计数交给「穗长直线 + 残差计数头」
 
-状态：**预注册，待跑** ｜ 提出 2026-10-07 ｜ 分支 `mini/count-residual`（从 `mini/baseline`@`0f71161` 开出，100 epoch）｜ 配置 `wheat_joint_single_stage_mini_count_residual.yaml`（`_BASE_` 为 `wheat_joint_single_stage_mini_ep100.yaml`）｜ 输出 `output_v2/exp-1007-mini-count-residual`
+状态：**计数过线、护栏未过（不记成立）**；机制启动 ｜ 验证于 [exp-2026-10-07-mini-count-residual](../experiments/exp-2026-10-07-mini-count-residual.md) ｜ 2026-10-07 20:41:31 启动于 `60d21a3`，xuyu A100 GPU0（本批次用户临时放开）｜ 预注册提交于 `60d21a3`（跑之前）｜ 提出 2026-10-07 ｜ 分支 `mini/count-residual`（从 `mini/baseline`@`0f71161` 开出，100 epoch）｜ 配置 `wheat_joint_single_stage_mini_count_residual.yaml`（`_BASE_` 为 `wheat_joint_single_stage_mini_ep100.yaml`）｜ 输出 `output_v2/exp-1007-mini-count-residual`
 
 ## 来源
 
@@ -200,3 +200,22 @@
 - 速度：冒烟独占一张卡 2.63 s/iter；mini/baseline 当时与别的 run 并发约 3.8 s/iter。按 2.6~3.8 s/iter 算，训练 9~13 h，评估另约 1~1.5 h。
 - 峰值显存：冒烟 22,989 MB，与基线（约 23.1 GB）同量级。计数头每层只多一个 2 层 MLP 和一次向量化的 L1。
 - 跑在 xuyu A100 GPU0（本批次用户临时放开，一个 run 一张卡）。
+
+## 结论（2026-10-08）
+
+**计数过线、护栏未过，按预注册不记成立；机制启动。**
+详见 [exp-2026-10-07-mini-count-residual](../experiments/exp-2026-10-07-mini-count-residual.md)。
+
+| 判据 | 要求 | 实测 | |
+|:--|:--|:--|:--:|
+| 机制：r(头) − r(直线)，最终评估 561 穗 | ≥ +0.03 | **+0.127**（0.747 vs 0.621） | ✅ |
+| 主判据：读数那次（iter 9499）`count_MAE_spike` | ≤ 1.28 成立 | **1.146**（基线 iter 8999 为 2.465） | ✅ 过线 |
+| 护栏：segm AP 全程峰值 | ≥ 77.80 | 77.26 | ❌ |
+| 护栏：`spike_recall` 全程峰值 | ≥ 0.9311 | 0.9217 | ❌ |
+| 护栏：读数那次 `matched_F1@8` | ≥ 0.6078 | 0.6027 | ❌ |
+
+- 计数：偏差 +0.02、r 0.75；后半程 13 轮全部 ≤ 1.27。这是 mini 系列第一个默认读数赢过直线（1.42）的 arm。
+  同一 checkpoint 只用直线是 1.417，相对直线的收益来自残差 Δ。
+- 代价：后半程与基线同 iter 比，segm AP 平均 −2.05、`spike_recall` −0.032、`matched_F1@8` −0.019。
+  点的读法没改，差异来自计数损失经共享 decoder 的回传；单次 run 分不清是梯度方向冲突还是梯度裁剪下的份额挤占。
+- 未验证的后续方向：计数损失不回传共享 decoder（Δ 的输入 detach），或降低 `POINT_COUNT_WEIGHT`。
