@@ -1,7 +1,7 @@
 # 想法：分组 decoder 上，存在性改学「定位质量」（Quality Focal Loss）
 
-状态：**预注册，待跑** ｜ 提出 2026-10-07 ｜ 分支 `mini/group-quality`（从 `mini/group-decoder`@`00a7aaf` 开出，100 epoch）｜ 配置
-`wheat_joint_single_stage_mini_group_quality.yaml`（`_BASE_` 为 `wheat_joint_single_stage_mini_group.yaml`，即 E3 的配置）｜ 输出 `output_v2/exp-<启动日期 MMDD>-mini-group-quality`
+状态：**判否（100 epoch，2026-10-08；机制未启动，主判据判否，计数次判据成立但来自标定，护栏全过）**，见 [exp-2026-10-07-mini-group-quality](../experiments/exp-2026-10-07-mini-group-quality.md) ｜ 提出 2026-10-07 ｜ 分支 `mini/group-quality`（从 `mini/group-decoder`@`00a7aaf` 开出，100 epoch）｜ 配置
+`wheat_joint_single_stage_mini_group_quality.yaml`（`_BASE_` 为 `wheat_joint_single_stage_mini_group.yaml`，即 E3 的配置）｜ 输出 `output_v2/exp-1007-mini-group-quality`
 
 **分叉点与约定不同，是有意的。** mini 实验的约定是新 arm 一律从 `mini/baseline` 开。本 arm 是在 E3（分组 decoder）上续做：
 要检验的是「小穗 token 已经能逐点看局部特征，只差监督」这一判断，离开分组 decoder 就不成立。所以从 `mini/group-decoder`@`00a7aaf` 开出。
@@ -216,3 +216,29 @@ python myscripts/backup/vis_process/point_token_diag.py --sweep --run-dir <输�
 - 另加 25 次评估，每次约 2.5 min（冒烟实测），共约 1 h。
 - 峰值显存约 26~27 GB（冒烟 max_mem 25.9 G；E3 100 epoch 实测 26.9 GB），只能用 qiuhao 的 A100（GPU1）。
 - 每次存 checkpoint 785 MB × 25 个，约 20 GB 磁盘。
+
+## 结论（2026-10-08）
+
+**判否；机制未启动（M1 未通过）；计数次判据成立，但来自标定；护栏全过。**
+按上面「预期与判否线」判，读数一律是默认读数（阈值 0.35，未做阈值扫描）。
+详见 [exp-2026-10-07-mini-group-quality](../experiments/exp-2026-10-07-mini-group-quality.md)。
+
+| 判据 | 要求 | 实测 | |
+|:--|:--|:--|:--:|
+| M1 存在性 AUC | ≥ 0.749 | 0.7181（E3 0.6991） | ❌ |
+| M2 重复点（护栏） | ≤ 1% | 0.22%（22 / 9866；E3 0.39%） | ✅ |
+| 主判据：读数那次 `matched_F1@8` | ≥ 0.6526 成立；≤ 0.6326 判否 | 0.6282（iter 7999；E3 0.6326 @ iter 9499） | 判否 |
+| 次判据：读数那次 `count_MAE_spike` | ≤ 2.18 | 1.663（E3 2.422） | ✅ |
+| 护栏 `segm/AP` 峰值 | ≥ 77.35 | 78.47 | ✅ |
+| 护栏 `spike_recall` 峰值 | ≥ 0.9457 | 0.9576 | ✅ |
+
+诊断在 qiuhao GPU1 上跑（`output_v2/_diag-1007-group-quality/`），重算的 matched_F1@8 与训练日志末值逐位相同。
+
+读法：
+
+- quality 目标只让存在性 AUC 升了 0.019。覆盖率与 E3 相同（79.0% vs 79.1%），沿轴 / 横轴误差在同一水平（4.74 / 2.17 vs 4.49 / 2.28 px）。
+- `matched_F1@8` 与 E3 持平：读数那次 −0.0045，末值 +0.0005。
+- 计数降 31%，但最终评估的有符号偏差从 +2.53 降到 +1.16，Pearson r 基本不变（0.552 → 0.562）。
+  下降来自分数整体下移、少出点，即「归因限制」里预先写明的标定混杂，不是判别变好。
+- 分割没有代价：`segm/AP` 峰值 78.47（E3 78.35）。
+- 加局部特征（E3、ifi-refine、apg-refine）与改监督目标（本 arm）单独都没让 AUC 过 +0.05。
