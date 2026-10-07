@@ -1,6 +1,6 @@
 # 想法：APGCC 的 IFI 精修头 + APG 辅助点（形式 A）
 
-状态：**训练中（2026-10-06 启动）** ｜ 提出 2026-09-26 ｜ 分支 `mini/apg-refine`（从 `mini/baseline`@`0f71161` 开出）｜
+状态：**预注册判定：机制未启动（M1 未过）；主判据歧义；计数护栏不过** ｜ 验证于 [exp-2026-10-06-mini-apg-refine](../experiments/exp-2026-10-06-mini-apg-refine.md) ｜ 提出 2026-09-26 ｜ 分支 `mini/apg-refine`（从 `mini/baseline`@`0f71161` 开出）｜
 配置 `wheat_joint_single_stage_mini_apg_refine.yaml`（`_BASE_` 为 `wheat_joint_single_stage_mini_ep100.yaml`）｜
 输出 `output_v2/exp-1006-mini-apg-refine`
 
@@ -231,3 +231,21 @@ python myscripts/backup/vis_process/point_token_diag.py --run-dir output_v2/exp-
 ## 成本
 
 12500 iter。baseline 独占 A100 约 2.3 s/iter、10:49；精修头每 batch 多约 1 万个位置的小 MLP，预计增加不到 5%。
+
+## 结论（2026-10-07）
+
+**预注册判定：机制未启动；主判据歧义；计数护栏不过。** 详见 [exp-2026-10-06-mini-apg-refine](../experiments/exp-2026-10-06-mini-apg-refine.md)。
+
+| | 本臂 | baseline | 线 |
+|:--|--:|--:|--:|
+| M1 存在性 AUC | **0.630** | 0.667 | ≥ 0.7171 ❌ |
+| M2 沿轴中位误差 | **3.87 px** | 4.62 | ≤ 4.16 ✅ |
+| `matched_F1@8` 峰值 / 末值 | 0.6384 / 0.6384 | 0.6331 / 0.6312 | 成立 ≥ 0.6481 / 0.6462 → 歧义 |
+| `segm/AP` 峰值 | 78.14 | 78.80 | ≥ 77.80 ✅ |
+| `count_MAE_spike` 校准后最优档 | 2.577 @ 0.55 | 1.467 @ 0.50 | ≤ 1.61 ❌ |
+| 重复点率 | 0.25% | 0.08% | ≤ 1% ✅ |
+| 归因 A − B（末 4 轮均值） | +0.0066 | — | ≥ 0.015 → APG 增量未决 |
+
+- 精修吸附成立（沿轴 −16%，训练损失之比 0.90）。APG 的存在性项学不出来（BCE ≈ ln 2）：2 px vs 2~8 px 的正负对比低于 1/4 特征的格宽（4 px），
+  反而把存在性压平，AUC 比 B 低 0.03。
+- 同一 checkpoint 的 25 槽头（coarse 源）0.6413，高于本臂的精修头；对 baseline 的领先来自 trunk / 25 槽头，不来自精修头。
