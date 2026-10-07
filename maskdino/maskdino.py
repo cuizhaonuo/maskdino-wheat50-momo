@@ -204,6 +204,8 @@ class MaskDINO(nn.Module):
             point_empty_cls_weight=cfg.MODEL.MaskDINO.POINT_EMPTY_CLS_WEIGHT,
             point_coord_norm=cfg.MODEL.MaskDINO.POINT_COORD_NORM,
             point_coord_robust_c=cfg.MODEL.MaskDINO.POINT_COORD_ROBUST_C,
+            point_exist_target=cfg.MODEL.MaskDINO.POINT_EXIST_TARGET,
+            point_quality_sigma_nn=cfg.MODEL.MaskDINO.POINT_QUALITY_SIGMA_NN,
         )
 
         return {

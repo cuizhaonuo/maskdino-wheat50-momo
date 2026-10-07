@@ -1,0 +1,29 @@
+# ============================================================================
+# 单阶段联合训练 · 500 图小集 · 分组 decoder + 存在性学「定位质量」（mini/group-quality）
+#   预注册：experiments-bank/ideas/group-quality.md（判否线在跑之前写死）
+#   对照：wheat_joint_single_stage_mini_group.yaml（mini/group-decoder 的 100 epoch 版，E3，
+#         output_v2/exp-0925-mini-group-decoder）。本分支从 mini/group-decoder@00a7aaf 开出，在 E3 上续做。
+#
+# 与 E3 的差异【只有存在性目标一处】：
+#   POINT_EXIST_TARGET: hard -> quality
+#     内层匹配上的 token，存在性目标由 1 改为定位质量 q = exp(-d² / (2σ²))：
+#       d = 该 token 预测点与所配 GT 小穗的像素距离（detach，不受 iso / ρ 影响）；
+#       σ = POINT_QUALITY_SIGMA_NN × 该实例 GT 小穗最近邻距离的中位数（像素，增广后；Ni<2 时 8 px）。
+#     未匹配 token 仍为 0；损失由 α-focal 换成 α 加权的 Quality Focal Loss（γ=2，α=POINT_FOCAL_ALPHA=0.5），
+#     q ∈ {0,1} 时二者逐项相等。interm、layer-0 MLP 头、小穗 token 各层统一用这一目标。
+#   POINT_QUALITY_SIGMA_NN: 0.5（mini train 原生尺度下最近邻中位数 p50 16.8 px → σ ≈ 8.4 px，与评估 σ=8 对齐）
+# 不变：内层匹配代价（COST_POINT_*）、损失归一化、POINT_CLASS_WEIGHT、Ni=0 实例的处理
+#      （q 全 0，权重 POINT_EMPTY_CLS_WEIGHT=0.1）、推理（POINT_THRESHOLD 0.35；q=0.35 约对应 d≈1.45σ≈12 px）。
+#      schedule、数据、其余旋钮全部继承 E3。
+#
+# 用法：
+#   python train_net.py --num-gpus 1 \
+#     --config-file configs/coco/instance-segmentation/wheat_joint_single_stage_mini_group_quality.yaml \
+#     OUTPUT_DIR /public/home/zncui/pycharm_project/maskdino-wheat50/output_v2/<run-name>
+# ============================================================================
+_BASE_: wheat_joint_single_stage_mini_group.yaml
+
+MODEL:
+  MaskDINO:
+    POINT_EXIST_TARGET: "quality"
+    POINT_QUALITY_SIGMA_NN: 0.5

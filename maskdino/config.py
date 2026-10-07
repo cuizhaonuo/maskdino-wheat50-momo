@@ -120,6 +120,18 @@ def add_maskdino_config(cfg):
     # （c=1、|e|=0.05 处差 2.5%），远处梯度 1/(1+|e|/c)，方向由已定位好的实例主导。
     # 0 = 纯 L1。只作用于绝对坐标输出，layer-0 / interm 的 MLP 点头不受影响。
     cfg.MODEL.MaskDINO.POINT_COORD_ROBUST_C = 0.0
+    # ---- 存在性目标（mini/group-quality）----
+    # "hard"    = 现状：内层匹配上的 token 目标为 1，其余为 0，损失为 α-focal。
+    # "quality" = 匹配上的 token 目标改为定位质量 q = exp(-d² / (2σ²))，d 为该 token 预测点与所配
+    #             GT 小穗的像素距离（detach），其余仍为 0；损失换成 α 加权的 Quality Focal Loss
+    #             L = -|q-p|^γ·[α·q·log p + (1-α)·(1-q)·log(1-p)]（γ=2，α=POINT_FOCAL_ALPHA），
+    #             q ∈ {0,1} 时与 α-focal 逐项相等。来源：GFL 的 QFL、VarifocalNet、Stable-DINO。
+    #             所有带点的输出（interm、layer-0 MLP 头、小穗 token 各层）一律用同一种目标；
+    #             内层匹配代价、归一化、POINT_EMPTY_CLS_WEIGHT、推理都不变。
+    cfg.MODEL.MaskDINO.POINT_EXIST_TARGET = "hard"
+    # quality 目标的 σ = 本值 × 该实例 GT 小穗「各点到最近邻距离」的中位数（像素，增广后；Ni<2 时 σ=8 px）。
+    # mini train 原生尺度下该中位数 p50 16.8 px，0.5 → σ ≈ 8.4 px，与评估的 σ=8 对齐；LSJ 缩放时随之缩放。
+    cfg.MODEL.MaskDINO.POINT_QUALITY_SIGMA_NN = 0.5
     # True = 存在性头 point_class_embed 用 3 层 MLP（与坐标头 point_coord_embed 对齐），
     # False = 保持单层 nn.Linear。点头参数 12,850 -> 144,434。
     # 【口径】08-25 在 overfit10 上三向同时改善，但 08-26 的 val 检验判定 mF1 优势是记忆

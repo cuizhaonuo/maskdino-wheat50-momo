@@ -66,6 +66,22 @@ def sigmoid_focal_loss(inputs, targets, num_boxes, alpha: float = 0.25, gamma: f
     return loss.mean(1).sum() / num_boxes
 
 
+def quality_focal_loss(inputs, quality, alpha: float, gamma: float = 2.0):
+    """α 加权的 Quality Focal Loss（逐元素，不求和）。
+    L = -|q - p|^γ · [α·q·log p + (1-α)·(1-q)·log(1-p)]，p = sigmoid(inputs)。
+    q ∈ {0,1} 时与 α-focal（loss_points 的 hard 分支）逐项相等；q 为软目标时在 p = q 处取最小值 0。
+    来源：Li et al., Generalized Focal Loss（NeurIPS 2020）的 QFL；正负两项按 α 加权，与本仓库的点 focal 对齐。
+    Args:
+        inputs:  logits，任意形状
+        quality: 与 inputs 同形状的目标 q ∈ [0,1]（应已 detach）
+    """
+    prob = inputs.sigmoid()
+    ce_pos = F.binary_cross_entropy_with_logits(inputs, torch.ones_like(inputs), reduction="none")   # -log p
+    ce_neg = F.binary_cross_entropy_with_logits(inputs, torch.zeros_like(inputs), reduction="none")  # -log(1-p)
+    modulator = (quality - prob).abs() ** gamma
+    return modulator * (alpha * quality * ce_pos + (1 - alpha) * (1 - quality) * ce_neg)
+
+
 def dice_loss(
         inputs: torch.Tensor,
         targets: torch.Tensor,
@@ -146,7 +162,7 @@ class SetCriterion(nn.Module):
                  num_points, oversample_ratio, importance_sample_ratio,dn="no",dn_losses=[], panoptic_on=False, semantic_ce_loss=False,
                  num_spikelet_points=50, point_cost_coord=5.0, point_cost_class=2.0,
                  point_focal_alpha=0.25, point_empty_cls_weight=1.0, point_coord_norm="box_axis",
-                 point_coord_robust_c=0.0):
+                 point_coord_robust_c=0.0, point_exist_target="hard", point_quality_sigma_nn=0.5):
         """Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
@@ -189,6 +205,10 @@ class SetCriterion(nn.Module):
         self.point_coord_norm = point_coord_norm
         # 绝对坐标输出（分组 decoder 的小穗 token）的坐标误差稳健化常数 c，见 _point_coord_rho
         self.point_coord_robust_c = point_coord_robust_c
+        # 存在性目标："hard"（匹配上为 1）或 "quality"（匹配上为定位质量 q），见 _point_quality
+        assert point_exist_target in ("hard", "quality"), f"未知 POINT_EXIST_TARGET: {point_exist_target}"
+        self.point_exist_target = point_exist_target
+        self.point_quality_sigma_nn = point_quality_sigma_nn
 
     def loss_labels_ce(self, outputs, targets, indices, num_masks):
         """Classification loss (NLL)
@@ -409,6 +429,39 @@ class SetCriterion(nn.Module):
         col_ind = torch.as_tensor(col_ind, dtype=torch.int64, device=pred_rel.device)
         return row_ind, col_ind
 
+    # Ni < 2（无法算最近邻距离）时 quality 目标的 σ（像素）；与评估的 σ=8 同值
+    POINT_QUALITY_SIGMA_FALLBACK_PX = 8.0
+
+    @torch.no_grad()
+    def _point_quality(self, pred_rel, gt_rel, row_ind, col_ind, box_wh, image_wh):
+        """POINT_EXIST_TARGET="quality" 的存在性目标：内层匹配上的 token 的定位质量 q = exp(-d² / (2σ²))。
+        - d：token 预测点与所配 GT 小穗的像素距离。框相对坐标 × 框归一化宽高 × 图像像素宽高 → 像素；
+             纯像素距离，不受 iso 归一化或 ρ 影响；整个函数在 no_grad 下，q 不回传梯度。
+        - σ：POINT_QUALITY_SIGMA_NN × 该实例 GT 小穗「各点到最近邻距离」的中位数（像素，增广后）；
+             Ni < 2 时取 POINT_QUALITY_SIGMA_FALLBACK_PX。原生尺度下该中位数约 17 px，LSJ 缩放时 σ 随之缩放。
+        Args:
+            pred_rel: [P, 2]  预测点（GT 框相对）
+            gt_rel:   [Ni, 2] GT 小穗（GT 框相对，已 clamp 到 [0,1]，与坐标损失同一个目标）
+            row_ind, col_ind: 内层匹配结果（_inner_point_match）
+            box_wh:   [2] GT 框 (w, h)，图像归一化
+            image_wh: [2] 图像像素 (W, H)
+        Returns:
+            q: [len(row_ind)]，与 row_ind 一一对应
+        """
+        assert image_wh is not None, "POINT_EXIST_TARGET=quality 需要 targets 带 image_wh（prepare_targets 已提供）"
+        scale = box_wh.float() * image_wh.float().to(box_wh.device)          # 框相对 → 像素
+        d = ((pred_rel[row_ind].float() - gt_rel[col_ind].float()) * scale).norm(dim=-1)   # [M]
+        gt_px = gt_rel.float() * scale                                          # [Ni, 2]
+        if gt_px.shape[0] < 2:
+            sigma = gt_px.new_tensor(self.POINT_QUALITY_SIGMA_FALLBACK_PX)
+        else:
+            dist = (gt_px[:, None] - gt_px[None]).norm(dim=-1)                  # [Ni, Ni]
+            dist.fill_diagonal_(float("inf"))
+            sigma = self.point_quality_sigma_nn * torch.quantile(dist.min(dim=1).values, 0.5)
+            # 数值保护：GT 点重合时中位数为 0，q 会变成 exp(-0/0)。mini train/val 里没有重合点，不会触发
+            sigma = sigma.clamp(min=1e-3)
+        return torch.exp(-d.square() / (2 * sigma.square()))
+
     def loss_points(self, outputs, targets, indices, num_masks):
         """逐实例小穗点损失：对每个外层匹配到的实例，做内层匈牙利匹配后计算
         点坐标 L1 损失 + 点存在性 focal 损失。
@@ -418,6 +471,9 @@ class SetCriterion(nn.Module):
           先换到 GT 框相对系，坐标误差用 _point_coord_rho（POINT_COORD_ROBUST_C>0 时有界增长）。
           缺省 False：MLP 点头的框相对坐标，与原实现一致。
         - wheat 实例（无小穗，Ni=0）：无坐标损失，P 个点全部监督为不存在（背景）。
+        - POINT_EXIST_TARGET="quality"：匹配上的 token 的存在性目标由 1 改为定位质量 q（见 _point_quality），
+          损失由 α-focal 换成 quality_focal_loss（q ∈ {0,1} 时二者逐项相等）。内层匹配、归一化、
+          Ni=0 的降权都不变；所有输出（interm、layer-0、小穗 token 各层）都走这里，目标口径统一。
         """
         assert 'pred_point_coords' in outputs and 'pred_point_logits' in outputs
         pred_coords = outputs['pred_point_coords']   # [B, Q, P, 2]
@@ -457,10 +513,14 @@ class SetCriterion(nn.Module):
                 iso_scale = self._point_iso_scale(wh, image_wh)
                 row_ind, col_ind = self._inner_point_match(pred_rel, pred_lg, gt_rel, iso_scale, robust=abs_frame)
 
-                # 存在性目标：匹配上的预测点为 1，其余为 0
+                # 存在性目标：匹配上的预测点为 1（quality：为定位质量 q），其余为 0
                 tgt_exist = torch.zeros((self.num_spikelet_points, 1), device=device, dtype=pred_lg.dtype)
                 if row_ind.numel() > 0:
-                    tgt_exist[row_ind] = 1.0
+                    if self.point_exist_target == "quality":
+                        tgt_exist[row_ind] = self._point_quality(
+                            pred_rel, gt_rel, row_ind, col_ind, wh, image_wh)[:, None].to(tgt_exist.dtype)
+                    else:
+                        tgt_exist[row_ind] = 1.0
                     # 坐标 L1 损失（仅匹配点），与内层代价同一个空间、同一个误差函数
                     pred_m, gt_m = pred_rel[row_ind], gt_rel[col_ind]
                     if iso_scale is not None:
@@ -471,12 +531,15 @@ class SetCriterion(nn.Module):
                         coord_loss = coord_loss + F.l1_loss(pred_m, gt_m, reduction='sum')
 
                 # 存在性 focal 损失（全部 P 个点）
-                prob = pred_lg.sigmoid()
-                ce = F.binary_cross_entropy_with_logits(pred_lg, tgt_exist, reduction='none')
-                p_t = prob * tgt_exist + (1 - prob) * (1 - tgt_exist)
-                focal = ce * ((1 - p_t) ** gamma)
-                alpha_t = alpha * tgt_exist + (1 - alpha) * (1 - tgt_exist)
-                focal = alpha_t * focal
+                if self.point_exist_target == "quality":
+                    focal = quality_focal_loss(pred_lg, tgt_exist, alpha, gamma)
+                else:
+                    prob = pred_lg.sigmoid()
+                    ce = F.binary_cross_entropy_with_logits(pred_lg, tgt_exist, reduction='none')
+                    p_t = prob * tgt_exist + (1 - prob) * (1 - tgt_exist)
+                    focal = ce * ((1 - p_t) ** gamma)
+                    alpha_t = alpha * tgt_exist + (1 - alpha) * (1 - tgt_exist)
+                    focal = alpha_t * focal
                 # Ni==0 的 wheat 实例贡献 P 个纯负样本，但推理时按类别门控、
                 # 它们本就不输出点，这部分监督只在误分类时生效，故可降权。
                 w = 1.0 if Ni > 0 else self.point_empty_cls_weight
