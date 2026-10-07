@@ -162,6 +162,15 @@ class COCOInstanceNewBaselineDatasetMapper:
         padding_mask = np.ones(image.shape[:2])
 
         image, transforms = T.apply_transform_gens(self.tfm_gens, image)
+        # 实际施加的缩放系数（新尺寸 / 原尺寸，按 x、y 分开）。残差计数头的直线锚要用原生尺度的框对角线：
+        # 原生 = 增广后像素 ÷ 缩放系数（maskdino.py 的 prepare_targets）。翻转、裁剪、补边都不改尺度。
+        # 只读 transform 的属性，不消耗随机数；计数头关着时这个键不被使用。
+        lsj_sx = lsj_sy = 1.0
+        for t in transforms.transforms:
+            if isinstance(t, T.ResizeTransform):
+                lsj_sx *= t.new_w / t.w
+                lsj_sy *= t.new_h / t.h
+        dataset_dict["lsj_scale"] = (float(lsj_sx), float(lsj_sy))
         # the crop transformation has default padding value 0 for segmentation
         padding_mask = transforms.apply_segmentation(padding_mask)
         padding_mask = ~ padding_mask.astype(bool)

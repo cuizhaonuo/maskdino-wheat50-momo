@@ -100,6 +100,17 @@ def add_maskdino_config(cfg):
     # 【注意】开关会改变参数名（point_class_embed.weight/bias <-> .layers.{0,1,2}.*），
     # 两种设置下训出的 Stage2 checkpoint 不能互相加载（会被静默跳过）。
     cfg.MODEL.MaskDINO.POINT_CLASS_MLP = False
+    # ===== 残差计数头（mini/count-residual，预注册见 experiments-bank/ideas/count-residual.md）=====
+    # 每穗小穗数 N̂ = a + b·diag + Δ。a + b·diag 是「穗长直线」，diag = 框对角线 hypot(w, h)（原生像素尺度）；
+    # Δ 是每个实例 query 上一个 2 层 MLP 输出的残差，最后一层零初始化，开训时 N̂ 恰好等于直线。
+    # False 时一个参数都不建、不产生损失，模型与 mini/baseline 逐位相同。
+    cfg.MODEL.MaskDINO.POINT_COUNT_HEAD = False
+    # loss_point_count：外层匹配上的 wheat_2（Ni >= 1）上 |N̂ - Ni| 的均值，随 _interm / _{i} 深监督带上。
+    cfg.MODEL.MaskDINO.POINT_COUNT_WEIGHT = 1.0
+    # 直线 (a, b)：mini train 2754 个带点 wheat_2 上最小二乘，点数 = 8.924 + 0.0345 × hypot(w, h)
+    # （GT 框，原生 1024² 像素）。训练时 diag 用匹配到的 GT 框（按 LSJ 缩放系数换回原生尺度），
+    # 推理时用该实例的预测框（原图像素）。
+    cfg.MODEL.MaskDINO.POINT_COUNT_LINE = [8.924, 0.0345]
     # FREEZE_EXCEPT_POINT_HEAD=True 时，除点头外额外解冻的参数名子串。
     # 空 = 只训点头（Stage2 原设计）。例：["predictor.decoder"] 解冻 transformer decoder，
     # ["sem_seg_head"] 解冻整个分割头（decoder + pixel decoder + 各预测头），backbone 仍冻结。
@@ -132,6 +143,12 @@ def add_maskdino_config(cfg):
     cfg.MODEL.MaskDINO.TEST.PANO_TEMPERATURE = 0.06
     # 小穗点存在性置信度阈值（sigmoid 后 > 该值的点才输出）
     cfg.MODEL.MaskDINO.TEST.POINT_THRESHOLD = 0.35
+    # 每穗计数 pred_spikelet_counts 的来源，只对 wheat_2 生效（小穗点本身照旧按 POINT_THRESHOLD 输出）：
+    #   "points" = 现状，留下的小穗点个数；
+    #   "line"   = round(a + b·hypot(w, h))，w、h 取该实例的预测框（原图像素），不需要计数头；
+    #   "head"   = round(a + b·hypot(w, h) + Δ)，Δ 取最后一层的残差，需要 POINT_COUNT_HEAD=True。
+    # 结果 clamp 到 >= 0。SpikeletPointEvaluator 的 count_MAE_spike / count_MAE_img 读这个字段。
+    cfg.MODEL.MaskDINO.TEST.POINT_COUNT_SOURCE = "points"
     # 评估时是否额外加挂小穗点评估器（SpikeletPointEvaluator，见 maskdino/evaluation/）
     cfg.MODEL.MaskDINO.TEST.SPIKELET_EVAL = False
     # 点匹配的距离阈值（原图像素，多档一起报）。GT 实测同穗内小穗最近邻间距中位 16px，

@@ -18,6 +18,11 @@ COCOEvaluator 只评 mask/box AP，看不出点回归头学得怎么样。本评
 坐标系：模型输出的 pred_spikelet_points 已经在原图像素系（maskdino.py 在 instance_inference
 之前就把 mask/box 还原回了原图尺寸，点是纯框相对还原），GT 的 points 也是原图绝对像素，
 两者可直接比对，σ 的像素单位即原图像素。
+
+计数：实例带 pred_spikelet_counts 时，count_MAE_spike / count_MAE_img（含 RMSE）与两份 CSV 的
+pred_points 列读这个字段；点级 P/R/F1、n_pred_points、fp_point_* 仍按实际输出的点算。
+TEST.POINT_COUNT_SOURCE=points（默认）时这个字段与点数恒等，结果与改动前逐位相同；
+line / head 读法下计数来自穗长直线（+ 残差），逐穗明细额外写 out_points、line_count 两列。
 """
 
 import copy
@@ -109,8 +114,13 @@ class SpikeletPointEvaluator(DatasetEvaluator):
             classes = inst.pred_classes.detach().cpu().numpy()
             scores = inst.scores.detach().cpu().numpy()
             has_points = inst.has("pred_spikelet_points")
+            # 每穗计数：有 pred_spikelet_counts 就读它（line / head 读法下它不等于点数），否则数点
+            counts_all = (inst.pred_spikelet_counts.detach().cpu().numpy()
+                          if inst.has("pred_spikelet_counts") else None)
+            line_all = (inst.pred_spikelet_count_line.detach().cpu().numpy()
+                        if inst.has("pred_spikelet_count_line") else None)
 
-            points, rles, keep_scores = [], [], []
+            points, rles, keep_scores, counts, line_counts = [], [], [], [], []
             for i in range(len(inst)):
                 if int(classes[i]) != self._spikelet_class_id or scores[i] < self._score_thresh:
                     continue
@@ -120,11 +130,17 @@ class SpikeletPointEvaluator(DatasetEvaluator):
                 rles.append(mask_util.encode(np.asfortranarray(m)))
                 points.append(np.asarray(pts, dtype=np.float64).reshape(-1, 2))
                 keep_scores.append(float(scores[i]))
+                counts.append(int(counts_all[i]) if counts_all is not None else len(points[-1]))
+                if line_all is not None:
+                    # 与 POINT_COUNT_SOURCE=line 的取整口径相同：round 后 clamp 到 >= 0
+                    line_counts.append(int(max(np.round(float(line_all[i])), 0)))
 
             # 零预测的图也要保留：它们对 recall 与计数 MAE 有贡献。
             self._predictions.append({
                 "image_id": inp["image_id"], "points": points,
                 "rles": rles, "scores": keep_scores,
+                "counts": counts,
+                "line_counts": line_counts if line_all is not None else None,
             })
 
     def evaluate(self):
@@ -153,6 +169,8 @@ class SpikeletPointEvaluator(DatasetEvaluator):
         img_pred_tot, img_gt_tot = [], []
         n_gt_spike = n_pred_spike = n_matched_spike = 0
         rows = []
+        # line / head 读法（实例带 pred_spikelet_count_line）时，逐穗明细多写 out_points、line_count 两列
+        with_line = any(p.get("line_counts") is not None for p in predictions)
 
         for pred in predictions:
             gt = self._gt.get(pred["image_id"])
@@ -160,14 +178,20 @@ class SpikeletPointEvaluator(DatasetEvaluator):
                 self._logger.warning(f"[SpikeletPointEvaluator] image_id {pred['image_id']} 不在 GT 中，跳过")
                 continue
             gp, pp = gt["points"], pred["points"]
+            # 每穗计数（见 process）；旧格式的预测没有 counts 时退回数点
+            pc = pred.get("counts")
+            if pc is None:
+                pc = [len(x) for x in pp]
+            plc = pred.get("line_counts")
             n_gt_spike += len(gp)
             n_pred_spike += len(pp)
             gt_tot = int(sum(len(x) for x in gp))
-            pred_tot = int(sum(len(x) for x in pp))
+            pred_tot = int(sum(len(x) for x in pp))      # 实际输出的点（点级 P/R/F1 用）
+            pred_cnt_tot = int(sum(pc))                  # 计数（count_MAE_img 用）
             n_gt_pts += gt_tot
             n_pred_pts += pred_tot
             img_gt_tot.append(gt_tot)
-            img_pred_tot.append(pred_tot)
+            img_pred_tot.append(pred_cnt_tot)
 
             # --- 实例级：mask IoU + 匈牙利 ---
             pairs = []
@@ -191,10 +215,13 @@ class SpikeletPointEvaluator(DatasetEvaluator):
                     dist_n += int(within.size)
                 n_pred_pts_m += len(pp[pi])
                 n_gt_pts_m += len(gp[gi])
-                spike_count_abs_err.append(abs(len(pp[pi]) - len(gp[gi])))
-                pair_rows.append((gt["file_name"], len(pp[pi]), len(gp[gi]), float(iou[pi, gi])))
+                spike_count_abs_err.append(abs(int(pc[pi]) - len(gp[gi])))
+                row = (gt["file_name"], int(pc[pi]), len(gp[gi]), float(iou[pi, gi]))
+                if with_line:
+                    row = row + (len(pp[pi]), int(plc[pi]) if plc is not None else "")
+                pair_rows.append(row)
 
-            rows.append((gt["file_name"], len(pp), pred_tot, len(gp), gt_tot, len(pairs)))
+            rows.append((gt["file_name"], len(pp), pred_cnt_tot, len(gp), gt_tot, len(pairs)))
 
         def prf(tp_arr, n_pred, n_gt, k):
             p = tp_arr[k] / n_pred if n_pred else float("nan")
@@ -237,6 +264,7 @@ class SpikeletPointEvaluator(DatasetEvaluator):
 
         if self._output_dir:
             os.makedirs(self._output_dir, exist_ok=True)
+            # 逐图明细：pred_points 是该图各预测穗的计数之和（与 count_MAE_img 同口径）
             path = os.path.join(self._output_dir, "spikelet_pred_vs_gt.csv")
             with open(path, "w", newline="", encoding="utf-8") as f:
                 wcsv = csv.writer(f)
@@ -247,10 +275,15 @@ class SpikeletPointEvaluator(DatasetEvaluator):
 
             # 逐 TP 穗明细：与 count_MAE_spike 完全同一批配对（mask IoU 匈牙利 + IoU>=阈值），
             # count_MAE_spike == mean(|pred_points - gt_points|)。供散点/偏差分析。
+            # pred_points 是每穗计数（pred_spikelet_counts）；line / head 读法下另有
+            # out_points（实际输出的点数）与 line_count（只用穗长直线、取整后的计数），同一批穗可直接比 r。
             ppath = os.path.join(self._output_dir, "spikelet_pair_counts.csv")
             with open(ppath, "w", newline="", encoding="utf-8") as f:
                 wcsv = csv.writer(f)
-                wcsv.writerow(["file_name", "pred_points", "gt_points", "iou"])
+                header = ["file_name", "pred_points", "gt_points", "iou"]
+                if with_line:
+                    header += ["out_points", "line_count"]
+                wcsv.writerow(header)
                 wcsv.writerows(pair_rows)
             self._logger.info(f"[SpikeletPointEvaluator] 逐 TP 穗明细 -> {ppath}")
 

@@ -54,6 +54,9 @@ class MaskDINO(nn.Module):
         transform_eval: bool = False,
         semantic_ce_loss: bool = False,
         point_threshold: float = 0.35,
+        point_count_head: bool = False,
+        point_count_line: Tuple[float, float] = (8.924, 0.0345),
+        point_count_source: str = "points",
     ):
         """
         Args:
@@ -111,6 +114,14 @@ class MaskDINO(nn.Module):
         # 小穗点推理：存在性阈值 + 带小穗的类别（wheat_2 的连续 id=1，只有该类输出点）
         self.point_threshold = point_threshold
         self.spikelet_class_id = 1
+        # 残差计数头：训练时 prepare_targets 给 targets 带上原生尺度的 GT 框对角线与 Ni；
+        # 推理时 point_count_source 决定 wheat_2 的 pred_spikelet_counts 怎么来（见 config.py）。
+        self.point_count_head = point_count_head
+        self.point_count_line = (float(point_count_line[0]), float(point_count_line[1]))
+        assert point_count_source in ("points", "line", "head"), point_count_source
+        if point_count_source == "head":
+            assert point_count_head, "TEST.POINT_COUNT_SOURCE=head 需要 MODEL.MaskDINO.POINT_COUNT_HEAD=True"
+        self.point_count_source = point_count_source
 
         if not self.semantic_on:
             assert self.sem_seg_postprocess_before_inference
@@ -155,6 +166,9 @@ class MaskDINO(nn.Module):
         weight_dict.update({"loss_bbox":box_weight,"loss_giou":giou_weight})
         # 小穗点损失（随 _interm / _{i} 深监督自动带上；dn 不计算点损失，其 _dn 权重存在但不会被产生，无害）
         weight_dict.update({"loss_point_coord": point_coord_weight, "loss_point_cls": point_cls_weight})
+        # 残差计数头的损失，同样随 _interm / _{i} 深监督带上（_dn 版权重存在但不会被产生，无害）
+        if cfg.MODEL.MaskDINO.POINT_COUNT_HEAD:
+            weight_dict.update({"loss_point_count": cfg.MODEL.MaskDINO.POINT_COUNT_WEIGHT})
         # two stage is the query selection scheme
         if cfg.MODEL.MaskDINO.TWO_STAGE:
             interm_weight_dict = {}
@@ -180,6 +194,8 @@ class MaskDINO(nn.Module):
             losses = ["labels", "masks","boxes","points"]
         else:
             losses = ["labels", "masks","points"]
+        if cfg.MODEL.MaskDINO.POINT_COUNT_HEAD:
+            losses.append("point_count")
         # building criterion
         criterion = SetCriterion(
             sem_seg_head.num_classes,
@@ -199,6 +215,7 @@ class MaskDINO(nn.Module):
             point_cost_class=cfg.MODEL.MaskDINO.COST_POINT_CLASS_WEIGHT,
             point_focal_alpha=cfg.MODEL.MaskDINO.POINT_FOCAL_ALPHA,
             point_empty_cls_weight=cfg.MODEL.MaskDINO.POINT_EMPTY_CLS_WEIGHT,
+            point_count_line=tuple(cfg.MODEL.MaskDINO.POINT_COUNT_LINE),
         )
 
         return {
@@ -228,6 +245,9 @@ class MaskDINO(nn.Module):
             "pano_temp": cfg.MODEL.MaskDINO.TEST.PANO_TEMPERATURE,
             "semantic_ce_loss": cfg.MODEL.MaskDINO.TEST.SEMANTIC_ON and cfg.MODEL.MaskDINO.SEMANTIC_CE_LOSS and not cfg.MODEL.MaskDINO.TEST.PANOPTIC_ON,
             "point_threshold": cfg.MODEL.MaskDINO.TEST.POINT_THRESHOLD,
+            "point_count_head": cfg.MODEL.MaskDINO.POINT_COUNT_HEAD,
+            "point_count_line": tuple(cfg.MODEL.MaskDINO.POINT_COUNT_LINE),
+            "point_count_source": cfg.MODEL.MaskDINO.TEST.POINT_COUNT_SOURCE,
         }
 
     @property
@@ -274,7 +294,9 @@ class MaskDINO(nn.Module):
                 if 'detr' in self.data_loader:
                     targets = self.prepare_targets_detr(gt_instances, images)
                 else:
-                    targets = self.prepare_targets(gt_instances, images)
+                    # LSJ 缩放系数（mapper 写入），只在残差计数头打开时用来把 GT 框换回原生尺度
+                    lsj_scales = [x.get("lsj_scale", (1.0, 1.0)) for x in batched_inputs]
+                    targets = self.prepare_targets(gt_instances, images, lsj_scales)
             else:
                 targets = None
 
@@ -307,6 +329,10 @@ class MaskDINO(nn.Module):
             # 小穗点预测（框相对归一化 [0,1]）
             point_coord_results = outputs["pred_point_coords"]   # [B, Q, P, 2]
             point_logit_results = outputs["pred_point_logits"]   # [B, Q, P, 1]
+            # 残差计数 Δ（[B, Q]）；计数头关着时没有这个键
+            point_count_results = outputs.get("pred_point_counts")
+            if point_count_results is None:
+                point_count_results = [None] * len(point_logit_results)
             # upsample masks
             mask_pred_results = F.interpolate(
                 mask_pred_results,
@@ -318,8 +344,8 @@ class MaskDINO(nn.Module):
             del outputs
 
             processed_results = []
-            for mask_cls_result, mask_pred_result, mask_box_result, point_coord_result, point_logit_result, input_per_image, image_size in zip(
-                mask_cls_results, mask_pred_results, mask_box_results, point_coord_results, point_logit_results, batched_inputs, images.image_sizes
+            for mask_cls_result, mask_pred_result, mask_box_result, point_coord_result, point_logit_result, point_count_result, input_per_image, image_size in zip(
+                mask_cls_results, mask_pred_results, mask_box_results, point_coord_results, point_logit_results, point_count_results, batched_inputs, images.image_sizes
             ):  # image_size is augmented size, not divisible to 32
                 height = input_per_image.get("height", image_size[0])  # real size
                 width = input_per_image.get("width", image_size[1])
@@ -354,15 +380,15 @@ class MaskDINO(nn.Module):
                     width = new_size[1]/image_size[1]*width
                     mask_box_result = self.box_postprocess(mask_box_result, height, width)
 
-                    instance_r = retry_if_cuda_oom(self.instance_inference)(mask_cls_result, mask_pred_result, mask_box_result, point_coord_result, point_logit_result)
+                    instance_r = retry_if_cuda_oom(self.instance_inference)(mask_cls_result, mask_pred_result, mask_box_result, point_coord_result, point_logit_result, point_count_result)
                     processed_results[-1]["instances"] = instance_r
 
             return processed_results
 
-    def prepare_targets(self, targets, images):
+    def prepare_targets(self, targets, images, lsj_scales=None):
         h_pad, w_pad = images.tensor.shape[-2:]
         new_targets = []
-        for targets_per_image in targets:
+        for i_img, targets_per_image in enumerate(targets):
             # pad gt
             h, w = targets_per_image.image_size
             image_size_xyxy = torch.as_tensor([w, h, w, h], dtype=torch.float, device=self.device)
@@ -381,6 +407,15 @@ class MaskDINO(nn.Module):
                     "points": gt_points,
                 }
             )
+            if self.point_count_head:
+                # 残差计数头的直线锚：GT 框对角线换回原生像素尺度 = 增广后像素 ÷ LSJ 缩放系数（x、y 分开）。
+                # 截断后降级为 wheat 的穗 Ni 已被清零，criterion 只监督 wheat_2 且 Ni >= 1 的实例。
+                sx, sy = lsj_scales[i_img] if lsj_scales is not None else (1.0, 1.0)
+                gb = targets_per_image.gt_boxes.tensor.float()
+                new_targets[-1]["box_diag_native"] = torch.hypot((gb[:, 2] - gb[:, 0]) / sx,
+                                                                 (gb[:, 3] - gb[:, 1]) / sy)
+                new_targets[-1]["point_counts"] = torch.as_tensor(
+                    [len(p) for p in gt_points], dtype=torch.float32, device=self.device)
         return new_targets
 
 
@@ -488,7 +523,8 @@ class MaskDINO(nn.Module):
 
             return panoptic_seg, segments_info
 
-    def instance_inference(self, mask_cls, mask_pred, mask_box_result, point_coords=None, point_logits=None):
+    def instance_inference(self, mask_cls, mask_pred, mask_box_result, point_coords=None, point_logits=None,
+                           point_counts=None):
         # mask_pred is already processed to have the same shape as original input
         image_size = mask_pred.shape[-2:]
         scores = mask_cls.sigmoid()  # [100, 80]
@@ -502,6 +538,8 @@ class MaskDINO(nn.Module):
         if point_coords is not None:
             point_coords = point_coords[topk_indices]   # [K, P, 2] 框相对 [0,1]
             point_logits = point_logits[topk_indices]   # [K, P, 1]
+            if point_counts is not None:
+                point_counts = point_counts[topk_indices]   # [K] 残差 Δ
         # if this is panoptic segmentation, we only keep the "thing" classes
         if self.panoptic_on:
             keep = torch.zeros_like(scores_per_image).bool()
@@ -513,6 +551,8 @@ class MaskDINO(nn.Module):
             if point_coords is not None:
                 point_coords = point_coords[keep]
                 point_logits = point_logits[keep]
+                if point_counts is not None:
+                    point_counts = point_counts[keep]
         result = Instances(image_size)
         # mask (before sigmoid)
         result.pred_masks = (mask_pred > 0).float()
@@ -553,6 +593,22 @@ class MaskDINO(nn.Module):
                     spikelet_counts.append(0)
             result.pred_spikelet_points = spikelet_points
             result.pred_spikelet_counts = torch.as_tensor(spikelet_counts, device=self.device, dtype=torch.int64)
+
+            # ===== 每穗计数改由穗长直线（+ 残差）给出，只对 wheat_2 生效；小穗点本身不变 =====
+            # "points" 读法什么都不改（计数 = 留下的点数，与上面逐位相同）。
+            if self.point_count_source != "points":
+                a, b_line = self.point_count_line
+                bwh = (boxes_xyxy[:, 2:] - boxes_xyxy[:, :2]).clamp(min=0).float()   # 预测框宽高，原图像素
+                line = a + b_line * torch.hypot(bwh[:, 0], bwh[:, 1])                 # [K]
+                n_hat = line
+                if self.point_count_source == "head":
+                    assert point_counts is not None, "POINT_COUNT_SOURCE=head 但模型没有输出 pred_point_counts"
+                    n_hat = line + point_counts.float()                                 # 最后一层的 Δ
+                is_spike = labels_per_image == self.spikelet_class_id
+                cnt = torch.round(n_hat).clamp(min=0).long()
+                result.pred_spikelet_counts = torch.where(is_spike, cnt, torch.zeros_like(cnt))
+                # 直线值（未取整）一并挂出，评估器据此在逐穗明细里加 line_count 列（同一批穗上比 r）
+                result.pred_spikelet_count_line = torch.where(is_spike, line, torch.zeros_like(line))
         return result
 
     def box_postprocess(self, out_bbox, img_h, img_w):

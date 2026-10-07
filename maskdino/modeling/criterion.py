@@ -145,7 +145,8 @@ class SetCriterion(nn.Module):
     def __init__(self, num_classes, matcher, weight_dict, eos_coef, losses,
                  num_points, oversample_ratio, importance_sample_ratio,dn="no",dn_losses=[], panoptic_on=False, semantic_ce_loss=False,
                  num_spikelet_points=50, point_cost_coord=5.0, point_cost_class=2.0,
-                 point_focal_alpha=0.25, point_empty_cls_weight=1.0):
+                 point_focal_alpha=0.25, point_empty_cls_weight=1.0,
+                 point_count_line=(8.924, 0.0345), spikelet_class_id=1):
         """Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
@@ -183,6 +184,10 @@ class SetCriterion(nn.Module):
         self.point_focal_alpha = point_focal_alpha
         # Ni==0 实例的存在性损失权重（只作用于 cls_loss 的分子，不影响 denom）
         self.point_empty_cls_weight = point_empty_cls_weight
+        # 残差计数头（losses 里有 "point_count" 时才用到）：N̂ = a + b·diag_native + Δ，只监督 wheat_2 且 Ni >= 1
+        self.point_count_line = (float(point_count_line[0]), float(point_count_line[1]))
+        self.spikelet_class_id = int(spikelet_class_id)
+        self._num_count_norm = 1.0   # 每次 forward 按 num_masks 的跨卡做法重算
 
     def loss_labels_ce(self, outputs, targets, indices, num_masks):
         """Classification loss (NLL)
@@ -422,6 +427,26 @@ class SetCriterion(nn.Module):
         }
         return losses
 
+    def loss_point_count(self, outputs, targets, indices, num_masks):
+        """残差计数头：N̂ = a + b·diag_native + Δ，在外层匹配上的 wheat_2（Ni >= 1）上算 |N̂ - Ni|，
+        按这些实例的个数归一化（self._num_count_norm，forward 里与 num_masks 同法跨卡平均）。
+        - diag_native：匹配到的 GT 框对角线，已在 prepare_targets 里按 LSJ 缩放系数换回原生像素尺度；
+        - wheat 类（含 LSJ 截断后降级、Ni 被清零的穗）不监督。
+        """
+        assert 'pred_point_counts' in outputs, "POINT_COUNT_HEAD=True 但 outputs 里没有 pred_point_counts"
+        assert 'box_diag_native' in targets[0], "targets 缺 box_diag_native（需 prepare_targets + LSJ mapper）"
+        delta_all = outputs['pred_point_counts']             # [B, Q]
+        idx = self._get_src_permutation_idx(indices)
+        delta = delta_all[idx].float()                       # [M] 匹配上的 query 的残差
+        labels = torch.cat([t['labels'][J] for t, (_, J) in zip(targets, indices)])
+        diag = torch.cat([t['box_diag_native'][J] for t, (_, J) in zip(targets, indices)]).float()
+        n_gt = torch.cat([t['point_counts'][J] for t, (_, J) in zip(targets, indices)]).float()
+        valid = (labels == self.spikelet_class_id) & (n_gt >= 1)
+        a, b = self.point_count_line
+        n_hat = a + b * diag + delta
+        err = (n_hat - n_gt).abs() * valid.to(n_hat.dtype)
+        return {'loss_point_count': err.sum() / self._num_count_norm}
+
     def prep_for_dn(self,mask_dict):
         output_known_lbs_bboxes = mask_dict['output_known_lbs_bboxes']
 
@@ -451,6 +476,7 @@ class SetCriterion(nn.Module):
             'masks': self.loss_masks,
             'boxes': self.loss_boxes_panoptic if self.panoptic_on else self.loss_boxes,
             'points': self.loss_points,
+            'point_count': self.loss_point_count,
         }
         assert loss in loss_map, f"do you really want to compute {loss} loss?"
         return loss_map[loss](outputs, targets, indices, num_masks)
@@ -489,6 +515,18 @@ class SetCriterion(nn.Module):
         if is_dist_avail_and_initialized():
             torch.distributed.all_reduce(num_masks)
         num_masks = torch.clamp(num_masks / get_world_size(), min=1).item()
+
+        # 残差计数损失的归一化分母：GT 里 wheat_2 且 Ni >= 1 的实例数，跨卡做法照 num_masks。
+        # query 数远多于每图 GT 数，外层匈牙利会给每个 GT 配上一个 query，所以它就是各层「匹配上的」这类实例数。
+        if 'point_count' in self.losses:
+            num_count = sum(int(((t['labels'] == self.spikelet_class_id) & (t['point_counts'] >= 1)).sum())
+                            for t in targets)
+            num_count = torch.as_tensor(
+                [num_count], dtype=torch.float, device=next(iter(outputs.values())).device
+            )
+            if is_dist_avail_and_initialized():
+                torch.distributed.all_reduce(num_count)
+            self._num_count_norm = torch.clamp(num_count / get_world_size(), min=1).item()
 
         # debug 可视化：正负样本匹配。此处的 indices 才是最后一层 decoder 的匹配结果
         # （forward 末尾 return 的 indices 已被 aux / interm 分支覆盖，不能用来画图）。

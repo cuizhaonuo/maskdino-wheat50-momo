@@ -1,0 +1,28 @@
+# ============================================================================
+# mini/count-residual · 计数交给「穗长直线 + 残差计数头」
+#   预注册：experiments-bank/ideas/count-residual.md（判否线已在跑之前写死）
+#
+# 与 wheat_joint_single_stage_mini_ep100.yaml（mini/baseline 的 100 epoch 基线）的差异【只有三项】：
+#   MODEL.MaskDINO.POINT_COUNT_HEAD: True
+#     每个 query 多一个 2 层 MLP（point_count_embed，最后一层零初始化）输出残差 Δ，
+#     每穗小穗数 N̂ = a + b·diag + Δ，直线 (a, b) = POINT_COUNT_LINE 默认值 (8.924, 0.0345)。
+#     训练时 diag = 匹配到的 GT 框对角线（按 LSJ 缩放系数换回原生像素尺度），
+#     多一项 loss_point_count = 外层匹配上的 wheat_2（Ni >= 1）上 |N̂ - Ni| 的均值，随 _interm / _{i} 深监督带上。
+#   MODEL.MaskDINO.POINT_COUNT_WEIGHT: 1.0
+#   MODEL.MaskDINO.TEST.POINT_COUNT_SOURCE: head
+#     wheat_2 的每穗计数 = round(a + b·hypot(w, h) + Δ)，w、h 取预测框；小穗点照旧按 POINT_THRESHOLD 输出。
+#     同一 checkpoint 用 CLI 覆盖 MODEL.MaskDINO.TEST.POINT_COUNT_SOURCE line / points 可换读法再评。
+#
+# 用法：
+#   python train_net.py --num-gpus 1 \
+#     --config-file configs/coco/instance-segmentation/wheat_joint_single_stage_mini_count_residual.yaml \
+#     OUTPUT_DIR /public/home/zncui/pycharm_project/maskdino-wheat50/output_v2/<run-name>
+# ============================================================================
+_BASE_: wheat_joint_single_stage_mini_ep100.yaml
+
+MODEL:
+  MaskDINO:
+    POINT_COUNT_HEAD: True
+    POINT_COUNT_WEIGHT: 1.0
+    TEST:
+      POINT_COUNT_SOURCE: "head"

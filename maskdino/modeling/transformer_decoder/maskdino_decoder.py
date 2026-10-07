@@ -47,6 +47,7 @@ class MaskDINODecoder(nn.Module):
             num_queries: int,
             num_points: int,
             point_class_mlp: bool = False,
+            point_count_head: bool = False,
             nheads: int,
             dim_feedforward: int,
             dec_layers: int,
@@ -171,6 +172,17 @@ class MaskDINODecoder(nn.Module):
         self.bbox_embed = nn.ModuleList(box_embed_layerlist)
         self.decoder.bbox_embed = self.bbox_embed
 
+        # ===== 残差计数头（POINT_COUNT_HEAD=True 才建）=====
+        # 每个 query 输出一个标量残差 Δ，N̂ = a + b·diag + Δ（直线锚在 criterion / instance_inference 里加）。
+        # 建在 __init__ 末尾，不打乱已有模块的参数初始化顺序：关着时一个随机数都不多消耗，与基线逐位一致；
+        # 开着时已有参数的初值也与基线相同（decoder 是整个模型里最后一个建参数的模块）。
+        # 最后一层 weight / bias 置零：开训时 Δ ≡ 0，N̂ 恰好等于穗长直线，偏差从构造上为零。
+        self.point_count_embed = None
+        if point_count_head:
+            self.point_count_embed = MLP(hidden_dim, hidden_dim, 1, 2)
+            nn.init.constant_(self.point_count_embed.layers[-1].weight.data, 0)
+            nn.init.constant_(self.point_count_embed.layers[-1].bias.data, 0)
+
 
     @classmethod
     def from_config(cls, cfg, in_channels, mask_classification):
@@ -183,6 +195,7 @@ class MaskDINODecoder(nn.Module):
         ret["num_queries"] = cfg.MODEL.MaskDINO.NUM_OBJECT_QUERIES
         ret["num_points"] = cfg.MODEL.MaskDINO.NUM_POINTS
         ret["point_class_mlp"] = cfg.MODEL.MaskDINO.POINT_CLASS_MLP
+        ret["point_count_head"] = cfg.MODEL.MaskDINO.POINT_COUNT_HEAD
         # Transformer parameters:
         ret["nheads"] = cfg.MODEL.MaskDINO.NHEADS
         ret["dim_feedforward"] = cfg.MODEL.MaskDINO.DIM_FEEDFORWARD
@@ -326,7 +339,7 @@ class MaskDINODecoder(nn.Module):
         return input_query_label,input_query_bbox,attn_mask,mask_dict
 
     def dn_post_process(self,outputs_class,outputs_coord,mask_dict,outputs_mask,
-                        outputs_point_coord=None,outputs_point_logit=None):
+                        outputs_point_coord=None,outputs_point_logit=None,outputs_point_count=None):
         """
             post process of dn after output from the transformer
             put the dn part in the mask_dict
@@ -344,11 +357,14 @@ class MaskDINODecoder(nn.Module):
         if outputs_point_coord is not None:
             outputs_point_coord = outputs_point_coord[:, :, pad_size:]
             outputs_point_logit = outputs_point_logit[:, :, pad_size:]
+        # 残差计数与点预测一样切掉 dn 部分（[L, B, pad+Q] -> [L, B, Q]），dn 不算计数损失。
+        if outputs_point_count is not None:
+            outputs_point_count = outputs_point_count[:, :, pad_size:]
         out = {'pred_logits': output_known_class[-1], 'pred_boxes': output_known_coord[-1],'pred_masks': output_known_mask[-1]}
 
         out['aux_outputs'] = self._set_aux_loss(output_known_class, output_known_mask,output_known_coord)
         mask_dict['output_known_lbs_bboxes']=out
-        return outputs_class, outputs_coord, outputs_mask, outputs_point_coord, outputs_point_logit
+        return outputs_class, outputs_coord, outputs_mask, outputs_point_coord, outputs_point_logit, outputs_point_count
 
     def get_valid_ratio(self, mask):
         _, H, W = mask.shape
@@ -422,6 +438,7 @@ class MaskDINODecoder(nn.Module):
         predictions_mask = []
         predictions_point_coord = []
         predictions_point_logit = []
+        predictions_point_count = []   # 残差计数头关着时元素全是 None，不会被使用
         if self.two_stage:
             output_memory, output_proposals = gen_encoder_output_proposals(src_flatten, mask_flatten, spatial_shapes)
             output_memory = self.enc_output_norm(self.enc_output(output_memory))
@@ -437,7 +454,7 @@ class MaskDINODecoder(nn.Module):
             tgt_undetach = torch.gather(output_memory, 1,
                                   topk_proposals.unsqueeze(-1).repeat(1, 1, self.hidden_dim))  # unsigmoid
 
-            outputs_class, outputs_mask, interm_point_coord, interm_point_logit = \
+            outputs_class, outputs_mask, interm_point_coord, interm_point_logit, interm_point_count = \
                 self.forward_prediction_heads(tgt_undetach.transpose(0, 1), mask_features)
             tgt = tgt_undetach.detach()
             if self.learn_tgt:
@@ -448,6 +465,8 @@ class MaskDINODecoder(nn.Module):
             interm_outputs['pred_masks'] = outputs_mask
             interm_outputs['pred_point_coords'] = interm_point_coord
             interm_outputs['pred_point_logits'] = interm_point_logit
+            if interm_point_count is not None:
+                interm_outputs['pred_point_counts'] = interm_point_count
 
             if self.initialize_box_type != 'no':
                 # convert masks into boxes to better initialize box in the decoder
@@ -488,7 +507,7 @@ class MaskDINODecoder(nn.Module):
         # direct prediction from the matching and denoising part in the begining
         if self.initial_pred:
             # 暂时注释
-            outputs_class, outputs_mask, outputs_point_coord, outputs_point_logit = \
+            outputs_class, outputs_mask, outputs_point_coord, outputs_point_logit, outputs_point_count = \
                 self.forward_prediction_heads(tgt.transpose(0, 1), mask_features, self.training)
 
             # debug: 查看推理时每一层的预测结果
@@ -498,6 +517,7 @@ class MaskDINODecoder(nn.Module):
             predictions_mask.append(outputs_mask)
             predictions_point_coord.append(outputs_point_coord)
             predictions_point_logit.append(outputs_point_logit)
+            predictions_point_count.append(outputs_point_count)
         if self.dn != "no" and self.training and mask_dict is not None:
             refpoint_embed=torch.cat([input_query_bbox,refpoint_embed],dim=1)
         # 此处 refpoint_embed 变成了 (bs, dn_pad + num_queries, 4)，position query + denoising query
@@ -542,7 +562,7 @@ class MaskDINODecoder(nn.Module):
             # 这样做的目的是减少计算量，因为掩码预测比较耗时
 
             # 暂时注释
-            outputs_class, outputs_mask, outputs_point_coord, outputs_point_logit = \
+            outputs_class, outputs_mask, outputs_point_coord, outputs_point_logit, outputs_point_count = \
                 self.forward_prediction_heads(output.transpose(0, 1), mask_features, self.training or (i == len(hs)-1))
 
             # debug: 查看推理时每一层的预测结果
@@ -552,6 +572,7 @@ class MaskDINODecoder(nn.Module):
             predictions_mask.append(outputs_mask)
             predictions_point_coord.append(outputs_point_coord)
             predictions_point_logit.append(outputs_point_logit)
+            predictions_point_count.append(outputs_point_count)
 
         # iteratively box prediction
         '''
@@ -580,17 +601,22 @@ class MaskDINODecoder(nn.Module):
             predictions_class=torch.stack(predictions_class)
             predictions_point_coord=torch.stack(predictions_point_coord)
             predictions_point_logit=torch.stack(predictions_point_logit)
+            # predictions_point_count: (num_layers + 1, bs, dn_pad + num_queries)，计数头关着时为 None
+            predictions_point_count=(torch.stack(predictions_point_count)
+                                     if self.point_count_embed is not None else None)
             # 包含中间的所有结果
             # predictions_mask: (num_layers + 1, bs, dn_pad + num_queries, h, w)
             # predictions_class: (num_layers + 1, bs, dn_pad + num_queries, num_classes)
             # out_boxes: (num_layers + 1, bs, dn_pad + num_queries, 4)
             # predictions_point_coord: (num_layers + 1, bs, dn_pad + num_queries, P, 2)
             # predictions_point_logit: (num_layers + 1, bs, dn_pad + num_queries, P, 1)
-            predictions_class, out_boxes,predictions_mask,predictions_point_coord,predictions_point_logit=\
+            predictions_class, out_boxes,predictions_mask,predictions_point_coord,predictions_point_logit,predictions_point_count=\
                 self.dn_post_process(predictions_class,out_boxes,mask_dict,predictions_mask,
-                                     predictions_point_coord,predictions_point_logit)
+                                     predictions_point_coord,predictions_point_logit,predictions_point_count)
             predictions_class,predictions_mask=list(predictions_class),list(predictions_mask)
             predictions_point_coord,predictions_point_logit=list(predictions_point_coord),list(predictions_point_logit)
+            if predictions_point_count is not None:
+                predictions_point_count=list(predictions_point_count)
         elif self.training:  # this is to insure self.label_enc participate in the model
             predictions_class[-1] += 0.0*self.label_enc.weight.sum()
 
@@ -606,9 +632,13 @@ class MaskDINODecoder(nn.Module):
             'pred_point_logits': predictions_point_logit[-1],
             'aux_outputs': self._set_aux_loss(
                 predictions_class if self.mask_classification else None, predictions_mask, out_boxes,
-                predictions_point_coord, predictions_point_logit
+                predictions_point_coord, predictions_point_logit,
+                predictions_point_count if self.point_count_embed is not None else None
             )
         }
+        # 残差计数 Δ（[bs, nq]）：计数头关着时不放这个键，下游（criterion / instance_inference）据此跳过
+        if self.point_count_embed is not None:
+            out['pred_point_counts'] = predictions_point_count[-1]
         if self.two_stage:
             out['interm_outputs'] = interm_outputs
         return out, mask_dict
@@ -627,12 +657,15 @@ class MaskDINODecoder(nn.Module):
         b, q = decoder_output.shape[:2]
         outputs_point_coord = self.point_coord_embed(decoder_output).reshape(b, q, self.num_points, 2).sigmoid()
         outputs_point_logit = self.point_class_embed(decoder_output).reshape(b, q, self.num_points, 1)
+        # 残差计数头：每个 query 一个标量 Δ，[B, Q]；关着时为 None
+        outputs_point_count = (self.point_count_embed(decoder_output).squeeze(-1)
+                               if self.point_count_embed is not None else None)
 
-        return outputs_class, outputs_mask, outputs_point_coord, outputs_point_logit
+        return outputs_class, outputs_mask, outputs_point_coord, outputs_point_logit, outputs_point_count
 
     @torch.jit.unused
     def _set_aux_loss(self, outputs_class, outputs_seg_masks, out_boxes=None,
-                      out_point_coords=None, out_point_logits=None):
+                      out_point_coords=None, out_point_logits=None, out_point_counts=None):
         # this is a workaround to make torchscript happy, as torchscript
         # doesn't support dictionary with non-homogeneous values, such
         # as a dict having both a Tensor and a list.
@@ -647,10 +680,17 @@ class MaskDINODecoder(nn.Module):
                 {"pred_logits": a, "pred_masks": b, "pred_boxes":c}
                 for a, b, c in zip(outputs_class[:-1], outputs_seg_masks[:-1], out_boxes[:-1])
             ]
-        else:
+        elif out_point_counts is None:
             return [
                 {"pred_logits": a, "pred_masks": b, "pred_boxes": c,
                  "pred_point_coords": d, "pred_point_logits": e}
                 for a, b, c, d, e in zip(outputs_class[:-1], outputs_seg_masks[:-1], out_boxes[:-1],
                                          out_point_coords[:-1], out_point_logits[:-1])
+            ]
+        else:
+            return [
+                {"pred_logits": a, "pred_masks": b, "pred_boxes": c,
+                 "pred_point_coords": d, "pred_point_logits": e, "pred_point_counts": f}
+                for a, b, c, d, e, f in zip(outputs_class[:-1], outputs_seg_masks[:-1], out_boxes[:-1],
+                                            out_point_coords[:-1], out_point_logits[:-1], out_point_counts[:-1])
             ]

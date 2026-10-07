@@ -72,8 +72,9 @@ import weakref
 from data_register import wheat_data, maize_rice_data, xinxiang_data, gwhd2021_data, wheat_data_cat1_quality, wheat_data_cat2, wheat_data_cat3
 
 
-# 小穗点头的参数名子串（decoder 中的 point_coord_embed / point_class_embed）。
-_POINT_HEAD_KEYS = ("point_coord_embed", "point_class_embed")
+# 小穗点头的参数名子串（decoder 中的 point_coord_embed / point_class_embed，
+# 以及 POINT_COUNT_HEAD=True 时的残差计数头 point_count_embed）。
+_POINT_HEAD_KEYS = ("point_coord_embed", "point_class_embed", "point_count_embed")
 
 
 def freeze_all_but_point_head(model, extra_keys=()):
