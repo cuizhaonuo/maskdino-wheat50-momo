@@ -1,6 +1,6 @@
 # 想法：APGCC 原样的稠密锚点小穗头 + APG（形式 C）
 
-状态：**排队中（2026-10-06 起，等 GPU1 空出显存后自动启动）** ｜ 提出 2026-09-26 ｜ 分支 `mini/apg-dense`（从 `mini/baseline`@`0f71161` 开出）｜
+状态：**预注册判定：机制未启动（M1 未过）；主判据判否；计数护栏不过** ｜ 验证于 [exp-2026-10-07-mini-apg-dense](../experiments/exp-2026-10-07-mini-apg-dense.md) ｜ 提出 2026-09-26 ｜ 分支 `mini/apg-dense`（从 `mini/baseline`@`0f71161` 开出）｜
 配置 `wheat_joint_single_stage_mini_apg_dense.yaml`（`_BASE_` 为 `wheat_joint_single_stage_mini_ep100.yaml`）｜
 输出 `output_v2/exp-<启动日期>-mini-apg-dense`
 
@@ -196,3 +196,19 @@ python myscripts/backup/vis_process/point_token_diag.py --run-dir output_v2/exp-
 
 12500 iter。每 iter 多约 6.5 万个锚点的小 MLP 前后向（约 0.15 TFLOP）与每图几个穗的匈牙利；eval 时全网格 6.5 万锚点分块求值。
 预计比 baseline 慢 10% 以内，冒烟测试实测后更新。
+
+## 结论（2026-10-07）
+
+**预注册判定：机制未启动；主判据判否；计数护栏不过。** 详见 [exp-2026-10-07-mini-apg-dense](../experiments/exp-2026-10-07-mini-apg-dense.md)。
+
+| | 本臂 | baseline | 线 |
+|:--|--:|--:|--:|
+| M1 存在性 AUC | **0.564** | 0.667 | ≥ 0.7171 ❌ |
+| M2 沿轴中位误差 | **3.53 px** | 4.62 | ≤ 4.16 ✅ |
+| `matched_F1@8` 峰值 / 末值 | 0.5137 / 0.5128 | 0.6331 / 0.6312 | ≤ 0.6331 → 判否 |
+| `segm/AP` 峰值 | 78.23 | 78.80 | ≥ 77.80 ✅ |
+| `count_MAE_spike` 校准后最优档 | 6.546 @ 0.40（r 0.04） | 1.467 @ 0.50 | ≤ 1.61 ❌ |
+| 重复点率 | 0.00% | 0.08% | ≤ 1% ✅ |
+
+- 定位最准，但稠密头的分数挤在 0.25~0.45 的窄带里，相邻锚点（间距 4 px）分不开，计数与 GT 不相关。
+- 同一 checkpoint 的 25 槽头（推理不用）0.6439，是三臂最高；三臂共有「25 槽头比 baseline 高约 +0.01」的线索，未经预注册。
