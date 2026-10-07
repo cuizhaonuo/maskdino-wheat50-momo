@@ -92,6 +92,14 @@ def add_maskdino_config(cfg):
     # 推理时 instance_inference 按 pred_classes 门控，wheat 实例本就不输出小穗点，
     # 这部分监督只在误分类时才生效，故可降权。0.0 等价于「只对 wheat_2 算点损失」。
     cfg.MODEL.MaskDINO.POINT_EMPTY_CLS_WEIGHT = 1.0
+    # ---- 点损失的尺度门控（mini/point-scale-gate，预注册见 experiments-bank/ideas/point-scale-gate.md）----
+    # LSJ 的 ResizeScale 把图缩放 s ~ U[0.1, 2.0] 倍。缩得很小时，同一穗的小穗挤在几个像素里，
+    # 解码器 cross-attn 最细的特征（stride 8）分不出相邻小穗，这些实例的点监督近乎噪声。
+    # > 0 时：对外层匹配上的 Ni>=2 实例，把 GT 小穗换到增广后的像素坐标，取每点最近邻距离的中位数 d̄；
+    # d̄ < 该值（像素）的实例在 loss_points 里整个忽略——不算坐标损失、不算存在性损失、不计入归一化分母。
+    # 是忽略，不是当负样本。Ni=1 与 wheat（Ni=0）照旧；检测、mask 损失不受影响。
+    # 0.0 = 关闭，与 mini/baseline 逐位等价。
+    cfg.MODEL.MaskDINO.POINT_MIN_NN_PX = 0.0
     # True = 存在性头 point_class_embed 用 3 层 MLP（与坐标头 point_coord_embed 对齐），
     # False = 保持单层 nn.Linear。点头参数 12,850 -> 144,434。
     # 【口径】08-25 在 overfit10 上三向同时改善，但 08-26 的 val 检验判定 mF1 优势是记忆

@@ -16,6 +16,7 @@ from torch import nn
 from scipy.optimize import linear_sum_assignment
 
 from detectron2.utils.comm import get_world_size
+from detectron2.utils.events import get_event_storage
 from detectron2.projects.point_rend.point_features import (
     get_uncertain_point_coords_with_randomness,
     point_sample,
@@ -145,7 +146,7 @@ class SetCriterion(nn.Module):
     def __init__(self, num_classes, matcher, weight_dict, eos_coef, losses,
                  num_points, oversample_ratio, importance_sample_ratio,dn="no",dn_losses=[], panoptic_on=False, semantic_ce_loss=False,
                  num_spikelet_points=50, point_cost_coord=5.0, point_cost_class=2.0,
-                 point_focal_alpha=0.25, point_empty_cls_weight=1.0):
+                 point_focal_alpha=0.25, point_empty_cls_weight=1.0, point_min_nn_px=0.0):
         """Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
@@ -183,6 +184,11 @@ class SetCriterion(nn.Module):
         self.point_focal_alpha = point_focal_alpha
         # Ni==0 实例的存在性损失权重（只作用于 cls_loss 的分子，不影响 denom）
         self.point_empty_cls_weight = point_empty_cls_weight
+        # 点损失的尺度门控阈值（像素，POINT_MIN_NN_PX，见 config.py）。0 = 关闭，loss_points 与基线逐位相同。
+        self.point_min_nn_px = float(point_min_nn_px)
+        # 全程累计的「Ni>=2 实例数 / 其中被忽略数」，只用于日志（point_scale_gate_skip_ratio_cum）
+        self._gate_n_spike_total = 0
+        self._gate_n_skip_total = 0
 
     def loss_labels_ce(self, outputs, targets, indices, num_masks):
         """Classification loss (NLL)
@@ -353,11 +359,58 @@ class SetCriterion(nn.Module):
         col_ind = torch.as_tensor(col_ind, dtype=torch.int64, device=pred_rel.device)
         return row_ind, col_ind
 
+    @torch.no_grad()
+    def _mark_point_scale_skip(self, targets):
+        """尺度门控（POINT_MIN_NN_PX > 0 时由 forward 调用）：给每个 target 挂上
+        'point_scale_skip'（list[bool]，与 GT 实例同序），loss_points 据此整实例跳过。
+
+        只看 Ni >= 2 的实例：GT 小穗（图像归一化）× image_wh 换回增广后的像素坐标，
+        取每点最近邻距离的中位数 d̄（偶数个点时取两个中值的均值，与 numpy.median 相同），
+        d̄ < POINT_MIN_NN_PX 记为忽略。Ni < 2 的实例一律不忽略。
+        结果只取决于 GT，每次前向算一次，主输出 / 9 层 aux / interm 的 loss_points 共用。
+        """
+        n_spike = n_skip = 0
+        for t in targets:
+            pts = t['points']
+            skip = [False] * len(pts)
+            idx = [k for k, p in enumerate(pts) if p.shape[0] >= 2]
+            if idx:
+                wh = t['image_wh'].float()
+                dbar = []
+                for k in idx:
+                    px = pts[k].float() * wh                                    # [Ni,2] 增广后像素
+                    # 直接相减求距离（不用 cdist：Ni>25 时它走矩阵乘法，像素量级下误差可达亚像素）
+                    d = (px[:, None, :] - px[None, :, :]).norm(dim=-1)        # [Ni,Ni]
+                    d.fill_diagonal_(float('inf'))
+                    dbar.append(torch.quantile(d.min(dim=1).values, 0.5))     # 最近邻距离的中位数
+                flags = (torch.stack(dbar) < self.point_min_nn_px).tolist()
+                for k, f in zip(idx, flags):
+                    skip[k] = bool(f)
+                n_spike += len(idx)
+                n_skip += int(sum(flags))
+            t['point_scale_skip'] = skip
+
+        # 日志：本 batch 与全程累计的忽略比例（分母 = Ni>=2 的 GT 实例数）。
+        # 外层匹配给每个 GT 都配一个 query（300 query ≫ GT 数），所以这也是 loss_points 里被跳过的比例。
+        self._gate_n_spike_total += n_spike
+        self._gate_n_skip_total += n_skip
+        try:
+            storage = get_event_storage()
+        except AssertionError:
+            return  # 不在训练循环里（如单测脚本），不记日志
+        if n_spike > 0:
+            storage.put_scalar('point_scale_gate_skip_ratio', n_skip / n_spike)
+        storage.put_scalar('point_scale_gate_skip_ratio_cum',
+                           self._gate_n_skip_total / max(self._gate_n_spike_total, 1),
+                           smoothing_hint=False)
+
     def loss_points(self, outputs, targets, indices, num_masks):
         """逐实例小穗点损失：对每个外层匹配到的实例，做内层匈牙利匹配后计算
         点坐标 L1 损失 + 点存在性 focal 损失。
         - 点坐标采用"实例框相对归一化"[0,1]：用匹配到的 GT 框把 GT 小穗换算到框相对坐标。
         - wheat 实例（无小穗，Ni=0）：无坐标损失，P 个点全部监督为不存在（背景）。
+        - 尺度门控（POINT_MIN_NN_PX > 0）：_mark_point_scale_skip 标为忽略的 Ni>=2 实例整个跳过，
+          不算坐标损失、不算存在性损失、不计入 num_pos。门控关闭时下面的循环与基线逐位相同。
         """
         assert 'pred_point_coords' in outputs and 'pred_point_logits' in outputs
         pred_coords = outputs['pred_point_coords']   # [B, Q, P, 2]
@@ -374,7 +427,12 @@ class SetCriterion(nn.Module):
                 continue
             boxes_b = targets[b]['boxes']      # [Ng, 4] cxcywh 图像归一化
             points_b = targets[b]['points']    # list[Tensor[Ni,2]] 图像归一化
+            # 尺度门控的逐 GT 标记；门控关闭时 forward 不挂这个键，skip_b 为 None
+            skip_b = targets[b].get('point_scale_skip')
             for q_i, g_j in zip(src_idx.tolist(), tgt_idx.tolist()):
+                if skip_b is not None and skip_b[g_j]:
+                    # 小穗在增广后的尺度上分辨不出来：整个实例忽略（不是当负样本）
+                    continue
                 # AMP 下预测为 half，GT 为 float32；统一转 float32 避免 dtype 不匹配
                 pred_rel = pred_coords[b, q_i].float()     # [P,2]
                 pred_lg = pred_logits[b, q_i].float()      # [P,1]
@@ -500,6 +558,10 @@ class SetCriterion(nn.Module):
         # 诊断实验：跨迭代累计 slot 匹配频率与标签抖动
         if maybe_record_slot_stats is not None:
             maybe_record_slot_stats(self, outputs, targets, indices, batched_inputs)
+
+        # 点损失的尺度门控：逐 GT 标记只取决于 GT，在这里算一次，下面所有 loss_points 调用共用
+        if self.point_min_nn_px > 0 and 'points' in self.losses:
+            self._mark_point_scale_skip(targets)
 
         # Compute all the requested losses
         losses = {}

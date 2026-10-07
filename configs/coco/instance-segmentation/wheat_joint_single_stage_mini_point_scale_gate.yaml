@@ -1,0 +1,31 @@
+# ============================================================================
+# mini/point-scale-gate · 点损失的尺度门控 · 500 图小集 · 100 epoch
+#   预注册：experiments-bank/ideas/point-scale-gate.md（判否线已在跑之前写死）
+#
+# 想法：LSJ 把图缩放 s ~ U[0.1, 2.0] 倍（图像都是 1024²，缩放因子就是 s）。
+# val 上同穗小穗最近邻间距的中位数约 17 px，解码器 cross-attn 最细的特征是 stride 8。
+# s 小到小穗间距不足 8 px 时，这个实例的点定位与内层匹配近乎随机，点监督等于喂噪声。
+# 本臂对这类实例不算点损失。
+#
+# 规则（maskdino/modeling/criterion.py 的 _mark_point_scale_skip / loss_points）：
+#   对外层匹配上的 Ni>=2 实例，GT 小穗换到增广后的像素坐标，取每点最近邻距离的中位数 d̄；
+#   d̄ < POINT_MIN_NN_PX 的实例整个忽略：不算坐标损失、不算存在性损失、不计入归一化分母。
+#   是忽略，不是当负样本。Ni=1 与 wheat（Ni=0）照旧；检测、mask 损失不受影响。
+#   mini train 上按实例估计约 20.6% 被忽略（放大时会裁掉一部分实例，实际比例更高），
+#   训练日志 metrics.json 的 point_scale_gate_skip_ratio(_cum) 记录实测值。
+#
+# 与 wheat_joint_single_stage_mini_ep100.yaml（mini/baseline 100 epoch）的差异【只有一项】：
+#   MODEL.MaskDINO.POINT_MIN_NN_PX 0.0 -> 8.0
+# 数据集、schedule、初始权重、七项损失权重、匹配代价、点头旋钮、INPUT 全部继承不动。
+#
+# 用法：
+#   python train_net.py --num-gpus 1 \
+#     --config-file configs/coco/instance-segmentation/wheat_joint_single_stage_mini_point_scale_gate.yaml \
+#     OUTPUT_DIR /public/home/zncui/pycharm_project/maskdino-wheat50/output_v2/<run-name>
+# ============================================================================
+_BASE_: wheat_joint_single_stage_mini_ep100.yaml
+
+MODEL:
+  MaskDINO:
+    # 8 px = cross-attn 最细特征（res3）的格宽。像素指增广后的图像像素。
+    POINT_MIN_NN_PX: 8.0

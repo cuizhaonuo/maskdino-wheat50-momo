@@ -199,6 +199,7 @@ class MaskDINO(nn.Module):
             point_cost_class=cfg.MODEL.MaskDINO.COST_POINT_CLASS_WEIGHT,
             point_focal_alpha=cfg.MODEL.MaskDINO.POINT_FOCAL_ALPHA,
             point_empty_cls_weight=cfg.MODEL.MaskDINO.POINT_EMPTY_CLS_WEIGHT,
+            point_min_nn_px=cfg.MODEL.MaskDINO.POINT_MIN_NN_PX,
         )
 
         return {
@@ -379,6 +380,10 @@ class MaskDINO(nn.Module):
                     "masks": padded_masks,
                     "boxes":box_ops.box_xyxy_to_cxcywh(targets_per_image.gt_boxes.tensor)/image_size_xyxy,
                     "points": gt_points,
+                    # 增广后图像的像素尺寸 (W, H)。POINT_MIN_NN_PX 用它把归一化小穗换回像素算间距。
+                    # 来源：mini/group-decoder 的 prepare_targets 有同一处改动（为 POINT_COORD_NORM="iso"），
+                    # 本分支按其写法重写，未 cherry-pick。
+                    "image_wh": wh,
                 }
             )
         return new_targets
@@ -403,6 +408,8 @@ class MaskDINO(nn.Module):
                     "masks": padded_masks,
                     "boxes": box_ops.box_xyxy_to_cxcywh(targets_per_image.gt_boxes.tensor) / image_size_xyxy,
                     "points": gt_points,
+                    # 同 prepare_targets（来源：mini/group-decoder，本分支重写）
+                    "image_wh": wh,
                 }
             )
         return new_targets
