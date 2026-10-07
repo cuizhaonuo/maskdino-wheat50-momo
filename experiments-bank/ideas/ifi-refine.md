@@ -1,6 +1,6 @@
 # 想法：只加 IFI 精修头，不加 APG（形式 B，APGCC 组的归因对照臂）
 
-状态：**训练中（2026-10-06 启动）** ｜ 提出 2026-09-26 ｜ 分支 `mini/ifi-refine`（从 `mini/baseline`@`0f71161` 开出）｜
+状态：**预注册判定：主判据判否；M2 通过；计数护栏不过** ｜ 验证于 [exp-2026-10-06-mini-ifi-refine](../experiments/exp-2026-10-06-mini-ifi-refine.md) ｜ 提出 2026-09-26 ｜ 分支 `mini/ifi-refine`（从 `mini/baseline`@`0f71161` 开出）｜
 配置 `wheat_joint_single_stage_mini_ifi_refine.yaml`（`_BASE_` 为 `wheat_joint_single_stage_mini_ep100.yaml`）｜
 输出 `output_v2/exp-1006-mini-ifi-refine`
 
@@ -102,3 +102,12 @@ python myscripts/backup/vis_process/point_token_diag.py --run-dir output_v2/exp-
 ```
 
 A 与 B 建议并发起跑（同一张 A100，本仓库训练受 dataloader 限制，并发几乎不损速；显存各约 21 GB）。
+
+## 结论（2026-10-07）
+
+**预注册判定：主判据判否（峰值 0.6316 ≤ 0.6331）；M2 通过（沿轴 4.00 px）；计数护栏不过（最优档 1.852 > 1.61）。**
+详见 [exp-2026-10-06-mini-ifi-refine](../experiments/exp-2026-10-06-mini-ifi-refine.md)。
+
+- AUC 0.659（baseline 0.667，A 0.630）：如假设所料，同样的监督下局部特征没有让存在性变成局部判别。
+- 归因：A − B 末 4 轮 +0.0066 < 0.015 → APG 增量未决；APG 对存在性是负作用（A 的 AUC 低 0.03）。
+- 同一 checkpoint 的 25 槽头 0.6413 > 精修头 0.6288。
