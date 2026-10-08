@@ -20,6 +20,7 @@ from detectron2.utils.memory import retry_if_cuda_oom
 from .modeling.criterion import SetCriterion
 from .modeling.matcher import HungarianMatcher
 from .utils import box_ops
+from .utils.point_nms import greedy_point_nms
 
 
 @META_ARCH_REGISTRY.register()
@@ -55,6 +56,7 @@ class MaskDINO(nn.Module):
         semantic_ce_loss: bool = False,
         point_threshold: float = 0.35,
         point_abs_coords: bool = False,
+        point_nms_kappa: float = 0.0,
     ):
         """
         Args:
@@ -114,6 +116,9 @@ class MaskDINO(nn.Module):
         self.spikelet_class_id = 1
         # 分组 decoder（POINT_GROUP_DECODER）的小穗点是图像归一化绝对坐标，不再经预测框换算
         self.point_abs_coords = point_abs_coords
+        # 推理侧小穗点 NMS 半径 κ（TEST.POINT_NMS_KAPPA；0 = 关），半径 = κ·sqrt(w·h)，w、h 为预测框像素宽高。
+        # 诊断脚本收集全部 token 时会临时把它设 0。
+        self.point_nms_kappa = point_nms_kappa
 
         if not self.semantic_on:
             assert self.sem_seg_postprocess_before_inference
@@ -204,6 +209,8 @@ class MaskDINO(nn.Module):
             point_empty_cls_weight=cfg.MODEL.MaskDINO.POINT_EMPTY_CLS_WEIGHT,
             point_coord_norm=cfg.MODEL.MaskDINO.POINT_COORD_NORM,
             point_coord_robust_c=cfg.MODEL.MaskDINO.POINT_COORD_ROBUST_C,
+            point_nms_mode=cfg.MODEL.MaskDINO.POINT_NMS_MODE,
+            point_nms_kappa=cfg.MODEL.MaskDINO.POINT_NMS_KAPPA,
         )
 
         return {
@@ -234,6 +241,7 @@ class MaskDINO(nn.Module):
             "semantic_ce_loss": cfg.MODEL.MaskDINO.TEST.SEMANTIC_ON and cfg.MODEL.MaskDINO.SEMANTIC_CE_LOSS and not cfg.MODEL.MaskDINO.TEST.PANOPTIC_ON,
             "point_threshold": cfg.MODEL.MaskDINO.TEST.POINT_THRESHOLD,
             "point_abs_coords": cfg.MODEL.MaskDINO.POINT_GROUP_DECODER,
+            "point_nms_kappa": cfg.MODEL.MaskDINO.TEST.POINT_NMS_KAPPA,
         }
 
     @property
@@ -313,6 +321,10 @@ class MaskDINO(nn.Module):
             # 小穗点预测（框相对归一化 [0,1]）
             point_coord_results = outputs["pred_point_coords"]   # [B, Q, P, 2]
             point_logit_results = outputs["pred_point_logits"]   # [B, Q, P, 1]
+            # 小穗 token 的存活掩码（decoder 逐层剔除时才有，[B, Q, P] bool），逐图交给 instance_inference
+            point_keep_results = outputs.get("pred_point_keep")
+            if point_keep_results is None:
+                point_keep_results = [None] * len(batched_inputs)
             # upsample masks
             mask_pred_results = F.interpolate(
                 mask_pred_results,
@@ -324,8 +336,8 @@ class MaskDINO(nn.Module):
             del outputs
 
             processed_results = []
-            for mask_cls_result, mask_pred_result, mask_box_result, point_coord_result, point_logit_result, input_per_image, image_size in zip(
-                mask_cls_results, mask_pred_results, mask_box_results, point_coord_results, point_logit_results, batched_inputs, images.image_sizes
+            for mask_cls_result, mask_pred_result, mask_box_result, point_coord_result, point_logit_result, point_keep_result, input_per_image, image_size in zip(
+                mask_cls_results, mask_pred_results, mask_box_results, point_coord_results, point_logit_results, point_keep_results, batched_inputs, images.image_sizes
             ):  # image_size is augmented size, not divisible to 32
                 height = input_per_image.get("height", image_size[0])  # real size
                 width = input_per_image.get("width", image_size[1])
@@ -363,7 +375,7 @@ class MaskDINO(nn.Module):
                         # 分组 decoder 的小穗点与框同为 padded 图像归一化坐标，用同一套缩放换到原图像素
                         point_coord_result = point_coord_result * point_coord_result.new_tensor([width, height])
 
-                    instance_r = retry_if_cuda_oom(self.instance_inference)(mask_cls_result, mask_pred_result, mask_box_result, point_coord_result, point_logit_result)
+                    instance_r = retry_if_cuda_oom(self.instance_inference)(mask_cls_result, mask_pred_result, mask_box_result, point_coord_result, point_logit_result, point_keep=point_keep_result)
                     processed_results[-1]["instances"] = instance_r
 
             return processed_results
@@ -501,7 +513,9 @@ class MaskDINO(nn.Module):
 
             return panoptic_seg, segments_info
 
-    def instance_inference(self, mask_cls, mask_pred, mask_box_result, point_coords=None, point_logits=None):
+    def instance_inference(self, mask_cls, mask_pred, mask_box_result, point_coords=None, point_logits=None,
+                           point_keep=None):
+        """point_keep: [Q, P] bool 或 None，小穗 token 的存活掩码（decoder 逐层剔除时给出），与点预测按同一套 topk 选。"""
         # mask_pred is already processed to have the same shape as original input
         image_size = mask_pred.shape[-2:]
         scores = mask_cls.sigmoid()  # [100, 80]
@@ -515,6 +529,8 @@ class MaskDINO(nn.Module):
         if point_coords is not None:
             point_coords = point_coords[topk_indices]   # [K, P, 2] 框相对 [0,1]（分组 decoder 下为像素）
             point_logits = point_logits[topk_indices]   # [K, P, 1]
+            if point_keep is not None:
+                point_keep = point_keep[topk_indices]   # [K, P] bool
         # if this is panoptic segmentation, we only keep the "thing" classes
         if self.panoptic_on:
             keep = torch.zeros_like(scores_per_image).bool()
@@ -526,6 +542,8 @@ class MaskDINO(nn.Module):
             if point_coords is not None:
                 point_coords = point_coords[keep]
                 point_logits = point_logits[keep]
+                if point_keep is not None:
+                    point_keep = point_keep[keep]
         result = Instances(image_size)
         # mask (before sigmoid)
         result.pred_masks = (mask_pred > 0).float()
@@ -549,11 +567,30 @@ class MaskDINO(nn.Module):
             spikelet_points = []
             spikelet_counts = []
             boxes_xyxy = mask_box_result  # [K, 4] 像素 xyxy
+            # 推理侧点 NMS（TEST.POINT_NMS_KAPPA > 0）或带存活掩码时走下面的新分支；都没有时走原路径（逐位不变）
+            point_select = self.point_nms_kappa > 0 or point_keep is not None
             for k in range(len(result)):
                 if int(labels_per_image[k].item()) == self.spikelet_class_id:
                     score_k = point_logits[k].sigmoid().squeeze(-1)   # [P]
                     keep_pt = score_k > self.point_threshold
-                    if self.point_abs_coords:
+                    if point_select:
+                        # 先算全部 P 个点的像素坐标，再取「分数 > 阈值 ∧ NMS 留下 ∧ 存活」的点
+                        x0, y0, x1, y1 = boxes_xyxy[k]
+                        bw = (x1 - x0).clamp(min=0)
+                        bh = (y1 - y0).clamp(min=0)
+                        if self.point_abs_coords:
+                            xy_all = point_coords[k]                  # [P, 2] 已是像素（见 forward）
+                        else:
+                            xy_all = torch.stack([x0, y0]) + point_coords[k] * torch.stack([bw, bh])  # [P, 2] 像素
+                        if self.point_nms_kappa > 0:
+                            # 半径 κ·sqrt(w·h)，w、h 为预测框像素宽高（clamp 防 0）；
+                            # NMS 对全部 P 个点做，与先按阈值过滤再做结果相同
+                            radius = self.point_nms_kappa * torch.sqrt(bw.clamp(min=1e-6) * bh.clamp(min=1e-6))
+                            keep_pt = keep_pt & greedy_point_nms(xy_all, score_k, radius)
+                        if point_keep is not None:
+                            keep_pt = keep_pt & point_keep[k].to(keep_pt.device)
+                        xy = xy_all[keep_pt]                          # [Ki, 2] 像素
+                    elif self.point_abs_coords:
                         xy = point_coords[k][keep_pt]                 # [Ki, 2] 已是像素（见 forward）
                     else:
                         x0, y0, x1, y1 = boxes_xyxy[k]

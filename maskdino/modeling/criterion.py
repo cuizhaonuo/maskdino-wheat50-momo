@@ -16,12 +16,14 @@ from torch import nn
 from scipy.optimize import linear_sum_assignment
 
 from detectron2.utils.comm import get_world_size
+from detectron2.utils.events import get_event_storage
 from detectron2.projects.point_rend.point_features import (
     get_uncertain_point_coords_with_randomness,
     point_sample,
 )
 
 from ..utils.misc import is_dist_avail_and_initialized, nested_tensor_from_tensor_list
+from ..utils.point_nms import greedy_point_nms
 from maskdino.utils import box_ops
 
 try:
@@ -146,7 +148,7 @@ class SetCriterion(nn.Module):
                  num_points, oversample_ratio, importance_sample_ratio,dn="no",dn_losses=[], panoptic_on=False, semantic_ce_loss=False,
                  num_spikelet_points=50, point_cost_coord=5.0, point_cost_class=2.0,
                  point_focal_alpha=0.25, point_empty_cls_weight=1.0, point_coord_norm="box_axis",
-                 point_coord_robust_c=0.0):
+                 point_coord_robust_c=0.0, point_nms_mode="none", point_nms_kappa=0.07):
         """Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
@@ -189,6 +191,13 @@ class SetCriterion(nn.Module):
         self.point_coord_norm = point_coord_norm
         # 绝对坐标输出（分组 decoder 的小穗 token）的坐标误差稳健化常数 c，见 _point_coord_rho
         self.point_coord_robust_c = point_coord_robust_c
+        # 小穗 token 的点 NMS（DDQ 式，见 config.py 的 POINT_NMS_MODE / POINT_NMS_KAPPA 与 _point_nms_keep）
+        assert point_nms_mode in ("none", "match"), f"未知 POINT_NMS_MODE: {point_nms_mode}"
+        self.point_nms_mode = point_nms_mode
+        self.point_nms_kappa = point_nms_kappa
+        # 本次 forward 内累计的 NMS 统计（每次 forward 开头清零，末尾写进 EventStorage）：
+        # [被压 token 数, token 总数, 饿死实例数（留下的 token 少于 Ni）, Ni>0 的实例数]
+        self._point_nms_stats = [0, 0, 0, 0]
 
     def loss_labels_ce(self, outputs, targets, indices, num_masks):
         """Classification loss (NLL)
@@ -409,6 +418,47 @@ class SetCriterion(nn.Module):
         col_ind = torch.as_tensor(col_ind, dtype=torch.int64, device=pred_rel.device)
         return row_ind, col_ind
 
+    @torch.no_grad()
+    def _point_nms_keep(self, pred_rel, pred_logit, box_wh, image_wh=None, kappa=None):
+        """内层匹配前的小穗点 NMS（POINT_NMS_MODE="match"），返回留下的 token 掩码。
+        诊断脚本（point_token_diag.py）逐实例调这个方法，loss_points 逐图批量调（每个实例仍各自做一次 NMS），
+        两者是同一份代码；批量只是把多个实例叠在前置维度上，逐元素运算与 greedy_point_nms 的结果都与逐个做时相同。
+        在 iso 空间做：框相对坐标乘 s = (w, h)/sqrt(w·h)（w、h 为像素宽高），两轴的 1 个单位都等于
+        sqrt(w·h) 个像素，于是「像素中心距 < κ·sqrt(w·h)」⟺「iso 距离 < κ」。换算与 _point_iso_scale
+        同一公式，但不论 POINT_COORD_NORM 取什么都这样算：NMS 永远在 iso 空间做。
+        分数 = sigmoid(logit)；坐标与分数全部 detach，搬到 CPU 一次后在 CPU 上做 NMS。
+        Args:
+            pred_rel:   [..., P, 2] 预测点（GT 框相对坐标）
+            pred_logit: [..., P, 1] 存在性 logit
+            box_wh:     [..., 2] GT 框 (w, h)，图像归一化
+            image_wh:   [2] 图像像素 (W, H)；None 时视为 1
+            kappa:      NMS 半径 κ；None 时取 self.point_nms_kappa（诊断脚本可覆盖）
+        Returns:
+            BoolTensor [..., P]（CPU），True = 留下
+        """
+        kappa = self.point_nms_kappa if kappa is None else kappa
+        wh_px = box_wh.detach().float()
+        if image_wh is not None:
+            wh_px = wh_px * image_wh.to(wh_px)
+        s = wh_px / wh_px.prod(-1, keepdim=True).sqrt().clamp(min=1e-12)
+        xy = pred_rel.detach().float() * s.unsqueeze(-2)
+        score = pred_logit.detach().float().sigmoid()
+        packed = torch.cat([xy, score], dim=-1).cpu()   # 一次 GPU→CPU 同步
+        return greedy_point_nms(packed[..., :2], packed[..., 2], kappa)
+
+    def _put_point_nms_stats(self):
+        """把本次 forward 累计的 NMS 统计写进 EventStorage（metrics.json 的 point_nms/*）。
+        不放进 losses：MaskDINO.forward 会按 weight_dict 过滤 losses，统计项会被丢掉。"""
+        n_sup, n_tok, n_starved, n_pos = self._point_nms_stats
+        try:
+            storage = get_event_storage()
+        except AssertionError:   # 不在 EventStorage 里（如独立脚本直接前向）就跳过
+            return
+        if n_tok > 0:
+            storage.put_scalar("point_nms/suppressed_frac", n_sup / n_tok)
+        if n_pos > 0:
+            storage.put_scalar("point_nms/starved_frac", n_starved / n_pos)
+
     def loss_points(self, outputs, targets, indices, num_masks):
         """逐实例小穗点损失：对每个外层匹配到的实例，做内层匈牙利匹配后计算
         点坐标 L1 损失 + 点存在性 focal 损失。
@@ -418,6 +468,13 @@ class SetCriterion(nn.Module):
           先换到 GT 框相对系，坐标误差用 _point_coord_rho（POINT_COORD_ROBUST_C>0 时有界增长）。
           缺省 False：MLP 点头的框相对坐标，与原实现一致。
         - wheat 实例（无小穗，Ni=0）：无坐标损失，P 个点全部监督为不存在（背景）。
+        - 小穗点 NMS（DDQ 式，见 config.py 的 POINT_NMS_MODE）：存活掩码 keep 的来源依次是
+            1) 输出里带 pred_point_keep（[B, Q, P] bool，decoder 逐层剔除时给出）→ 取 [b, q]；
+            2) 否则 POINT_NMS_MODE != "none" 且是小穗 token 的绝对坐标输出 → 用所配 GT 框做 NMS（_point_nms_keep）；
+            3) 否则 keep=None，走原路径（与不加 NMS 时逐位一致）。
+          keep 非 None 时只有留下的 token 进内层匹配，下标再映射回 P 个；存在性 focal 只对留下的 token
+          求和（被压掉的贡献 0），坐标损失仍只算配上的；Ni=0 的实例同样处理；分母不变；
+          留下的少于 Ni 时不补回（多出的 GT 小穗本层没有配对）。
         """
         assert 'pred_point_coords' in outputs and 'pred_point_logits' in outputs
         pred_coords = outputs['pred_point_coords']   # [B, Q, P, 2]
@@ -425,6 +482,11 @@ class SetCriterion(nn.Module):
         abs_frame = bool(outputs.get('pred_point_abs', False))
         device = pred_coords.device
         alpha, gamma = self.point_focal_alpha, 2.0
+        # 小穗点 NMS 的存活掩码来源（见上）。pred_point_keep 一次搬到 CPU，逐实例取用
+        keep_all = outputs.get('pred_point_keep')
+        if keep_all is not None:
+            keep_all = keep_all.detach().bool().cpu()
+        nms_here = keep_all is None and self.point_nms_mode != "none" and abs_frame
 
         coord_loss = torch.zeros([], device=device)
         cls_loss = torch.zeros([], device=device)
@@ -436,7 +498,24 @@ class SetCriterion(nn.Module):
             boxes_b = targets[b]['boxes']      # [Ng, 4] cxcywh 图像归一化
             points_b = targets[b]['points']    # list[Tensor[Ni,2]] 图像归一化
             image_wh = targets[b].get('image_wh')   # [2] 图像像素 (W, H)
-            for q_i, g_j in zip(src_idx.tolist(), tgt_idx.tolist()):
+            # 存活掩码逐图一次算好（[M, P]，CPU）：每个实例各自做 NMS，但整图只有一次 GPU→CPU、一次 CPU→GPU。
+            # 框相对坐标与下面逐实例的 pred_rel 同一套逐元素运算，NMS 的输入逐位相同。
+            keep_b = None
+            if keep_all is not None:
+                keep_b = keep_all[b][src_idx.cpu()]
+            elif nms_here:
+                bx = boxes_b[tgt_idx].float()                                             # [M, 4]
+                xy0_b = torch.stack([bx[:, 0] - bx[:, 2] / 2, bx[:, 1] - bx[:, 3] / 2], dim=-1)
+                wh_b = torch.stack([bx[:, 2], bx[:, 3]], dim=-1).clamp(min=1e-6)
+                rel_b = self._pred_to_box_rel(pred_coords[b, src_idx].float(), xy0_b[:, None], wh_b[:, None], True)
+                keep_b = self._point_nms_keep(rel_b, pred_logits[b, src_idx].float(), wh_b, image_wh)
+            if keep_b is not None:
+                n_keep_b = keep_b.sum(1).tolist()
+                kidx_b = keep_b.nonzero(as_tuple=True)[1].to(device)   # 各实例留下的 token 下标，按实例拼接
+                off_b = [0]
+                for n in n_keep_b:
+                    off_b.append(off_b[-1] + n)
+            for k, (q_i, g_j) in enumerate(zip(src_idx.tolist(), tgt_idx.tolist())):
                 # AMP 下预测为 half，GT 为 float32；统一转 float32 避免 dtype 不匹配
                 pred_c = pred_coords[b, q_i].float()       # [P,2]
                 pred_lg = pred_logits[b, q_i].float()      # [P,1]
@@ -455,7 +534,22 @@ class SetCriterion(nn.Module):
                     gt_rel = gt_pts_img.new_zeros((0, 2))
 
                 iso_scale = self._point_iso_scale(wh, image_wh)
-                row_ind, col_ind = self._inner_point_match(pred_rel, pred_lg, gt_rel, iso_scale, robust=abs_frame)
+                keep = None if keep_b is None else keep_b[k]
+                if keep is None:
+                    row_ind, col_ind = self._inner_point_match(pred_rel, pred_lg, gt_rel, iso_scale, robust=abs_frame)
+                else:
+                    # 只让留下的 token 进内层匹配，匹配下标再映射回 P 个 token 的下标
+                    kidx = kidx_b[off_b[k]:off_b[k + 1]]
+                    n_keep = n_keep_b[k]
+                    row_ind, col_ind = self._inner_point_match(
+                        pred_rel[kidx], pred_lg[kidx], gt_rel, iso_scale, robust=abs_frame)
+                    row_ind = kidx[row_ind]
+                    st = self._point_nms_stats
+                    st[0] += int(keep.numel()) - n_keep
+                    st[1] += int(keep.numel())
+                    if Ni > 0:
+                        st[3] += 1
+                        st[2] += int(n_keep < Ni)
 
                 # 存在性目标：匹配上的预测点为 1，其余为 0
                 tgt_exist = torch.zeros((self.num_spikelet_points, 1), device=device, dtype=pred_lg.dtype)
@@ -470,7 +564,7 @@ class SetCriterion(nn.Module):
                     else:
                         coord_loss = coord_loss + F.l1_loss(pred_m, gt_m, reduction='sum')
 
-                # 存在性 focal 损失（全部 P 个点）
+                # 存在性 focal 损失（全部 P 个点；有 NMS 掩码时只对留下的求和，见下）
                 prob = pred_lg.sigmoid()
                 ce = F.binary_cross_entropy_with_logits(pred_lg, tgt_exist, reduction='none')
                 p_t = prob * tgt_exist + (1 - prob) * (1 - tgt_exist)
@@ -480,7 +574,11 @@ class SetCriterion(nn.Module):
                 # Ni==0 的 wheat 实例贡献 P 个纯负样本，但推理时按类别门控、
                 # 它们本就不输出点，这部分监督只在误分类时生效，故可降权。
                 w = 1.0 if Ni > 0 else self.point_empty_cls_weight
-                cls_loss = cls_loss + focal.sum() * w
+                if keep is None:
+                    cls_loss = cls_loss + focal.sum() * w
+                else:
+                    # NMS 压掉的 token 不算存在性损失（贡献 0、梯度 0），只对留下的求和
+                    cls_loss = cls_loss + focal[kidx].sum() * w
 
                 num_pos += Ni
 
@@ -532,6 +630,8 @@ class SetCriterion(nn.Module):
                       The expected keys in each dict depends on the losses applied, see each loss' doc
         """
         outputs_without_aux = {k: v for k, v in outputs.items() if k != "aux_outputs"}
+        # 小穗点 NMS 统计：每次 forward 清零，loss_points 里累计，末尾写进 EventStorage
+        self._point_nms_stats = [0, 0, 0, 0]
 
         # Retrieve the matching between the outputs of the last layer and the targets
         if self.dn is not "no" and mask_dict is not None:
@@ -630,6 +730,8 @@ class SetCriterion(nn.Module):
                 l_dict = {k + f'_interm': v for k, v in l_dict.items()}
                 losses.update(l_dict)
 
+        if self.point_nms_mode != "none":
+            self._put_point_nms_stats()
         return losses, indices
 
     def __repr__(self):

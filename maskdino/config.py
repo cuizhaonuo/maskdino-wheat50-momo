@@ -120,6 +120,25 @@ def add_maskdino_config(cfg):
     # （c=1、|e|=0.05 处差 2.5%），远处梯度 1/(1+|e|/c)，方向由已定位好的实例主导。
     # 0 = 纯 L1。只作用于绝对坐标输出，layer-0 / interm 的 MLP 点头不受影响。
     cfg.MODEL.MaskDINO.POINT_COORD_ROBUST_C = 0.0
+    # ---- 小穗 token 的点 NMS（mini/group-nms-match、mini/group-nms-prune）----
+    # 来源：DDQ（Zhang et al., "Dense Distinct Query for End-to-End Object Detection", CVPR 2023）：
+    # 每个 refine 阶段前做 class-agnostic NMS，被压掉的 query 不进匹配、不算任何损失，推理时同样做。
+    # 这里只作用于分组 decoder 的小穗 token 输出（第 1~9 层，pred_point_abs=True）：内层匈牙利匹配前，
+    # 按存在性分数对 K 个 token 做贪心 NMS（坐标与分数 detach），中心距 < κ·sqrt(w·h) 算重复。
+    # 被压掉的 token 存在性与坐标损失都不算；留下但没配上的照常判负；损失分母（GT 小穗数）不变；
+    # 不做「留下的少于 Ni 时补回」。layer-0 / interm 的 MLP 点头不受影响。
+    # "none"  = 不做（与不加此功能时逐位一致）；
+    # "match" = 只在匹配与损失侧做，前向不变：criterion 用所配 GT 框在 iso 空间逐层做 NMS，
+    #           某层被压的 token 下一层照常参与注意力。
+    # 输出里带 pred_point_keep（[B, Q, K] bool 存活掩码）时，criterion 直接用它，不再自己做 NMS。
+    # 每次迭代把被压比例、饿死比例（留下的 token 少于 Ni 的实例占比）写进 metrics.json 的 point_nms/*。
+    cfg.MODEL.MaskDINO.POINT_NMS_MODE = "none"
+    # NMS 半径 κ：中心距 < κ·sqrt(w·h) 算重复（w、h 为框的像素宽高；iso 空间里半径就是 κ）。
+    # 数据依据（mini 标注、原生尺度）：GT 小穗最近邻距离 val p1 8.8 / 中位 16.7 px；
+    # κ=0.07 在中位 val 穗上约等于 8 px，只有 0.77% 的 GT 小穗在该半径内有真邻居。
+    # LSJ 训练把图缩放 0.1~2.0 倍，像素半径不能写死，所以按框尺度归一化。
+    # 按中心距理解：「两个半径 8 px 的圆有重叠」等于中心距 16 px，会把约一半相邻的真小穗并掉。
+    cfg.MODEL.MaskDINO.POINT_NMS_KAPPA = 0.07
     # True = 存在性头 point_class_embed 用 3 层 MLP（与坐标头 point_coord_embed 对齐），
     # False = 保持单层 nn.Linear。点头参数 12,850 -> 144,434。
     # 【口径】08-25 在 overfit10 上三向同时改善，但 08-26 的 val 检验判定 mF1 优势是记忆
@@ -160,6 +179,11 @@ def add_maskdino_config(cfg):
     cfg.MODEL.MaskDINO.TEST.PANO_TEMPERATURE = 0.06
     # 小穗点存在性置信度阈值（sigmoid 后 > 该值的点才输出）
     cfg.MODEL.MaskDINO.TEST.POINT_THRESHOLD = 0.35
+    # 推理侧小穗点 NMS 的半径 κ（含义与数据依据见 POINT_NMS_KAPPA）。> 0 时 instance_inference 在最后一层
+    # 对每个 wheat_2 实例的全部 K 个点做贪心 NMS（分数降序，中心距 < κ·sqrt(w·h) 算重复，w、h 为预测框的
+    # 像素宽高），再按 POINT_THRESHOLD 过滤；先 NMS 后过滤与先过滤后 NMS 结果相同。
+    # 0 = 关（与不加此功能时逐位一致）。内置评估的点指标就是按这里的设置出的。
+    cfg.MODEL.MaskDINO.TEST.POINT_NMS_KAPPA = 0.0
     # 评估时是否额外加挂小穗点评估器（SpikeletPointEvaluator，见 maskdino/evaluation/）
     cfg.MODEL.MaskDINO.TEST.SPIKELET_EVAL = False
     # 点匹配的距离阈值（原图像素，多档一起报）。GT 实测同穗内小穗最近邻间距中位 16px，
