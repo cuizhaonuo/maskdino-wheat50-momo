@@ -1,8 +1,8 @@
 # 想法：分组 decoder 上，小穗 token 在 decoder 里逐层点 NMS 剔除（DDQ DETR 式，arm B）
 
-状态：**预注册（未开跑）** ｜ 提出 2026-10-08 ｜ 分支 `mini/group-nms-prune`（从 arm A 的代码提交 C=`df90505` 开出，本分支的代码提交 `5f4d71b`）｜ 配置
-`wheat_joint_single_stage_mini_group_nms_prune.yaml`（`_BASE_` 为 `wheat_joint_single_stage_mini_group.yaml`，即 E3 的配置）｜ 输出 `output_v2/exp-<启动日期>-mini-group-nms-prune` ｜
-启动提交：本文档所在的提交
+状态：**预注册，已开跑（2026-10-08 21:45:16 启动）** ｜ 提出 2026-10-08 ｜ 分支 `mini/group-nms-prune`（从 arm A 的代码提交 C=`df90505` 开出，本分支的代码提交 `5f4d71b`）｜ 配置
+`wheat_joint_single_stage_mini_group_nms_prune.yaml`（`_BASE_` 为 `wheat_joint_single_stage_mini_group.yaml`，即 E3 的配置）｜ 输出 `output_v2/exp-1008-mini-group-nms-prune` ｜
+启动提交 `90d6d09` ｜ 启动时间 2026-10-08 21:45:16，qiuhao A100（GPU1），与 arm A（exp-1008-mini-group-nms-match）同卡并发，`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`（只减显存碎片，不改数值）
 
 **分叉点是有意的。** 用户指定从 `mini/group-decoder`（E3）出发，按 NMS 的作用范围各开一个分支：
 
