@@ -3,18 +3,72 @@
 | | |
 |:--|:--|
 | 验证想法 | [ideas/group-quality.md](../ideas/group-quality.md)（**预注册提交于 `4e454bf`，跑之前**） |
-| 对照 | **E3**：`mini/group-decoder` 的 100 epoch 版（`output_v2/exp-0925-mini-group-decoder`，[exp-2026-09-25-mini-group-decoder](exp-2026-09-25-mini-group-decoder.md)）。参照（不作判据）：E0 = `mini/baseline` 100 epoch（`output_v2/exp-0923-mini-ep100`），E2 = `mini/q100` 100 epoch（`output_v2/exp-0925-mini-q100`） |
+| 对照 | **主对照：E0 = `mini/baseline` 100 epoch**（`output_v2/exp-0923-mini-ep100`，用户 2026-10-08 指定），对比见下面「对 mini/baseline 的对比」一节。E3（`mini/group-decoder` 的 100 epoch 版，`output_v2/exp-0925-mini-group-decoder`，[exp-2026-09-25-mini-group-decoder](exp-2026-09-25-mini-group-decoder.md)）是预注册时的单因素对照，保留为「这一处改动」的归因参照。参照（不作判据）：E2 = `mini/q100` 100 epoch（`output_v2/exp-0925-mini-q100`） |
 | 配置 | `configs/coco/instance-segmentation/wheat_joint_single_stage_mini_group_quality.yaml`（`_BASE_` = `wheat_joint_single_stage_mini_group.yaml`，即 E3 的配置） |
 | 分支 @ 提交 | `mini/group-quality` @ `4e454bf`（从 `mini/group-decoder`@`00a7aaf` 开出），worktree `.claude/worktrees/mini-group-quality` |
 | 输出 | `output_v2/exp-1007-mini-group-quality` |
 | 差异 | 相对 E3（落盘 `config.yaml` 逐行 diff）：只多 `POINT_EXIST_TARGET: quality`、`POINT_QUALITY_SIGMA_NN: 0.5` 两个键（另有 `OUTPUT_DIR`）。正式 run 除 `OUTPUT_DIR` 外无 CLI 覆盖 |
 | 耗时 | 10-07 20:36:44 → 10-08 07:25:13，**10:48:29**（log 首尾时间）。其中 25 次评估共 48:53（平均 1:57/次），其余 9:59:36；训练 2.871 s/iter（detectron2 汇总：12498 iter / 9:57:59）。qiuhao GPU1（A100）单独占用；峰值显存 max_mem 26.9 GB |
-| 状态 | 12500/12500 iter · 25/25 评估 · 0 报错 · **判否**（机制未启动；计数次判据成立；护栏全过） |
+| 状态 | 12500/12500 iter · 25/25 评估 · 0 报错 · **判否**（按预注册对 E3：机制未启动；计数次判据成立；护栏全过）。对 E0（事后套用的线）：计数过 0.9 线（来自标定）、定位不过、机制线勉强过、护栏过 |
 
 本 arm 下文记作 **GQ**。读数一律是默认读数：训练内置评估，`POINT_THRESHOLD` 0.35，没有做阈值扫描。
 判据在同一次评估上读：后半程（iter ≥ 6250）`count_MAE_spike` 最低的那次，该 iter 的全部指标都从这次读；护栏用全程峰值。单种子。
 
-## 预期对账
+## 对 mini/baseline 的对比（2026-10-08 按用户要求补充）
+
+用户 2026-10-08 指定 E0（`mini/baseline` 100 epoch，`output_v2/exp-0923-mini-ep100`）为主对照。本节是事后补充：
+下面的判定线**不是本 arm 的预注册**，是事后套用本批其它 arm 预注册时对 E0 的同一套线。本 arm 预注册对 E3 的判定见下一节，原样保留。
+
+口径与全文相同：默认读数（阈值 0.35，不扫阈值）；读数那次取后半程（iter ≥ 6250）`count_MAE_spike` 最低的一次，
+本 arm 为 iter 7999，E0 为 iter 8999；护栏用全程峰值。单种子。
+
+### 同口径对比
+
+| 指标 | GQ | E0 | GQ − E0 |
+|:--|--:|--:|--:|
+| 读数 iter | 7999 | 8999 | |
+| `count_MAE_spike` | **1.663** | 2.465 | −0.802（−32.5%） |
+| `matched_F1@8` | **0.6282** | 0.6228 | +0.0054 |
+| `matched_F1@5` | 0.3569 | 0.3466 | +0.0103 |
+| `matched_F1@3` | 0.1617 | 0.1504 | +0.0113 |
+| `spike_recall` | 0.9576 | 0.9511 | +0.0065 |
+| `spike_precision` | 0.5923 | 0.6543 | −0.0620 |
+| `segm/AP` | 74.87 | 77.40 | −2.53 |
+| `bbox/AP` | 74.60 | 75.96 | −1.36 |
+| `segm/AP` 全程峰值 | 78.47（@12500） | 78.80（@12500） | −0.34 |
+| `spike_recall` 全程峰值 | 0.9576（@7999） | 0.9511（@8999） | +0.0065 |
+| 诊断：存在性 AUC | **0.7181** | 0.6671 | +0.0511 |
+| 诊断：重复点 | 0.22%（22 / 9866） | 0.08%（8 / 10599） | |
+| 诊断：覆盖率 | 79.0%（7267 / 9198） | 75.5%（6957 / 9209） | +3.5 个百分点 |
+| 最终评估：计数有符号偏差 | +1.16 | +2.40 | |
+| 最终评估：Pearson r | 0.562 | 0.642 | −0.080 |
+
+- E0 的指标读自 `output_v2/exp-0923-mini-ep100/metrics.json`；诊断取自 `output_v2/_diag-0926/exp-0923-mini-ep100.json`；
+  覆盖率分母与偏差、r 取自该 run 最终评估的 `inference/spikelet_pair_counts.csv`。
+- 本 arm 的诊断在 qiuhao GPU1 上跑，E0 的诊断当时在 qiuhao 的 CPU 上跑（见 E3 结果文档，两者口径相同）。
+
+### 判定线（事后套用，不是本 arm 的预注册）
+
+计数、定位、护栏四条与本批 `mini/point-scale-gate` 预注册时对 E0 的线相同（计数线也与 `mini/coral-count` 相同）；
+机制线取 E0 + 0.05，与本 arm 对 E3 的机制线同幅度。
+
+| 判据 | 线 | GQ | |
+|:--|:--|--:|:--:|
+| 计数：读数那次 `count_MAE_spike` | ≤ 2.21（E0 2.46 × 0.9） | 1.663 | ✅ |
+| 定位：读数那次 `matched_F1@8` | ≥ 0.6428（E0 0.6228 + 0.02） | 0.6282 | ❌ |
+| 机制：存在性 AUC | ≥ 0.7171（E0 0.6671 + 0.05） | 0.7181 | ✅（余量 0.001） |
+| 护栏：`segm/AP` 全程峰值 | ≥ 77.80（E0 78.80 − 1.0） | 78.47 | ✅ |
+| 护栏：`spike_recall` 全程峰值 | ≥ 0.9311（E0 0.9511 − 0.02） | 0.9576 | ✅ |
+
+### 读法
+
+- **计数下降来自偏差减半。** 最终评估的有符号偏差 +2.40 → +1.16。r 反而比 E0 低（0.562 对 0.642），
+  所以这是标定变化，不是「哪个穗点多、哪个穗点少」的判别变好。
+- **AUC 比 E0 高 0.051，其中约 0.032 是 E3 的结构本身带来的**（E3 0.699，E0 0.667）。
+  本 arm 这一处改动（存在性目标 hard → quality）只贡献约 0.019（0.718 对 E3 的 0.699）。机制线只以 0.001 的余量过线。
+- **分割在护栏内。** `segm/AP` 峰值 78.47，比 E0 低 0.34，在 −1.0 的护栏内；`spike_recall` 峰值高于 E0。
+
+## 预期对账（预注册，对 E3）
 
 ### 机制：M1 **未通过**，M2 通过
 
@@ -109,7 +163,7 @@ GQ 在 qiuhao GPU1 上跑；E3 / E0 / E2 取自 `output_v2/_diag-0926/`（当时
 |:--|--:|--:|--:|--:|
 | 配对穗数 | 577 | 581 | 578 | 583 |
 | count_MAE_spike | 1.837 | 2.764 | 2.599 | 2.859 |
-| 有符号偏差（预测 − GT，均值） | **+1.16** | +2.53 | +2.41 | +2.72 |
+| 有符号偏差（预测 − GT，均值） | **+1.16** | +2.53 | +2.40 | +2.72 |
 | Pearson r（预测点数 vs GT 点数） | 0.562 | 0.552 | 0.642 | 0.596 |
 | 预测均值 / GT 均值 | 17.10 / 15.94 | 18.48 / 15.94 | 18.34 / 15.93 | 18.65 / 15.93 |
 | 多报 / 少报 / 恰好 | 64.8% / 18.0% / 17.2% | 85.2% / 7.1% / 7.7% | 85.3% / 6.4% / 8.3% | 87.0% / 4.8% / 8.2% |

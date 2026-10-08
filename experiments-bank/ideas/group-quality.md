@@ -1,6 +1,6 @@
 # 想法：分组 decoder 上，存在性改学「定位质量」（Quality Focal Loss）
 
-状态：**判否（100 epoch，2026-10-08；机制未启动，主判据判否，计数次判据成立但来自标定，护栏全过）**，见 [exp-2026-10-07-mini-group-quality](../experiments/exp-2026-10-07-mini-group-quality.md) ｜ 提出 2026-10-07 ｜ 分支 `mini/group-quality`（从 `mini/group-decoder`@`00a7aaf` 开出，100 epoch）｜ 配置
+状态：**判否（100 epoch，2026-10-08；机制未启动，主判据判否，计数次判据成立但来自标定，护栏全过）**，见 [exp-2026-10-07-mini-group-quality](../experiments/exp-2026-10-07-mini-group-quality.md)。对 mini/baseline（exp-0923-mini-ep100）：计数过 0.9 线（来自标定）、定位不过、护栏过（2026-10-08 补充，事后套用） ｜ 提出 2026-10-07 ｜ 分支 `mini/group-quality`（从 `mini/group-decoder`@`00a7aaf` 开出，100 epoch）｜ 配置
 `wheat_joint_single_stage_mini_group_quality.yaml`（`_BASE_` 为 `wheat_joint_single_stage_mini_group.yaml`，即 E3 的配置）｜ 输出 `output_v2/exp-1007-mini-group-quality`
 
 **分叉点与约定不同，是有意的。** mini 实验的约定是新 arm 一律从 `mini/baseline` 开。本 arm 是在 E3（分组 decoder）上续做：
@@ -242,3 +242,20 @@ python myscripts/backup/vis_process/point_token_diag.py --sweep --run-dir <输�
   下降来自分数整体下移、少出点，即「归因限制」里预先写明的标定混杂，不是判别变好。
 - 分割没有代价：`segm/AP` 峰值 78.47（E3 78.35）。
 - 加局部特征（E3、ifi-refine、apg-refine）与改监督目标（本 arm）单独都没让 AUC 过 +0.05。
+
+**对 mini/baseline（exp-0923-mini-ep100）：计数过 0.9 线（来自标定）、定位不过、护栏过（2026-10-08 补充，事后套用）。**
+用户 2026-10-08 指定 mini/baseline 100 epoch（E0）为主对照。下面的线是事后套用本批其它 arm 预注册时对 E0 的同一套线，
+不是本 arm 的预注册；上面对 E3 的判定不变。口径相同：默认读数，本 arm 读 iter 7999，E0 读 iter 8999，护栏用全程峰值。
+
+| 判据（事后套用） | 线 | 本 arm | E0 | |
+|:--|:--|--:|--:|:--:|
+| 计数：读数那次 `count_MAE_spike` | ≤ 2.21 | 1.663 | 2.465 | ✅ |
+| 定位：读数那次 `matched_F1@8` | ≥ 0.6428 | 0.6282 | 0.6228 | ❌ |
+| 机制：存在性 AUC | ≥ 0.7171 | 0.7181 | 0.6671 | ✅（余量 0.001） |
+| 护栏：`segm/AP` 全程峰值 | ≥ 77.80 | 78.47 | 78.80 | ✅ |
+| 护栏：`spike_recall` 全程峰值 | ≥ 0.9311 | 0.9576 | 0.9511 | ✅ |
+
+- 计数下降来自偏差减半（+2.40 → +1.16）；r 反而比 E0 低（0.562 对 0.642），是标定变化，不是判别变好。
+- AUC 比 E0 高 0.051，其中约 0.032 是 E3 的结构本身带来的（E3 0.699，E0 0.667），本 arm 的改动只贡献约 0.019。
+- 分割在护栏内（`segm/AP` 峰值比 E0 低 0.34）。
+- 详见实验记录「对 mini/baseline 的对比」一节。
