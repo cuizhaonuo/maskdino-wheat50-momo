@@ -1,0 +1,43 @@
+# ============================================================================
+# 单阶段联合训练 · 500 图小集 · 分组 decoder + 小穗 token 在 decoder 里逐层点 NMS 剔除（mini/group-nms-prune，arm B）
+#   来源：Zhang et al., "Dense Distinct Query for End-to-End Object Detection"（DDQ，CVPR 2023）的 DETR 版
+#   预注册：experiments-bank/ideas/group-nms-prune.md（判否线在跑之前写死）
+#   主对照：E0（mini/baseline 100 epoch，output_v2/exp-0923-mini-ep100）；
+#   归因参照：E3（wheat_joint_single_stage_mini_group.yaml，mini/group-decoder 的 100 epoch 版，
+#         output_v2/exp-0925-mini-group-decoder）与 arm A（mini/group-nms-match）。
+#   本分支从 arm A 的代码提交 C（df90505，共享代码 + match 模式）开出，在其上只加 prune 模式；
+#   用户指定从 mini/group-decoder 出发、两种作用范围各开一个分支。
+#
+# 与 E3 的差异【只有小穗点 NMS 一处】：
+#   POINT_NMS_MODE: none -> prune
+#     第 l 层（1~9）结束后，在仍存活的小穗 token 之间、按第 l 层的存在性分数对 K=30 个 token 做贪心 NMS
+#     （坐标与分数 detach，iso 空间，半径用第 l 层细化后的**预测框**）：中心距 < κ·sqrt(w·h) 算重复，
+#     alive_l = alive_{l-1} ∧ keep_l。第 l 层的损失只算 alive_l（被剔除的 token 不进内层匹配，存在性与坐标
+#     损失都不算；留下但没配上的照常判负；分母不变；不补回）。被剔除的 token 从第 l+1 层起在实例内 SA 与
+#     同 slot 跨实例 SA 里不再当 key，不再复活；仍作为 query 计算，输出丢弃。layer-0 与 interm 的 MLP 点头不受影响。
+#   POINT_NMS_KAPPA: 0.05（训练与推理的剔除共用；含义与数据依据见 maskdino/config.py 的 POINT_NMS_KAPPA）
+#     原定 0.07，开跑前（2026-10-08）用户看完 E3 全量诊断后改为 0.05，两个 arm 相同：在 E3 最终 checkpoint 上，
+#     κ=0.07 的推理 NMS 吃掉 5.40 个百分点的 8 px 覆盖、每层压掉 21~23% 的 token；κ=0.05 时为 2.15 个百分点、12~15%
+#     （output_v2/_diag-1008-group-nms/E3_{plain,k005,k007}.json）。
+#   POINT_NMS_PRUNE_START_ITER: 2500 —— warm-up：此前 decoder 不剔除，criterion 用所配 GT 框做 NMS，与 arm A 完全相同。
+#     开训时预测框近乎整图，κ·sqrt(w·h) 会大到一次压掉大半 token；E3 在 iter 2499 时 segm AP 50，框才可用。
+#   TEST.POINT_NMS_KAPPA: 0.0 —— 推理直接用第 9 层的存活掩码（再按 POINT_THRESHOLD 0.35 过滤），不重复做 NMS。
+#     内置评估的点指标就是带剔除的（推理总是剔除，训练中途的评估也一样）。
+# 与 arm A 的唯一差别：剔除是否延续到后续层的注意力、是否不可逆，以及推理与 warm-up 之后的训练用预测框作半径。
+# 不变：分组 decoder 结构与参数（剔除不新增参数）、内层匹配代价（COST_POINT_*）、损失权重与归一化、
+#      POINT_THRESHOLD 0.35；schedule、数据、其余旋钮全部继承 E3。
+#
+# 用法：
+#   python train_net.py --num-gpus 1 \
+#     --config-file configs/coco/instance-segmentation/wheat_joint_single_stage_mini_group_nms_prune.yaml \
+#     OUTPUT_DIR /public/home/zncui/pycharm_project/maskdino-wheat50/output_v2/<run-name>
+# ============================================================================
+_BASE_: wheat_joint_single_stage_mini_group.yaml
+
+MODEL:
+  MaskDINO:
+    POINT_NMS_MODE: "prune"
+    POINT_NMS_KAPPA: 0.05
+    POINT_NMS_PRUNE_START_ITER: 2500
+    TEST:
+      POINT_NMS_KAPPA: 0.0
