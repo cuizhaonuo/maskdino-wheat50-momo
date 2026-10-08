@@ -1,0 +1,41 @@
+# ============================================================================
+# 单阶段联合训练 · 500 图小集 · 分组 decoder + 小穗 token 逐层点 NMS 后再做内层匹配（mini/group-nms-match，arm A）
+#   来源：Zhang et al., "Dense Distinct Query for End-to-End Object Detection"（DDQ，CVPR 2023）
+#   预注册：experiments-bank/ideas/group-nms-match.md（判否线在跑之前写死）
+#   主对照：E0（mini/baseline 100 epoch，output_v2/exp-0923-mini-ep100）；
+#   归因参照：E3（wheat_joint_single_stage_mini_group.yaml，mini/group-decoder 的 100 epoch 版，
+#         output_v2/exp-0925-mini-group-decoder）。本分支从 mini/group-decoder@00a7aaf 开出（用户指定），在 E3 上续做。
+#
+# 与 E3 的差异【只有小穗点 NMS 一处，训练侧与推理侧同时打开、用同一个 κ】：
+#   POINT_NMS_MODE: none -> match
+#     第 1~9 层（小穗 token 的绝对坐标输出）在内层匈牙利匹配前，按存在性分数对 K=30 个 token 做贪心 NMS
+#     （坐标与分数 detach，iso 空间，半径用所配 GT 框）：中心距 < κ·sqrt(w·h) 算重复。
+#     被压掉的 token 不进匹配，存在性与坐标损失都不算；留下但没配上的照常判负；分母（GT 小穗数）不变；
+#     留下的少于 Ni 时不补回。前向不变：某层被压的 token 下一层照常参与注意力。
+#     layer-0 与 interm 的 MLP 点头不受影响。
+#   POINT_NMS_KAPPA 与 TEST.POINT_NMS_KAPPA: κ = 0.05（只在下面 &kappa 一处改，推理侧引用同一个值）
+#     训练侧半径 κ·sqrt(w·h) 用 GT 框；推理侧在最后一层同样做 NMS，半径用预测框的像素宽高，再按 POINT_THRESHOLD 0.35 过滤。
+#     内置评估的点指标就是带 NMS 的。κ=0.05 在中位 val 穗上约 5.7 px，半径内有真邻居的 GT 小穗 0.04%。
+# 不变：分组 decoder 结构、内层匹配代价（COST_POINT_*）、损失权重与归一化、POINT_THRESHOLD 0.35；
+#      schedule、数据、其余旋钮全部继承 E3。
+#
+# κ 的改动：0.07 -> 0.05。用户在 E3 全 val 诊断之后、任何 run 开跑之前定的（2026-10-08）。
+#   依据（E3 最终 checkpoint，全 val，output_v2/_diag-1008-group-nms/）：
+#     - 推理 NMS 造成的 8 px 覆盖损失：κ=0.07 5.40 个百分点，κ=0.05 2.15 个百分点；
+#     - 匹配前 NMS 每层压掉的 token：κ=0.07 21~23%，κ=0.05 12~15%；
+#     - E3 + 推理 NMS 的读数（最终 checkpoint）：matched_F1@8 0.6404（κ=0.07）对 0.6416（κ=0.05），
+#       count_MAE_spike 2.449 对 2.597。
+#
+# 用法：
+#   python train_net.py --num-gpus 1 \
+#     --config-file configs/coco/instance-segmentation/wheat_joint_single_stage_mini_group_nms_match.yaml \
+#     OUTPUT_DIR /public/home/zncui/pycharm_project/maskdino-wheat50/output_v2/<run-name>
+# ============================================================================
+_BASE_: wheat_joint_single_stage_mini_group.yaml
+
+MODEL:
+  MaskDINO:
+    POINT_NMS_MODE: "match"
+    POINT_NMS_KAPPA: &kappa 0.05
+    TEST:
+      POINT_NMS_KAPPA: *kappa
