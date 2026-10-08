@@ -130,9 +130,19 @@ def add_maskdino_config(cfg):
     # "none"  = 不做（与不加此功能时逐位一致）；
     # "match" = 只在匹配与损失侧做，前向不变：criterion 用所配 GT 框在 iso 空间逐层做 NMS，
     #           某层被压的 token 下一层照常参与注意力。
+    # "prune" = 在 decoder 里逐层剔除（DDQ DETR 式）：第 l 层结束后，只在仍存活的 token 之间、按第 l 层的
+    #           存在性分数做 NMS，半径用该层细化后的**预测框**，得到 alive_l = alive_{l-1} ∧ keep_l。
+    #           被剔除的 token 从第 l+1 层起在注意力里被屏蔽（实例内 SA 与同 slot 跨实例 SA 都不再当 key），
+    #           不再复活；仍作为 query 计算，输出丢弃。第 l 层的损失只算 alive_l，推理直接用第 9 层的 alive
+    #           （TEST.POINT_NMS_KAPPA 设 0，不重复做）。训练从 POINT_NMS_PRUNE_START_ITER 起才剔除，见下。
     # 输出里带 pred_point_keep（[B, Q, K] bool 存活掩码）时，criterion 直接用它，不再自己做 NMS。
     # 每次迭代把被压比例、饿死比例（留下的 token 少于 Ni 的实例占比）写进 metrics.json 的 point_nms/*。
     cfg.MODEL.MaskDINO.POINT_NMS_MODE = "none"
+    # prune 模式在训练中从第几个 iter 起剔除（iter 取自 EventStorage；推理总是剔除）。
+    # 为什么要 warm-up：剔除半径来自当层预测框，开训时预测框近乎整图，κ·sqrt(w·h) 会大到一次压掉大半 token。
+    # warm-up 之前 decoder 前向不剔除、输出不带 pred_point_keep，criterion 退回 match 的 GT 框 NMS，与 match 完全相同。
+    # 0 = 从第一个 iter 起就剔除。
+    cfg.MODEL.MaskDINO.POINT_NMS_PRUNE_START_ITER = 0
     # NMS 半径 κ：中心距 < κ·sqrt(w·h) 算重复（w、h 为框的像素宽高；iso 空间里半径就是 κ）。
     # 数据依据（mini 标注、原生尺度）：GT 小穗最近邻距离 val p1 8.8 / 中位 16.7 px；
     # κ=0.07 在中位 val 穗上约等于 8 px，只有 0.77% 的 GT 小穗在该半径内有真邻居。

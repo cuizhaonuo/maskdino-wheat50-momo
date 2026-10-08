@@ -192,7 +192,8 @@ class SetCriterion(nn.Module):
         # 绝对坐标输出（分组 decoder 的小穗 token）的坐标误差稳健化常数 c，见 _point_coord_rho
         self.point_coord_robust_c = point_coord_robust_c
         # 小穗 token 的点 NMS（DDQ 式，见 config.py 的 POINT_NMS_MODE / POINT_NMS_KAPPA 与 _point_nms_keep）
-        assert point_nms_mode in ("none", "match"), f"未知 POINT_NMS_MODE: {point_nms_mode}"
+        # "prune" 时存活掩码由 decoder 给出（outputs['pred_point_keep']）；warm-up 期 decoder 不给，这里退回 match 的做法
+        assert point_nms_mode in ("none", "match", "prune"), f"未知 POINT_NMS_MODE: {point_nms_mode}"
         self.point_nms_mode = point_nms_mode
         self.point_nms_kappa = point_nms_kappa
         # 本次 forward 内累计的 NMS 统计（每次 forward 开头清零，末尾写进 EventStorage）：
@@ -471,6 +472,7 @@ class SetCriterion(nn.Module):
         - 小穗点 NMS（DDQ 式，见 config.py 的 POINT_NMS_MODE）：存活掩码 keep 的来源依次是
             1) 输出里带 pred_point_keep（[B, Q, P] bool，decoder 逐层剔除时给出）→ 取 [b, q]；
             2) 否则 POINT_NMS_MODE != "none" 且是小穗 token 的绝对坐标输出 → 用所配 GT 框做 NMS（_point_nms_keep）；
+               prune 模式在 warm-up 期（decoder 不剔除、不给 pred_point_keep）也走这条，与 match 相同；
             3) 否则 keep=None，走原路径（与不加 NMS 时逐位一致）。
           keep 非 None 时只有留下的 token 进内层匹配，下标再映射回 P 个；存在性 focal 只对留下的 token
           求和（被压掉的贡献 0），坐标损失仍只算配上的；Ni=0 的实例同样处理；分母不变；

@@ -13,6 +13,7 @@ from torch.nn import functional as F
 from detectron2.config import configurable
 from detectron2.layers import Conv2d
 from detectron2.utils.registry import Registry
+from detectron2.utils.events import get_event_storage
 from detectron2.structures import BitMasks
 
 import copy
@@ -75,6 +76,9 @@ class MaskDINODecoder(nn.Module):
             point_across_attn: str = "slot",
             point_dim_feedforward: int = 1024,
             point_within_gate: bool = True,
+            point_nms_mode: str = "none",
+            point_nms_kappa: float = 0.07,
+            point_nms_prune_start_iter: int = 0,
     ):
         """
         NOTE: this interface is experimental.
@@ -210,6 +214,14 @@ class MaskDINODecoder(nn.Module):
             self.point_exist_embed = (MLP(hidden_dim, hidden_dim, 1, 3)
                                       if point_class_mlp else nn.Linear(hidden_dim, 1))
 
+        # ===== 小穗 token 的逐层剔除（POINT_NMS_MODE="prune"，见 config.py）=====
+        # 只是三个开关值，不建任何模块、不改 state_dict。其它模式下 decoder 前向不变（match 只在 criterion 里做）。
+        assert point_nms_mode in ("none", "match", "prune"), f"未知 POINT_NMS_MODE: {point_nms_mode}"
+        assert point_nms_mode != "prune" or point_group, "POINT_NMS_MODE=prune 只作用于分组 decoder 的小穗 token"
+        self.point_nms_prune = point_group and point_nms_mode == "prune"
+        self.point_nms_kappa = point_nms_kappa
+        self.point_nms_prune_start_iter = point_nms_prune_start_iter
+
 
     @classmethod
     def from_config(cls, cfg, in_channels, mask_classification):
@@ -242,8 +254,25 @@ class MaskDINODecoder(nn.Module):
         ret["point_across_attn"] = cfg.MODEL.MaskDINO.POINT_ACROSS_ATTN
         ret["point_dim_feedforward"] = cfg.MODEL.MaskDINO.POINT_DIM_FEEDFORWARD
         ret["point_within_gate"] = cfg.MODEL.MaskDINO.POINT_WITHIN_GATE
+        # 小穗 token 的点 NMS（逐层剔除只在 POINT_NMS_MODE="prune" 时由 decoder 做）
+        ret["point_nms_mode"] = cfg.MODEL.MaskDINO.POINT_NMS_MODE
+        ret["point_nms_kappa"] = cfg.MODEL.MaskDINO.POINT_NMS_KAPPA
+        ret["point_nms_prune_start_iter"] = cfg.MODEL.MaskDINO.POINT_NMS_PRUNE_START_ITER
 
         return ret
+
+    def _point_prune_active(self):
+        """本次前向是否做逐层剔除：POINT_NMS_MODE="prune" 且 κ > 0 时，推理总是剔除；训练中 iter >= POINT_NMS_PRUNE_START_ITER
+        才剔除（iter 取自 EventStorage，没有 EventStorage 的独立脚本按 iter=0）。不剔除时前向与 match 模式逐位相同。"""
+        if not self.point_nms_prune or self.point_nms_kappa <= 0:
+            return False
+        if not self.training:
+            return True
+        try:
+            it = get_event_storage().iter
+        except AssertionError:   # 不在 EventStorage 里
+            it = 0
+        return it >= self.point_nms_prune_start_iter
 
     def prepare_for_dn(self, targets, tgt, refpoint_emb, batch_size):
         """
@@ -580,9 +609,14 @@ class MaskDINODecoder(nn.Module):
         # hs <-- intermediate, references <-- ref_points
         # hs List 9, references List (9+1=10)
         group_kwargs = {}
+        prune_on = False
         if self.point_group:
             group_kwargs = dict(pt_tgt=pt_tgt.transpose(0, 1), pt_refpoints=pt_refpoints.transpose(0, 1),
                                 group_offset=group_offset)
+            # 逐层剔除生效时把存在性头（与输出头同一个模块，只作参数传入）和 κ 交给 decoder；不生效时一个参数都不多传
+            prune_on = self._point_prune_active()
+            if prune_on:
+                group_kwargs.update(pt_exist_head=self.point_exist_embed, pt_nms_kappa=self.point_nms_kappa)
         dec_out = self.decoder(
             tgt=tgt.transpose(0, 1),
             memory=src_flatten.transpose(0, 1),
@@ -596,9 +630,13 @@ class MaskDINODecoder(nn.Module):
             **group_kwargs
         )
         hs, references = dec_out[0], dec_out[1]
+        pt_alive = None
         if self.point_group:
             # pt_hs: 每层 (bs, nq, K, d)；pt_references: 每层细化后的小穗点 (bs, nq, K, 2)，未 detach
             pt_hs, pt_references = dec_out[2], dec_out[3]
+            if prune_on:
+                # pt_alive: 每层结束时的存活掩码 (bs, nq, K) bool，只覆盖匹配 query
+                pt_alive = dec_out[4]
         # 为所有 decoder 层的输出，添加预测头，得到每一层的分类和掩码预测，所有的特征层共用一个预测头，也就是说参数是共享的
         # PS：类别和掩码预测头的参数也是共享的，但是预测框的参数不共享
         # 所有的 hs 都是包含了 denoising query 的
@@ -690,6 +728,14 @@ class MaskDINODecoder(nn.Module):
                 aux['pred_point_abs'] = i > 0
             if self.two_stage:
                 out['interm_outputs']['pred_point_abs'] = False
+        if pt_alive is not None:
+            # 逐层剔除的存活掩码 [B, Q, K] bool（只覆盖匹配 query，与小穗点输出对齐）：最终输出 = 第 9 层，
+            # aux_outputs[i]（i >= 1）= 第 i 层；layer-0（aux_outputs[0]）与 interm 是 MLP 点头，不挂。
+            # criterion 有它就直接用作内层匹配前的存活掩码，推理（instance_inference）用最终输出的这一份
+            out['pred_point_keep'] = pt_alive[-1]
+            for i, aux in enumerate(out['aux_outputs']):
+                if i > 0:
+                    aux['pred_point_keep'] = pt_alive[i - 1]
         return out, mask_dict
 
     def forward_prediction_heads(self, output, mask_features, pred_mask=True, pred_points=True):

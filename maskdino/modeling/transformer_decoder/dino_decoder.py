@@ -12,6 +12,7 @@ from torch import nn, Tensor
 from torch.cuda.amp import autocast
 
 from ...utils.utils import MLP, _get_clones, _get_activation_fn, gen_sineembed_for_position, inverse_sigmoid
+from ...utils.point_nms import greedy_point_nms_batched
 from ..pixel_decoder.ops.modules import MSDeformAttn
 
 
@@ -112,6 +113,9 @@ class TransformerDecoder(nn.Module):
                 pt_tgt: Optional[Tensor] = None,
                 pt_refpoints: Optional[Tensor] = None,
                 group_offset: int = 0,
+                # 小穗 token 的逐层剔除（POINT_NMS_MODE="prune"）
+                pt_exist_head: Optional[nn.Module] = None,
+                pt_nms_kappa: float = 0.0,
                 ):
         """
         Input:
@@ -123,9 +127,15 @@ class TransformerDecoder(nn.Module):
             - pt_tgt: ng, bs, K, d_model  小穗 token；None = 原行为
             - pt_refpoints: ng, bs, K, 2  小穗参考点（sigmoid 后，图像归一化绝对坐标）
             - group_offset: 带小穗组的 ng 个实例 query 在 tgt 里的起始下标（训练时 = DN 的 pad 数）
+            - pt_exist_head: 小穗 token 的存在性头（MaskDINODecoder.point_exist_embed，与输出头同一个模块）。
+              只作为参数传入、不注册成本模块的子模块，state_dict 与参数不变。
+            - pt_nms_kappa: 剔除的 NMS 半径 κ（iso 空间）。
+              pt_exist_head 非 None 且 κ > 0 时逐层剔除生效（见 _point_prune_step）；否则不算任何新东西、
+              不传任何注意力掩码，与不加此功能时逐位一致。
         Output:
             [hs, references]，pt_tgt 非 None 时再追加 [pt_hs, pt_references]
-            （pt_hs: 每层 (bs, ng, K, d)；pt_references: 每层细化后的小穗点 (bs, ng, K, 2)，未 detach）
+            （pt_hs: 每层 (bs, ng, K, d)；pt_references: 每层细化后的小穗点 (bs, ng, K, 2)，未 detach）；
+            逐层剔除生效时再追加 [pt_alive]（每层 (bs, ng, K) bool，第 l 层结束时的存活掩码 alive_l）
         """
         output = tgt
         device = tgt.device
@@ -145,6 +155,16 @@ class TransformerDecoder(nn.Module):
         pt_ref = pt_refpoints.to(device) if pt_refpoints is not None else None
         pt_intermediate = []
         pt_ref_points = []
+        # 逐层剔除（DDQ DETR 式）：pt_alive = 上一层结束时的存活掩码 (ng, bs, K) bool，None = 全部存活（第 1 层）
+        prune = pt_output is not None and pt_exist_head is not None and pt_nms_kappa > 0
+        pt_alive = None
+        pt_alive_list = []
+        if prune:
+            assert self.bbox_embed is not None, "逐层剔除的半径来自本层细化后的框，需要 bbox_embed"
+            # 归一化坐标 → iso 空间要还原像素纵横比：取面积最大那层特征图的 (W, H)，只用其比例。
+            # padded 输入恒为 1024² 方图时两轴比例为 1，归一化坐标本身就各向同性。
+            hw_max = spatial_shapes[spatial_shapes.prod(1).argmax()]
+            pt_img_wh = torch.stack([hw_max[1], hw_max[0]]).float()
         for layer_id, layer in enumerate(self.layers):
             # preprocess ref points
             if self.training and self.decoder_query_perturber is not None and layer_id != 0:
@@ -170,8 +190,10 @@ class TransformerDecoder(nn.Module):
                 pt_sine = gen_sineembed_for_position(pt_ref_input[:, :, :, 0].flatten(1, 2))  # ng, bs*K, 256
                 pt_query_pos = self.pt_ref_head(pt_sine).view(ng, -1, n_pt, self.d_model)
                 g0, g1 = group_offset, group_offset + ng
+                # 已被剔除的 token 在本层的注意力里不再当 key（None = 不传任何掩码）
+                pt_dead = None if pt_alive is None else ~pt_alive
                 ins, pt_output = self.pt_layers[layer_id].forward_within(
-                    output[g0:g1], query_pos[g0:g1], pt_output, pt_query_pos)
+                    output[g0:g1], query_pos[g0:g1], pt_output, pt_query_pos, pt_dead=pt_dead)
                 output = torch.cat([output[:g0], ins.to(output.dtype), output[g1:]], dim=0)
 
             # 输入变量，有几个变量不必要过多关注
@@ -203,7 +225,7 @@ class TransformerDecoder(nn.Module):
             if pt_output is not None:
                 pt_output = self.pt_layers[layer_id].forward_point(
                     pt_output, pt_query_pos, pt_ref_input, memory, memory_key_padding_mask,
-                    level_start_index, spatial_shapes)
+                    level_start_index, spatial_shapes, pt_dead=pt_dead)
                 new_pt_ref = (inverse_sigmoid(pt_ref) + self.pt_delta_embed[layer_id](pt_output)).sigmoid()
                 pt_ref_points.append(new_pt_ref)
                 pt_intermediate.append(pt_output)
@@ -222,6 +244,13 @@ class TransformerDecoder(nn.Module):
                 # if layer_id != self.num_layers - 1:
                 ref_points.append(new_reference_points)
 
+            # 分组 decoder ③：逐层剔除。在本层细化后的框与小穗点上、只在仍存活的 token 之间做点 NMS，
+            # alive_l = alive_{l-1} ∧ keep_l：用作本层输出的存活掩码，并在下一层的注意力里屏蔽死 token
+            if prune:
+                pt_alive = self._point_prune_step(pt_exist_head, pt_output, new_pt_ref, new_reference_points[g0:g1],
+                                                  pt_img_wh, pt_nms_kappa, pt_alive)
+                pt_alive_list.append(pt_alive)
+
             intermediate.append(self.norm(output))
 
         # 把 batch size 放到第 0 维度
@@ -238,7 +267,41 @@ class TransformerDecoder(nn.Module):
                 [itm.transpose(0, 1) for itm in pt_intermediate],
                 [itm.transpose(0, 1) for itm in pt_ref_points],
             ]
+            if prune:
+                ret.append([itm.transpose(0, 1) for itm in pt_alive_list])
         return ret
+
+    @staticmethod
+    @torch.no_grad()
+    def _point_prune_step(exist_head, pt_output, pt_xy, boxes, img_wh, kappa, alive_prev):
+        """逐层剔除的一步（POINT_NMS_MODE="prune"）：用本层输出（全部 detach）对每个实例的 K 个小穗 token 做贪心点 NMS。
+        - 分数 = sigmoid(exist_head(pt_output))，与本层输出的存在性 logit 同一个头、同一个输入。
+          关掉 autocast、在 fp32 下算：AMP 训练时若在 no_grad 里经 autocast 调存在性头，autocast 会把权重的 fp16
+          副本缓存成不带梯度的版本，之后输出头复用缓存，存在性头就收不到梯度（实测 6 个参数无梯度）。
+          推理本来就是 fp32，与输出的 logit 相同；训练时只比输出 logit（fp16）更精确；
+        - 坐标 = 本层细化后的小穗点（图像归一化绝对坐标）；
+        - 半径 = κ·sqrt(w·h)，w、h 为本层细化后实例框的像素宽高。框用 decoder 内部的参考框 new_reference_points
+          （即下一层的参考框）；该层输出的 pred_boxes 是同一个 bbox_embed 作用在 decoder_norm 之后的特征上，
+          与它略有不同（E3 最终 checkpoint 的 val 图上，wheat_2 实例两者 sqrt(w·h) 的对数差平均第 1 层 0.6%、之后 < 0.3%）。
+          在 iso 空间做：坐标乘
+          s = (W, H)/sqrt(w·W·h·H)，即「像素坐标 ÷ sqrt(w_px·h_px)」，半径就是 κ（与 criterion._point_nms_keep 同一换算）；
+        - 只在 alive_prev 的 token 之间做：死 token 既不能留下，也不能压别人（greedy_point_nms_batched 的 valid）。
+        Args:
+            exist_head: 存在性头；pt_output: (ng, bs, K, d)；pt_xy: (ng, bs, K, 2)；
+            boxes: (ng, bs, 4) cxcywh 图像归一化；img_wh: [2] (W, H)，只用其比例；
+            kappa: NMS 半径（iso 空间）；alive_prev: (ng, bs, K) bool 或 None（全部存活）
+        Returns:
+            alive: (ng, bs, K) bool = alive_prev ∧ keep
+        """
+        ng, bs, K = pt_xy.shape[:3]
+        with torch.autocast(device_type=pt_output.device.type, enabled=False):
+            score = exist_head(pt_output.float()).float().sigmoid().reshape(ng * bs, K)
+        wh_px = boxes[..., 2:].float() * img_wh                                   # (ng, bs, 2)，比例与像素相同
+        s = img_wh / wh_px.prod(-1, keepdim=True).sqrt().clamp(min=1e-12)       # (ng, bs, 2)
+        xy = (pt_xy.float() * s.unsqueeze(-2)).reshape(ng * bs, K, 2)            # iso 空间
+        valid = None if alive_prev is None else alive_prev.reshape(ng * bs, K)
+        keep = greedy_point_nms_batched(xy, score, kappa, valid).view(ng, bs, K)
+        return keep if alive_prev is None else alive_prev & keep
 
 
 class DeformableTransformerDecoderLayer(nn.Module):
@@ -413,13 +476,16 @@ class PointGroupLayer(nn.Module):
         self.norm3 = nn.LayerNorm(d_model)
 
     @autocast(enabled=False)
-    def forward_within(self, ins, ins_pos, pts, pts_pos):
+    def forward_within(self, ins, ins_pos, pts, pts_pos, pt_dead=None):
         """实例内 SA。
         Args:
             ins:     (N, B, d)     带小穗组的实例 token
             ins_pos: (N, B, d)     实例 token 的 query pos（原 ref_point_head 的输出）
             pts:     (N, B, K, d)  小穗 token
             pts_pos: (N, B, K, d)  小穗 token 的 query pos
+            pt_dead: (N, B, K) bool 或 None。True = 已被逐层剔除（POINT_NMS_MODE="prune"）的 token：
+                     用 key_padding_mask 让它不再当 key；实例 token 永不屏蔽，每行至少有一个可看的 key。
+                     死 token 仍作为 query 计算（输出由存活掩码丢弃）。None = 不传掩码（逐位不变）。
         Returns:
             (ins, pts)，形状不变
         """
@@ -428,8 +494,12 @@ class PointGroupLayer(nn.Module):
         grp = torch.cat([ins.unsqueeze(2), pts], dim=2).reshape(N * B, 1 + K, d)
         grp_pos = torch.cat([ins_pos.unsqueeze(2), pts_pos], dim=2).reshape(N * B, 1 + K, d)
         q = k = grp + grp_pos
+        kpm = None
+        if pt_dead is not None:
+            # 序列 = [实例 token, K 个小穗 token]，与 grp 同一排布（批下标 = n·B + b）
+            kpm = torch.cat([pt_dead.new_zeros(N, B, 1), pt_dead], dim=2).reshape(N * B, 1 + K)
         # need_weights=False 让 torch 走 SDPA（不物化注意力矩阵）
-        out = self.within_attn(q, k, grp, need_weights=False)[0]
+        out = self.within_attn(q, k, grp, key_padding_mask=kpm, need_weights=False)[0]
         out = self.within_dropout(out).reshape(N, B, 1 + K, d)
         gate = self.within_gate if self.within_gate is not None else 1.0
         ins = ins + gate * out[:, :, 0]
@@ -438,13 +508,17 @@ class PointGroupLayer(nn.Module):
 
     @autocast(enabled=False)
     def forward_point(self, pts, pts_pos, pts_ref, memory, memory_key_padding_mask,
-                      memory_level_start_index, memory_spatial_shapes):
+                      memory_level_start_index, memory_spatial_shapes, pt_dead=None):
         """小穗 token 的跨实例 SA → 可变形 cross-attn → FFN。
         Args:
             pts:     (N, B, K, d)
             pts_pos: (N, B, K, d)
             pts_ref: (N, B, K, nlevel, 2)  参考点（已乘 valid_ratios）
             memory:  (hw, B, d)
+            pt_dead: (N, B, K) bool 或 None。True = 已被逐层剔除的 token：同 slot 跨实例 SA 里不再当 key，
+                     但保留自身对角（同 slot 的 N 个 token 可能全死，整行全屏蔽会出 NaN）。用 bool attn_mask，
+                     形状 (B·K·heads, N, N)。死 token 仍作为 query 计算；cross-attn / FFN 照常。
+                     None = 不传掩码（逐位不变）。
         Returns:
             pts: (N, B, K, d)
         """
@@ -454,7 +528,14 @@ class PointGroupLayer(nn.Module):
             # 同 slot 跨实例：序列维 = N，批维 = B·K
             v = pts.permute(1, 2, 0, 3).reshape(B * K, N, d)
             q = k = (pts + pts_pos).permute(1, 2, 0, 3).reshape(B * K, N, d)
-            out = self.across_attn(q, k, v, need_weights=False)[0]
+            attn_mask = None
+            if pt_dead is not None:
+                # mask[b·K+k, i, j] = 第 j 个实例的第 k 号 token 已死 且 j != i（True = 不许看）；
+                # nn.MultiheadAttention 的 3-D 掩码按 批下标·heads + 头 排布，所以逐批重复 heads 次
+                dead_key = pt_dead.permute(1, 2, 0).reshape(B * K, 1, N)
+                eye = torch.eye(N, dtype=torch.bool, device=pt_dead.device)
+                attn_mask = (dead_key & ~eye).repeat_interleave(self.across_attn.num_heads, dim=0)
+            out = self.across_attn(q, k, v, attn_mask=attn_mask, need_weights=False)[0]
             out = out.reshape(B, K, N, d).permute(2, 0, 1, 3)
             pts = self.across_norm(pts + self.across_dropout(out))
 
