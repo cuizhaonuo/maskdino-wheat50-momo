@@ -1,8 +1,8 @@
 # 想法：小穗 token 逐层点 NMS 后再做内层匹配 · arm A（match：只在匹配与损失侧做）
 
-状态：**预注册（未开跑）** ｜ 提出 2026-10-08 ｜ 分支 `mini/group-nms-match`（从 `mini/group-decoder`@`00a7aaf` 开出，100 epoch）｜ 配置
-`wheat_joint_single_stage_mini_group_nms_match.yaml`（`_BASE_` 为 `wheat_joint_single_stage_mini_group.yaml`，即 E3 的配置）｜ 输出 `output_v2/exp-<启动日期>-mini-group-nms-match`
-｜ 代码提交 `df90505`（共享 NMS 工具 + match 模式）｜ 启动提交：（主 agent 填）｜ 启动时间：（主 agent 填）
+状态：**预注册，已开跑（2026-10-08 17:09:19 启动）** ｜ 提出 2026-10-08 ｜ 分支 `mini/group-nms-match`（从 `mini/group-decoder`@`00a7aaf` 开出，100 epoch）｜ 配置
+`wheat_joint_single_stage_mini_group_nms_match.yaml`（`_BASE_` 为 `wheat_joint_single_stage_mini_group.yaml`，即 E3 的配置）｜ 输出 `output_v2/exp-1008-mini-group-nms-match`
+｜ 代码提交 `df90505`（共享 NMS 工具 + match 模式）｜ 启动提交 `1e73b5f`｜ 启动时间 2026-10-08 17:09:19，qiuhao A100（GPU1），与 arm B 的冒烟同卡
 
 **分叉点是有意的（用户指定）。** mini 实验的约定是新 arm 一律从 `mini/baseline` 开。本 arm 要改的是分组 decoder 的小穗 token 的匹配，
 离开分组 decoder 就不存在，所以从 `mini/group-decoder`@`00a7aaf` 开出，在 E3 上续做。
@@ -211,7 +211,7 @@ iter 6499 … 11999 与 final（12500）。输出 `output_v2/_eval-1008-group-de
 必须传不带值的 `--sweep` 关掉扫描，且放在最前面（它是 `nargs="*"`，放在后面会吞掉后续参数）：
 
 ```
-python myscripts/backup/vis_process/point_token_diag.py --sweep --run-dir output_v2/exp-<启动日期>-mini-group-nms-match --out <json>
+python myscripts/backup/vis_process/point_token_diag.py --sweep --run-dir output_v2/exp-1008-mini-group-nms-match --out <json>
 ```
 
 - **M1（匹配稳定，用户的假设）**：第 1→9 层相邻层的内层改判率均值 ≤ **0.0190**（E3 plain 0.0271 × 0.7）。
