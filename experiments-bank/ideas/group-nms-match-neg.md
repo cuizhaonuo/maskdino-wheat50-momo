@@ -1,9 +1,9 @@
 # 想法：小穗 token 逐层点 NMS 后再做内层匹配，被压掉的 token 判负 · arm A-neg（mini/group-nms-match-neg）
 
-状态：**预注册（未开跑）** ｜ 提出 2026-10-09 ｜ 分支 `mini/group-nms-match-neg`（从 `mini/group-nms-match`@`bfe1d7e` 开出，100 epoch）｜ 配置
+状态：**预注册，已开跑（2026-10-09 15:58:03 启动）** ｜ 提出 2026-10-09 ｜ 分支 `mini/group-nms-match-neg`（从 `mini/group-nms-match`@`bfe1d7e` 开出，100 epoch）｜ 配置
 `wheat_joint_single_stage_mini_group_nms_match_neg.yaml`（`_BASE_` 为 `wheat_joint_single_stage_mini_group_nms_match.yaml`，即 arm A 的配置）｜
-输出 `output_v2/exp-<MMDD>-mini-group-nms-match-neg`（【待补：起 run 时定】）｜ 代码提交 `1dffc3b` ｜ 启动提交：本文件所在的提交（【待补：哈希】）｜
-启动时间 【待补】，qiuhao A100（GPU1）【待补：是否与别的任务同卡】
+输出 `output_v2/exp-1009-mini-group-nms-match-neg` ｜ 代码提交 `1dffc3b` ｜ 启动提交 `5673db5` ｜
+启动时间 2026-10-09 15:58:03，qiuhao A100（GPU1）。开跑时卡上没有本组的其他 run，之后有别的用户的小任务同卡（约 5.6 GB）
 
 本 arm 下文记作 **A-neg**。
 
@@ -285,4 +285,21 @@ python myscripts/backup/vis_process/point_token_diag.py --sweep --run-dir output
 
 ## 启动信息
 
-【待主 agent 起 run 后补：启动提交哈希、启动时间、输出目录、GPU 与并发情况、启动命令】
+- **启动提交**：`5673db5`（启动时 worktree 干净，`launch.log` 首行记有完整哈希）。
+- **启动时间**：2026-10-09 15:58:03。
+- **输出**：`output_v2/exp-1009-mini-group-nms-match-neg`，日志 `output_v2/exp-1009-mini-group-nms-match-neg.launch.log`。
+- **GPU 与排队**：
+  - 只用 qiuhao 的 A100（GPU1），`CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1`。
+  - 15:41 起排队：当时别的用户的 vLLM 占了约 60 GB，只剩 20 GB。15:58 空出到 75 GB 后自动启动。
+  - 启动后 nvidia-smi 上本 run 约 27 GB。
+- **启动方式**：排队脚本 `output_v2/_queue/launch-group-nms-match-neg.sh`，日志为同目录下的 `launch-group-nms-match-neg.queue.log`。
+  - 脚本先轮询 GPU1 空闲显存 ≥ 34000 MiB，再核对 HEAD = `5673db5` 且 worktree 干净，然后执行：
+
+    ```
+    PYTHONPATH=. CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+      /public/home/zncui/anaconda3/envs/MaskDINO-310/bin/python train_net.py --num-gpus 1 \
+      --config-file configs/coco/instance-segmentation/wheat_joint_single_stage_mini_group_nms_match_neg.yaml \
+      OUTPUT_DIR /public/home/zncui/pycharm_project/maskdino-wheat50/output_v2/exp-1009-mini-group-nms-match-neg
+    ```
+  - `expandable_segments` 只减少显存碎片，不改数值。arm B 也用了它，arm A 没用。
+- **首个日志点**：iter 19，eta 12:37:50，0 报错。
