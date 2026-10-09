@@ -1,0 +1,29 @@
+# ============================================================================
+# mini/coral-exist · 秩一致存在性头 + 前缀内层匹配（B 臂）
+#   预注册：experiments-bank/ideas/coral-exist.md（判否线已在跑之前写死）
+#   来源：Cao et al., Rank Consistent Ordinal Regression（arXiv 1901.07884），
+#         本地源码 /public/home/zncui/pycharm_project/coral-cnn
+#
+# 与 wheat_joint_single_stage_mini_ep100.yaml（mini/baseline 的 100 epoch 基线）的差异【只有两项】：
+#   MODEL.MaskDINO.POINT_CORAL_EXIST: True
+#     一个开关同时改三处（作为「CORAL 存在性」方案整体检验）：
+#       ① point_class_embed 改为 CoralHead：slot k 的 logit = g(h) + b_k（共享打分 + 25 个有序 bias）；
+#       ② 内层匹配只让前 min(Ni, 25) 个 slot 参与匈牙利（代价只用坐标 L1），存在性目标变成有序前缀；
+#       ③ 存在性损失由 focal 换成 CORAL 的 BCE（每实例对 25 个任务取均值，实例间加权平均）。
+#     点坐标头、坐标 L1、POINT_COORD_WEIGHT / POINT_CLASS_WEIGHT / POINT_EMPTY_CLS_WEIGHT 都不变。
+#   MODEL.MaskDINO.TEST.POINT_THRESHOLD: 0.35 -> 0.5
+#     CORAL 的决策规则 K = sum_k 1[P(Ni>k) > 0.5]（afad-coral.py:358），推理输出前 K 个 slot。
+#     0.35 是为 focal 标定的存在性概率挑的档，对 BCE 标定的 P(Ni>k) 没有意义。
+#
+# 用法：
+#   python train_net.py --num-gpus 1 \
+#     --config-file configs/coco/instance-segmentation/wheat_joint_single_stage_mini_coral_exist.yaml \
+#     OUTPUT_DIR /public/home/zncui/pycharm_project/maskdino-wheat50/output_v2/<run-name>
+# ============================================================================
+_BASE_: wheat_joint_single_stage_mini_ep100.yaml
+
+MODEL:
+  MaskDINO:
+    POINT_CORAL_EXIST: True
+    TEST:
+      POINT_THRESHOLD: 0.5

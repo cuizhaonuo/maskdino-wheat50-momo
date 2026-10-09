@@ -21,6 +21,7 @@ from .dino_decoder import TransformerDecoder, DeformableTransformerDecoderLayer,
 from ..pixel_decoder.ops.modules import MSDeformAttn
 from ...utils.utils import MLP, gen_encoder_output_proposals, inverse_sigmoid, _get_clones
 from ...utils import box_ops
+from ..coral import CoralHead
 
 
 TRANSFORMER_DECODER_REGISTRY = Registry("TRANSFORMER_MODULE")
@@ -50,6 +51,7 @@ class MaskDINODecoder(nn.Module):
             num_queries: int,
             num_points: int,
             point_class_mlp: bool = False,
+            point_coral_exist: bool = False,
             nheads: int,
             dim_feedforward: int,
             dec_layers: int,
@@ -155,8 +157,13 @@ class MaskDINODecoder(nn.Module):
         self.point_coord_embed = MLP(hidden_dim, hidden_dim, num_points * 2, 3)
         # POINT_CLASS_MLP=True 时与坐标头同构（3 层 MLP）。参数名前缀不变，
         # 仍会被 train_net.py 的 _POINT_HEAD_KEYS 子串匹配到、正确解冻。
-        self.point_class_embed = (MLP(hidden_dim, hidden_dim, num_points, 3)
-                                  if point_class_mlp else nn.Linear(hidden_dim, num_points))
+        # POINT_CORAL_EXIST=True：换成 CORAL 结构，slot k 的 logit = g(h) + b_k，即 P(Ni > k)。
+        # 输出 [B,Q,P]，与原头同形，forward_prediction_heads 里的 reshape 不用改。
+        if point_coral_exist:
+            self.point_class_embed = CoralHead(hidden_dim, hidden_dim, num_points, 3)
+        else:
+            self.point_class_embed = (MLP(hidden_dim, hidden_dim, num_points, 3)
+                                      if point_class_mlp else nn.Linear(hidden_dim, num_points))
 
         # init decoder
         self.decoder_norm = decoder_norm = nn.LayerNorm(hidden_dim)
@@ -222,6 +229,7 @@ class MaskDINODecoder(nn.Module):
         ret["num_queries"] = cfg.MODEL.MaskDINO.NUM_OBJECT_QUERIES
         ret["num_points"] = cfg.MODEL.MaskDINO.NUM_POINTS
         ret["point_class_mlp"] = cfg.MODEL.MaskDINO.POINT_CLASS_MLP
+        ret["point_coral_exist"] = cfg.MODEL.MaskDINO.POINT_CORAL_EXIST
         # Transformer parameters:
         ret["nheads"] = cfg.MODEL.MaskDINO.NHEADS
         ret["dim_feedforward"] = cfg.MODEL.MaskDINO.DIM_FEEDFORWARD

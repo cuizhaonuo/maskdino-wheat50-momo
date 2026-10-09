@@ -57,6 +57,7 @@ class MaskDINO(nn.Module):
         point_threshold: float = 0.35,
         point_abs_coords: bool = False,
         point_nms_kappa: float = 0.0,
+        point_coral_exist: bool = False,
     ):
         """
         Args:
@@ -119,6 +120,8 @@ class MaskDINO(nn.Module):
         # 推理侧小穗点 NMS 半径 κ（TEST.POINT_NMS_KAPPA；0 = 关），半径 = κ·sqrt(w·h)，w、h 为预测框像素宽高。
         # 诊断脚本收集全部 token 时会临时把它设 0。
         self.point_nms_kappa = point_nms_kappa
+        # POINT_CORAL_EXIST：K = 超过阈值的 slot 数（CORAL 的求和规则），输出前 K 个 slot
+        self.point_coral_exist = point_coral_exist
 
         if not self.semantic_on:
             assert self.sem_seg_postprocess_before_inference
@@ -211,6 +214,7 @@ class MaskDINO(nn.Module):
             point_coord_robust_c=cfg.MODEL.MaskDINO.POINT_COORD_ROBUST_C,
             point_nms_mode=cfg.MODEL.MaskDINO.POINT_NMS_MODE,
             point_nms_kappa=cfg.MODEL.MaskDINO.POINT_NMS_KAPPA,
+            point_coral_exist=cfg.MODEL.MaskDINO.POINT_CORAL_EXIST,
         )
 
         return {
@@ -242,6 +246,7 @@ class MaskDINO(nn.Module):
             "point_threshold": cfg.MODEL.MaskDINO.TEST.POINT_THRESHOLD,
             "point_abs_coords": cfg.MODEL.MaskDINO.POINT_GROUP_DECODER,
             "point_nms_kappa": cfg.MODEL.MaskDINO.TEST.POINT_NMS_KAPPA,
+            "point_coral_exist": cfg.MODEL.MaskDINO.POINT_CORAL_EXIST,
         }
 
     @property
@@ -573,7 +578,16 @@ class MaskDINO(nn.Module):
                 if int(labels_per_image[k].item()) == self.spikelet_class_id:
                     score_k = point_logits[k].sigmoid().squeeze(-1)   # [P]
                     keep_pt = score_k > self.point_threshold
-                    if point_select:
+                    if self.point_coral_exist and not self.point_abs_coords:
+                        # CE 原路径：按求和计数、取前缀，不要求 bias 已经排好序（定理 1 只保证最优点有序）
+                        n_k = int(keep_pt.sum().item())
+                        keep_pt = torch.arange(score_k.numel(), device=score_k.device) < n_k
+                        x0, y0, x1, y1 = boxes_xyxy[k]
+                        bw = (x1 - x0).clamp(min=0)
+                        bh = (y1 - y0).clamp(min=0)
+                        rel = point_coords[k][keep_pt]                # [Ki, 2] 框相对
+                        xy = torch.stack([x0, y0]) + rel * torch.stack([bw, bh])  # [Ki, 2] 像素
+                    elif point_select:
                         # 先算全部 P 个点的像素坐标，再取「分数 > 阈值 ∧ NMS 留下 ∧ 存活」的点
                         x0, y0, x1, y1 = boxes_xyxy[k]
                         bw = (x1 - x0).clamp(min=0)

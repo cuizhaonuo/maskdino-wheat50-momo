@@ -25,6 +25,7 @@ from detectron2.projects.point_rend.point_features import (
 from ..utils.misc import is_dist_avail_and_initialized, nested_tensor_from_tensor_list
 from ..utils.point_nms import greedy_point_nms
 from maskdino.utils import box_ops
+from .coral import coral_loss
 
 try:
     # 正负样本匹配的 debug 可视化。要关掉请改各模块顶部的 ENABLED = False，
@@ -148,7 +149,8 @@ class SetCriterion(nn.Module):
                  num_points, oversample_ratio, importance_sample_ratio,dn="no",dn_losses=[], panoptic_on=False, semantic_ce_loss=False,
                  num_spikelet_points=50, point_cost_coord=5.0, point_cost_class=2.0,
                  point_focal_alpha=0.25, point_empty_cls_weight=1.0, point_coord_norm="box_axis",
-                 point_coord_robust_c=0.0, point_nms_mode="none", point_nms_kappa=0.07):
+                 point_coord_robust_c=0.0, point_nms_mode="none", point_nms_kappa=0.07,
+                 point_coral_exist=False):
         """Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
@@ -198,6 +200,8 @@ class SetCriterion(nn.Module):
         # 本次 forward 内累计的 NMS 统计（每次 forward 开头清零，末尾写进 EventStorage）：
         # [被压 token 数, token 总数, 饿死实例数（留下的 token 少于 Ni）, Ni>0 的实例数]
         self._point_nms_stats = [0, 0, 0, 0]
+        # POINT_CORAL_EXIST：前缀内层匹配 + CORAL 存在性损失（见 _inner_point_match / loss_points）
+        self.point_coral_exist = point_coral_exist
 
     def loss_labels_ce(self, outputs, targets, indices, num_masks):
         """Classification loss (NLL)
@@ -381,7 +385,7 @@ class SetCriterion(nn.Module):
         return wh / wh.prod().sqrt().clamp(min=1e-12)
 
     @torch.no_grad()
-    def _inner_point_match(self, pred_rel, pred_logit, gt_rel, iso_scale=None, robust=False):
+    def _inner_point_match(self, pred_rel, pred_logit, gt_rel, iso_scale=None, robust=False, prefix_match=False):
         """逐实例内层匈牙利匹配：把 P 个预测点匹配到 Ni 个 GT 小穗。
         Args:
             pred_rel:   [P, 2]  预测点（框相对归一化坐标）
@@ -389,6 +393,8 @@ class SetCriterion(nn.Module):
             gt_rel:     [Ni, 2] GT 小穗（框相对归一化坐标）
             iso_scale:  [2] 或 None，_point_iso_scale 的返回值；非 None 时坐标代价在各向同性空间算
             robust:     True 时坐标代价用 _point_coord_rho（与该输出的 L1 损失同一函数）
+            prefix_match: True 时走 CORAL 前缀匹配（slot 语义层专用，由 loss_points 按
+                        point_coral_exist and not abs_frame 传入；group 层 token 语义不可用）
         Returns:
             (row_ind, col_ind): 匹配的预测点索引与 GT 索引（长度均为 min(P, Ni)=Ni）
         """
@@ -396,6 +402,16 @@ class SetCriterion(nn.Module):
         if Ni == 0:
             empty = torch.zeros(0, dtype=torch.int64, device=pred_rel.device)
             return empty, empty
+        if prefix_match:
+            # 前缀模式：只有前 m=min(Ni,P) 个 slot 可以被配。它们全是正样本，存在性代价对所有分配都一样，
+            # 故代价只剩坐标 L1。Ni<=P 时是 [Ni,Ni] 的方阵，前缀内任意排列；Ni>P 时 P 个 slot 按坐标挑 P 个 GT。
+            # 于是「slot k 被配上 <=> k < min(Ni,P)」，存在性目标恰好是 CORAL 的 levels。
+            m = min(Ni, pred_rel.shape[0])
+            C = torch.cdist(pred_rel[:m].float(), gt_rel.float(), p=1).cpu()   # [m, Ni]
+            row_ind, col_ind = linear_sum_assignment(C)
+            row_ind = torch.as_tensor(row_ind, dtype=torch.int64, device=pred_rel.device)
+            col_ind = torch.as_tensor(col_ind, dtype=torch.int64, device=pred_rel.device)
+            return row_ind, col_ind
         alpha, gamma = self.point_focal_alpha, 2.0
         # AMP 下统一用 float32 计算代价，避免 half 精度的 cdist / log 问题
         pred_rel = pred_rel.float()
@@ -491,6 +507,8 @@ class SetCriterion(nn.Module):
         coord_loss = torch.zeros([], device=device)
         cls_loss = torch.zeros([], device=device)
         num_pos = 0  # 总匹配小穗数，用于归一化
+        # POINT_CORAL_EXIST：逐实例收集存在性 logit / 前缀目标 / 权重，循环后一次算 CORAL 损失
+        coral_logits, coral_levels_, coral_weights = [], [], []
 
         for b, (src_idx, tgt_idx) in enumerate(indices):
             if src_idx.numel() == 0:
@@ -536,9 +554,11 @@ class SetCriterion(nn.Module):
                 iso_scale = self._point_iso_scale(wh, image_wh)
                 keep = None if keep_b is None else keep_b[k]
                 if keep is None:
-                    row_ind, col_ind = self._inner_point_match(pred_rel, pred_lg, gt_rel, iso_scale, robust=abs_frame)
+                    row_ind, col_ind = self._inner_point_match(pred_rel, pred_lg, gt_rel, iso_scale, robust=abs_frame,
+                                                               prefix_match=self.point_coral_exist and not abs_frame)
                 else:
                     # 只让留下的 token 进内层匹配，匹配下标再映射回 P 个 token 的下标
+                    # （keep 只在 abs_frame 下出现，与前缀匹配互斥，故 prefix_match=False）
                     kidx = kidx_b[off_b[k]:off_b[k + 1]]
                     n_keep = n_keep_b[k]
                     row_ind, col_ind = self._inner_point_match(
@@ -564,28 +584,44 @@ class SetCriterion(nn.Module):
                     else:
                         coord_loss = coord_loss + F.l1_loss(pred_m, gt_m, reduction='sum')
 
-                # 存在性 focal 损失（全部 P 个点；有 NMS 掩码时只对留下的求和，见下）
-                prob = pred_lg.sigmoid()
-                ce = F.binary_cross_entropy_with_logits(pred_lg, tgt_exist, reduction='none')
-                p_t = prob * tgt_exist + (1 - prob) * (1 - tgt_exist)
-                focal = ce * ((1 - p_t) ** gamma)
-                alpha_t = alpha * tgt_exist + (1 - alpha) * (1 - tgt_exist)
-                focal = alpha_t * focal
                 # Ni==0 的 wheat 实例贡献 P 个纯负样本，但推理时按类别门控、
                 # 它们本就不输出点，这部分监督只在误分类时生效，故可降权。
                 w = 1.0 if Ni > 0 else self.point_empty_cls_weight
-                if keep is None:
-                    cls_loss = cls_loss + focal.sum() * w
+                if self.point_coral_exist and not abs_frame:
+                    # 前缀匹配下 tgt_exist 就是 levels = [1]*min(Ni,P) + [0]*(P-min(Ni,P))
+                    coral_logits.append(pred_lg.squeeze(-1))
+                    coral_levels_.append(tgt_exist.squeeze(-1))
+                    coral_weights.append(w)
                 else:
-                    # NMS 压掉的 token 不算存在性损失（贡献 0、梯度 0），只对留下的求和
-                    cls_loss = cls_loss + focal[kidx].sum() * w
+                    # 存在性 focal 损失（全部 P 个点；有 NMS 掩码时只对留下的求和，见下）
+                    prob = pred_lg.sigmoid()
+                    ce = F.binary_cross_entropy_with_logits(pred_lg, tgt_exist, reduction='none')
+                    p_t = prob * tgt_exist + (1 - prob) * (1 - tgt_exist)
+                    focal = ce * ((1 - p_t) ** gamma)
+                    alpha_t = alpha * tgt_exist + (1 - alpha) * (1 - tgt_exist)
+                    focal = alpha_t * focal
+                    if keep is None:
+                        cls_loss = cls_loss + focal.sum() * w
+                    else:
+                        # NMS 压掉的 token 不算存在性损失（贡献 0、梯度 0），只对留下的求和
+                        cls_loss = cls_loss + focal[kidx].sum() * w
 
                 num_pos += Ni
 
         denom = max(num_pos, 1)
+        if self.point_coral_exist:
+            # CORAL：每实例 P 个任务的 BCE 取均值，实例间按 w 加权平均（口径与基线的 sum/num_pos 不同，
+            # 见 maskdino/modeling/coral.py 与 experiments-bank/ideas/coral-exist.md）
+            if coral_logits:
+                wt = torch.as_tensor(coral_weights, device=device, dtype=torch.float32)
+                cls_term = coral_loss(torch.stack(coral_logits), torch.stack(coral_levels_), wt)
+            else:
+                cls_term = pred_logits.sum() * 0.0
+        else:
+            cls_term = cls_loss / denom
         losses = {
             'loss_point_coord': coord_loss / denom,
-            'loss_point_cls': cls_loss / denom,
+            'loss_point_cls': cls_term,
         }
         return losses
 
