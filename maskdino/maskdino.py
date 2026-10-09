@@ -211,6 +211,7 @@ class MaskDINO(nn.Module):
             point_coord_robust_c=cfg.MODEL.MaskDINO.POINT_COORD_ROBUST_C,
             point_nms_mode=cfg.MODEL.MaskDINO.POINT_NMS_MODE,
             point_nms_kappa=cfg.MODEL.MaskDINO.POINT_NMS_KAPPA,
+            point_nms_suppressed=cfg.MODEL.MaskDINO.POINT_NMS_SUPPRESSED,
         )
 
         return {

@@ -148,7 +148,8 @@ class SetCriterion(nn.Module):
                  num_points, oversample_ratio, importance_sample_ratio,dn="no",dn_losses=[], panoptic_on=False, semantic_ce_loss=False,
                  num_spikelet_points=50, point_cost_coord=5.0, point_cost_class=2.0,
                  point_focal_alpha=0.25, point_empty_cls_weight=1.0, point_coord_norm="box_axis",
-                 point_coord_robust_c=0.0, point_nms_mode="none", point_nms_kappa=0.07):
+                 point_coord_robust_c=0.0, point_nms_mode="none", point_nms_kappa=0.07,
+                 point_nms_suppressed="ignore"):
         """Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
@@ -195,6 +196,9 @@ class SetCriterion(nn.Module):
         assert point_nms_mode in ("none", "match"), f"未知 POINT_NMS_MODE: {point_nms_mode}"
         self.point_nms_mode = point_nms_mode
         self.point_nms_kappa = point_nms_kappa
+        # 被 NMS 压掉的 token 的存在性监督（config.py 的 POINT_NMS_SUPPRESSED）："ignore" 不算，"negative" 判负
+        assert point_nms_suppressed in ("ignore", "negative"), f"未知 POINT_NMS_SUPPRESSED: {point_nms_suppressed}"
+        self.point_nms_suppressed = point_nms_suppressed
         # 本次 forward 内累计的 NMS 统计（每次 forward 开头清零，末尾写进 EventStorage）：
         # [被压 token 数, token 总数, 饿死实例数（留下的 token 少于 Ni）, Ni>0 的实例数]
         self._point_nms_stats = [0, 0, 0, 0]
@@ -472,9 +476,13 @@ class SetCriterion(nn.Module):
             1) 输出里带 pred_point_keep（[B, Q, P] bool，decoder 逐层剔除时给出）→ 取 [b, q]；
             2) 否则 POINT_NMS_MODE != "none" 且是小穗 token 的绝对坐标输出 → 用所配 GT 框做 NMS（_point_nms_keep）；
             3) 否则 keep=None，走原路径（与不加 NMS 时逐位一致）。
-          keep 非 None 时只有留下的 token 进内层匹配，下标再映射回 P 个；存在性 focal 只对留下的 token
-          求和（被压掉的贡献 0），坐标损失仍只算配上的；Ni=0 的实例同样处理；分母不变；
+          keep 非 None 时只有留下的 token 进内层匹配，下标再映射回 P 个；坐标损失仍只算配上的；
+          存在性 focal 对谁求和由 POINT_NMS_SUPPRESSED 定：
+            "ignore"（默认）  只对留下的 token 求和，被压掉的贡献 0、梯度 0；
+            "negative"        对全部 P 个 token 求和：被压掉的不在 row_ind 里，目标为 0，照常判负（与 keep=None 同式）。
+          两种取值的匹配、坐标损失、统计都相同；Ni=0 的实例同样处理；分母不变；
           留下的少于 Ni 时不补回（多出的 GT 小穗本层没有配对）。
+          keep 来自 pred_point_keep（来源 1）时开关语义同样成立，但只在 match 模式（来源 2）下验证过。
         """
         assert 'pred_point_coords' in outputs and 'pred_point_logits' in outputs
         pred_coords = outputs['pred_point_coords']   # [B, Q, P, 2]
@@ -564,7 +572,7 @@ class SetCriterion(nn.Module):
                     else:
                         coord_loss = coord_loss + F.l1_loss(pred_m, gt_m, reduction='sum')
 
-                # 存在性 focal 损失（全部 P 个点；有 NMS 掩码时只对留下的求和，见下）
+                # 存在性 focal 损失（全部 P 个点；有 NMS 掩码且 POINT_NMS_SUPPRESSED="ignore" 时只对留下的求和，见下）
                 prob = pred_lg.sigmoid()
                 ce = F.binary_cross_entropy_with_logits(pred_lg, tgt_exist, reduction='none')
                 p_t = prob * tgt_exist + (1 - prob) * (1 - tgt_exist)
@@ -574,10 +582,12 @@ class SetCriterion(nn.Module):
                 # Ni==0 的 wheat 实例贡献 P 个纯负样本，但推理时按类别门控、
                 # 它们本就不输出点，这部分监督只在误分类时生效，故可降权。
                 w = 1.0 if Ni > 0 else self.point_empty_cls_weight
-                if keep is None:
+                if keep is None or self.point_nms_suppressed == "negative":
+                    # 无 NMS 掩码，或 POINT_NMS_SUPPRESSED="negative"：全部 P 个 token 都算。
+                    # 被压掉的 token 不在 row_ind 里（只有留下的进了匹配），tgt_exist 为 0，即判负
                     cls_loss = cls_loss + focal.sum() * w
                 else:
-                    # NMS 压掉的 token 不算存在性损失（贡献 0、梯度 0），只对留下的求和
+                    # "ignore"：NMS 压掉的 token 不算存在性损失（贡献 0、梯度 0），只对留下的求和
                     cls_loss = cls_loss + focal[kidx].sum() * w
 
                 num_pos += Ni

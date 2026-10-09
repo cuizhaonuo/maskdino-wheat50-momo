@@ -120,12 +120,13 @@ def add_maskdino_config(cfg):
     # （c=1、|e|=0.05 处差 2.5%），远处梯度 1/(1+|e|/c)，方向由已定位好的实例主导。
     # 0 = 纯 L1。只作用于绝对坐标输出，layer-0 / interm 的 MLP 点头不受影响。
     cfg.MODEL.MaskDINO.POINT_COORD_ROBUST_C = 0.0
-    # ---- 小穗 token 的点 NMS（mini/group-nms-match、mini/group-nms-prune）----
+    # ---- 小穗 token 的点 NMS（mini/group-nms-match、mini/group-nms-prune、mini/group-nms-match-neg）----
     # 来源：DDQ（Zhang et al., "Dense Distinct Query for End-to-End Object Detection", CVPR 2023）：
     # 每个 refine 阶段前做 class-agnostic NMS，被压掉的 query 不进匹配、不算任何损失，推理时同样做。
     # 这里只作用于分组 decoder 的小穗 token 输出（第 1~9 层，pred_point_abs=True）：内层匈牙利匹配前，
     # 按存在性分数对 K 个 token 做贪心 NMS（坐标与分数 detach），中心距 < κ·sqrt(w·h) 算重复。
-    # 被压掉的 token 存在性与坐标损失都不算；留下但没配上的照常判负；损失分母（GT 小穗数）不变；
+    # 被压掉的 token 不进匹配、没有坐标损失，存在性损失算不算由 POINT_NMS_SUPPRESSED 定（默认不算）；
+    # 留下但没配上的照常判负；损失分母（GT 小穗数）不变；
     # 不做「留下的少于 Ni 时补回」。layer-0 / interm 的 MLP 点头不受影响。
     # "none"  = 不做（与不加此功能时逐位一致）；
     # "match" = 只在匹配与损失侧做，前向不变：criterion 用所配 GT 框在 iso 空间逐层做 NMS，
@@ -139,6 +140,16 @@ def add_maskdino_config(cfg):
     # LSJ 训练把图缩放 0.1~2.0 倍，像素半径不能写死，所以按框尺度归一化。
     # 按中心距理解：「两个半径 8 px 的圆有重叠」等于中心距 16 px，会把约一半相邻的真小穗并掉。
     cfg.MODEL.MaskDINO.POINT_NMS_KAPPA = 0.07
+    # 被 NMS 压掉的 token 的存在性监督（mini/group-nms-match-neg）。两种取值的匹配与坐标损失完全相同：
+    # 只有留下的 token 进内层匹配（正样本只能从留下的里选），坐标损失只算配上的；差别只在存在性 focal 对谁求和。
+    # "ignore"   = 被压的不算存在性损失（贡献 0、梯度 0），只对留下的求和。arm A（mini/group-nms-match）的做法；
+    #              默认值，与不加此开关时逐位一致。
+    # "negative" = 被压的照常判负：存在性目标为 0、focal 照常计入，即对全部 K 个 token 求和（与 POINT_NMS_MODE
+    #              "none" 同一个式子）。依据：arm A 的被压 token 不判负，近重复变多（阈值后、不带推理 NMS 的
+    #              <3 px 重复点 A 0.69% 对 E3 0.39%）。
+    # 只在有存活掩码时起作用（POINT_NMS_MODE="match"，或输出里带 pred_point_keep）。存活掩码来自 pred_point_keep
+    # （decoder 逐层剔除，mini/group-nms-prune）时语义同样成立，但只在 match 模式下验证过。
+    cfg.MODEL.MaskDINO.POINT_NMS_SUPPRESSED = "ignore"
     # True = 存在性头 point_class_embed 用 3 层 MLP（与坐标头 point_coord_embed 对齐），
     # False = 保持单层 nn.Linear。点头参数 12,850 -> 144,434。
     # 【口径】08-25 在 overfit10 上三向同时改善，但 08-26 的 val 检验判定 mF1 优势是记忆

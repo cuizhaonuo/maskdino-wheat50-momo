@@ -1,4 +1,4 @@
-"""小穗点诊断：mini/iso-norm（E1）、mini/group-decoder（E3）与 mini/group-nms-{match,prune} 预注册里的机制判据。
+"""小穗点诊断：mini/iso-norm（E1）、mini/group-decoder（E3）与 mini/group-nms-{match,prune,match-neg} 预注册里的机制判据。
 
 在 val 上跑一遍推理，把点存在性阈值临时放到 -1、推理侧点 NMS 临时关掉，拿到每个实例的全部 K 个点及其分数
 （模型给出存活掩码 pred_point_keep 时一并取出）。对配对上的 wheat_2（wheat_2 预测、score >= 阈值、mask IoU >= 阈值，
@@ -26,6 +26,13 @@
   - auc_surv：最终层上「存活（有 keep 时）∧ 过了推理 NMS」的 token 的 AUC。正样本定义与旧 auc 相同
           （纯距离匈牙利、配上且 <= σ），只是参与匹配的 token 换成这些留下的；另附「标签取自全部 K 个
           token 的匹配」的版本（value_labels_from_all_k）作对照。
+  - auc_supneg（mini/group-nms-match-neg 新增）：最终层全部 K 个 token 的 AUC，被压掉的 token（不在 auc_surv 的
+          「留下」里）一律记负，留下的 token 标签与 auc_surv 相同；value_labels_from_all_k 为「全部 K 个 token 的匹配
+          标签 ∧ 留下」。推理侧 NMS 关、也没有存活掩码时，与旧 auc 相同。NMS 按分数降序压，被压的 token 总比附近
+          某个留下的分低，所以它天然高于旧 auc / auc_surv，只能与别的 run 的 auc_supneg 互比。
+  - auc_rule：按配置的 POINT_NMS_SUPPRESSED 指向与训练规则一致的那个 AUC："ignore"（被压的不算损失）→ auc_surv，
+          "negative"（被压的判负）→ auc_supneg。两者每次都算，这里只记录对应关系，不改任何旧指标。
+          flip 不随这个开关变：两种取值的内层匹配相同（都只让留下的 token 进匹配），开关只改存在性 focal 对谁求和。
   - coverage：全部 K 个 token、只用留下的 token，分别与 GT 做纯距离一对一匈牙利，<= σ 的 GT 比例，
           及两者之差（百分点；即 NMS 造成的 σ 覆盖损失）。
   - readout_model：模型自己的读数规则，即 存活 ∧ 推理 NMS ∧ score > τ，F1 应与内置评估一致（自检）；
@@ -267,6 +274,9 @@ def main():
     else:
         match_kappa = md.POINT_NMS_KAPPA if md.POINT_NMS_MODE != "none" else None
     infer_kappa = float(md.TEST.POINT_NMS_KAPPA if a.nms_kappa is None else a.nms_kappa)
+    # 被压 token 的存在性监督（训练侧开关），只决定 auc_rule 指向 auc_surv 还是 auc_supneg
+    suppressed_rule = md.POINT_NMS_SUPPRESSED
+    assert suppressed_rule in ("ignore", "negative"), f"未知 POINT_NMS_SUPPRESSED: {suppressed_rule}"
 
     ds = cfg.DATASETS.TEST[0]
     t = md.TEST
@@ -282,6 +292,7 @@ def main():
     pair_data = []   # 每个配对穗的 (全部点, 分数, GT 点)，供阈值扫描
     # 新指标的累计
     surv_s, surv_l, surv_l_allk = [], [], []
+    supneg_s, supneg_l, supneg_l_allk = [], [], []
     cov_all = cov_kept = cov_gt = n_tok_all = n_tok_kept = 0
     ro_model, ro_nonms = _Readout(), _Readout()
     flip_ok = None          # 是否是分组 decoder（第 1~9 层都是绝对坐标的小穗 token）
@@ -376,6 +387,12 @@ def main():
                     surv_s.extend(s_s.tolist())
                     surv_l.extend(lab_v.tolist())
                     surv_l_allk.extend(lab[surv].tolist())
+                    # auc_supneg：全部 K 个 token，被压掉的一律记负，留下的标签同 auc_surv
+                    lab_sn = np.zeros(len(P_all), dtype=bool)
+                    lab_sn[np.flatnonzero(surv)] = lab_v
+                    supneg_s.extend(s.tolist())
+                    supneg_l.extend(lab_sn.tolist())
+                    supneg_l_allk.extend((lab & surv).tolist())
                     cov_all += int((d_a <= a.sigma).sum())
                     cov_kept += int((d_v <= a.sigma).sum())
                     cov_gt += len(G)
@@ -445,11 +462,18 @@ def main():
         "config_POINT_NMS_MODE": md.POINT_NMS_MODE,
         "config_POINT_NMS_KAPPA": md.POINT_NMS_KAPPA,
         "config_TEST_POINT_NMS_KAPPA": md.TEST.POINT_NMS_KAPPA,
+        "config_POINT_NMS_SUPPRESSED": suppressed_rule,
     }
     res["auc_surv"] = {"value": _auc(surv_s, surv_l), "n_tokens": len(surv_l),
                        "pos_rate": float(np.mean(surv_l)) if surv_l else float("nan"),
                        "value_labels_from_all_k": _auc(surv_s, surv_l_allk),
                        "kept_token_frac": n_tok_kept / n_tok_all if n_tok_all else float("nan")}
+    res["auc_supneg"] = {"value": _auc(supneg_s, supneg_l), "n_tokens": len(supneg_l),
+                         "pos_rate": float(np.mean(supneg_l)) if supneg_l else float("nan"),
+                         "value_labels_from_all_k": _auc(supneg_s, supneg_l_allk),
+                         "suppressed_token_frac": 1.0 - n_tok_kept / n_tok_all if n_tok_all else float("nan")}
+    rule_key = "auc_surv" if suppressed_rule == "ignore" else "auc_supneg"
+    res["auc_rule"] = {"POINT_NMS_SUPPRESSED": suppressed_rule, "metric": rule_key, "value": res[rule_key]["value"]}
     c_all = cov_all / cov_gt if cov_gt else float("nan")
     c_kept = cov_kept / cov_gt if cov_gt else float("nan")
     res["coverage"] = {"sigma": a.sigma, "all_k": c_all, "kept": c_kept,
