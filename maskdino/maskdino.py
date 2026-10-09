@@ -166,6 +166,10 @@ class MaskDINO(nn.Module):
         weight_dict.update({"loss_bbox":box_weight,"loss_giou":giou_weight})
         # 小穗点损失（随 _interm / _{i} 深监督自动带上；dn 不计算点损失，其 _dn 权重存在但不会被产生，无害）
         weight_dict.update({"loss_point_coord": point_coord_weight, "loss_point_cls": point_cls_weight})
+        # KMO 的 ŷ^k 回归损失：必须在下面的 _interm / _dn / _{i} 展开之前加入，
+        # 否则各层的 loss_point_knn* 会在 forward 末尾因不在 weight_dict 里而被 pop 掉
+        if cfg.MODEL.MaskDINO.POINT_KMO:
+            weight_dict.update({"loss_point_knn": cfg.MODEL.MaskDINO.POINT_KNN_WEIGHT})
         # two stage is the query selection scheme
         if cfg.MODEL.MaskDINO.TWO_STAGE:
             interm_weight_dict = {}
@@ -215,6 +219,9 @@ class MaskDINO(nn.Module):
             point_nms_mode=cfg.MODEL.MaskDINO.POINT_NMS_MODE,
             point_nms_kappa=cfg.MODEL.MaskDINO.POINT_NMS_KAPPA,
             point_coral_exist=cfg.MODEL.MaskDINO.POINT_CORAL_EXIST,
+            point_kmo=cfg.MODEL.MaskDINO.POINT_KMO,
+            point_kmo_k=cfg.MODEL.MaskDINO.POINT_KMO_K,
+            point_cost_knn=cfg.MODEL.MaskDINO.COST_POINT_KNN_WEIGHT,
         )
 
         return {

@@ -138,6 +138,25 @@ def calculate_uncertainty(logits):
     return -(torch.abs(gt_class_logits))
 
 
+def knn_mean_distance(pts: torch.Tensor, k: int) -> torch.Tensor:
+    """KMO 的 y^k（CLTR Eq.3）：每个点到其 k 个最近邻（不含自身）的平均欧氏距离。
+    与官方 CLTR dataset.caculate_knn_distance 逐值一致：N<=k 时对仅有的 N-1 个邻居取均值，N==1 时为 0。
+    Args:
+        pts: [N, 2] 点坐标
+        k:   近邻数（不含自身）
+    Returns:
+        [N, 1]
+    """
+    n = pts.shape[0]
+    if n <= 1:
+        return pts.new_zeros((n, 1))
+    # 直接求差取范数，不用 torch.cdist：N>25 时 cdist 会切到矩阵乘法近似，与 cKDTree 对不上
+    dist = (pts[:, None, :] - pts[None, :, :]).norm(dim=-1)        # [N, N]
+    dist.fill_diagonal_(float("inf"))
+    knn = dist.topk(min(k, n - 1), dim=1, largest=False).values    # [N, k_eff]
+    return knn.mean(dim=1, keepdim=True)
+
+
 class SetCriterion(nn.Module):
     """This class computes the loss for DETR.
     The process happens in two steps:
@@ -150,7 +169,8 @@ class SetCriterion(nn.Module):
                  num_spikelet_points=50, point_cost_coord=5.0, point_cost_class=2.0,
                  point_focal_alpha=0.25, point_empty_cls_weight=1.0, point_coord_norm="box_axis",
                  point_coord_robust_c=0.0, point_nms_mode="none", point_nms_kappa=0.07,
-                 point_coral_exist=False):
+                 point_coral_exist=False,
+                 point_kmo=False, point_kmo_k=3, point_cost_knn=5.0):
         """Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
@@ -202,6 +222,10 @@ class SetCriterion(nn.Module):
         self._point_nms_stats = [0, 0, 0, 0]
         # POINT_CORAL_EXIST：前缀内层匹配 + CORAL 存在性损失（见 _inner_point_match / loss_points）
         self.point_coral_exist = point_coral_exist
+        # KMO（CLTR Eq.3）：内层代价加近邻上下文项 |ŷ^k - y^k|，并对 ŷ^k 做 L1 监督
+        self.point_kmo = point_kmo
+        self.point_kmo_k = point_kmo_k            # 近邻数 K（不含自身）
+        self.point_cost_knn = point_cost_knn      # 内层匹配中 KMO 项的权重
 
     def loss_labels_ce(self, outputs, targets, indices, num_masks):
         """Classification loss (NLL)
@@ -385,7 +409,8 @@ class SetCriterion(nn.Module):
         return wh / wh.prod().sqrt().clamp(min=1e-12)
 
     @torch.no_grad()
-    def _inner_point_match(self, pred_rel, pred_logit, gt_rel, iso_scale=None, robust=False, prefix_match=False):
+    def _inner_point_match(self, pred_rel, pred_logit, gt_rel, iso_scale=None, robust=False, prefix_match=False,
+                           pred_knn=None, gt_knn=None):
         """逐实例内层匈牙利匹配：把 P 个预测点匹配到 Ni 个 GT 小穗。
         Args:
             pred_rel:   [P, 2]  预测点（框相对归一化坐标）
@@ -395,6 +420,9 @@ class SetCriterion(nn.Module):
             robust:     True 时坐标代价用 _point_coord_rho（与该输出的 L1 损失同一函数）
             prefix_match: True 时走 CORAL 前缀匹配（slot 语义层专用，由 loss_points 按
                         point_coral_exist and not abs_frame 传入；group 层 token 语义不可用）
+            pred_knn:   [P, 1]  预测的近邻平均距离 ŷ^k；传入才加 KMO 代价项（slot 语义层限定，
+                        group 层 dict 无 pred_point_knn，自然跳过）
+            gt_knn:     [Ni, 1] GT 的 y^k；不传则由 gt_rel 现算（诊断脚本走这条路）
         Returns:
             (row_ind, col_ind): 匹配的预测点索引与 GT 索引（长度均为 min(P, Ni)=Ni）
         """
@@ -428,6 +456,13 @@ class SetCriterion(nn.Module):
         else:
             cost_coord = torch.cdist(pred_rel, gt_rel, p=1)   # [P, Ni]
         C = self.point_cost_coord * cost_coord + self.point_cost_class * cost_class  # [P, Ni]
+        if pred_knn is not None:
+            # KMO（CLTR Eq.3）：再加近邻上下文代价 |ŷ^k - y^k|（按传入与否判断，不按全局 flag，
+            # group 层无 pred_point_knn 自然跳过）
+            if gt_knn is None:
+                gt_knn = knn_mean_distance(gt_rel, self.point_kmo_k)
+            cost_knn = torch.cdist(pred_knn.float(), gt_knn.float(), p=1)    # [P, Ni]
+            C = C + self.point_cost_knn * cost_knn
         C = C.cpu()
         row_ind, col_ind = linear_sum_assignment(C)
         row_ind = torch.as_tensor(row_ind, dtype=torch.int64, device=pred_rel.device)
@@ -477,7 +512,7 @@ class SetCriterion(nn.Module):
 
     def loss_points(self, outputs, targets, indices, num_masks):
         """逐实例小穗点损失：对每个外层匹配到的实例，做内层匈牙利匹配后计算
-        点坐标 L1 损失 + 点存在性 focal 损失。
+        点坐标 L1 损失 + 点存在性 focal 损失（KMO 开启时再加 ŷ^k 的 L1 损失）。
         - 点坐标采用"实例框相对归一化"[0,1]：用匹配到的 GT 框把 GT 小穗换算到框相对坐标。
           POINT_COORD_NORM="iso" 时，误差（内层代价与 L1）再换到各向同性空间计算，见 _point_iso_scale。
         - outputs['pred_point_abs']=True（分组 decoder 的小穗 token）：预测是图像归一化绝对坐标，
@@ -496,6 +531,8 @@ class SetCriterion(nn.Module):
         pred_coords = outputs['pred_point_coords']   # [B, Q, P, 2]
         pred_logits = outputs['pred_point_logits']   # [B, Q, P, 1]
         abs_frame = bool(outputs.get('pred_point_abs', False))
+        # per-dict 分派：group 层 dict 无 pred_point_knn，自然跳过 KNN 代价与损失（不按全局 flag 断言）
+        pred_knns = outputs.get('pred_point_knn')    # [B, Q, P, 1] 或 None
         device = pred_coords.device
         alpha, gamma = self.point_focal_alpha, 2.0
         # 小穗点 NMS 的存活掩码来源（见上）。pred_point_keep 一次搬到 CPU，逐实例取用
@@ -506,6 +543,7 @@ class SetCriterion(nn.Module):
 
         coord_loss = torch.zeros([], device=device)
         cls_loss = torch.zeros([], device=device)
+        knn_loss = torch.zeros([], device=device)
         num_pos = 0  # 总匹配小穗数，用于归一化
         # POINT_CORAL_EXIST：逐实例收集存在性 logit / 前缀目标 / 权重，循环后一次算 CORAL 损失
         coral_logits, coral_levels_, coral_weights = [], [], []
@@ -552,13 +590,21 @@ class SetCriterion(nn.Module):
                     gt_rel = gt_pts_img.new_zeros((0, 2))
 
                 iso_scale = self._point_iso_scale(wh, image_wh)
+                # KNN 上下文（KMO）：仅 slot 语义层（pred_knns 非 None）参与匹配与损失；group 层跳过。
+                # 前缀匹配（coral slot 层）下 _inner_point_match 提前 return、不用 pred_knn 作代价，
+                # 但匹配上的 slot 仍施加 ŷ^k 的 L1 监督（见下）。
+                pred_knn = gt_knn = None
+                if pred_knns is not None:
+                    pred_knn = pred_knns[b, q_i].float()                    # [P,1]
+                    gt_knn = knn_mean_distance(gt_rel, self.point_kmo_k)    # [Ni,1]，匹配与损失共用
                 keep = None if keep_b is None else keep_b[k]
                 if keep is None:
                     row_ind, col_ind = self._inner_point_match(pred_rel, pred_lg, gt_rel, iso_scale, robust=abs_frame,
-                                                               prefix_match=self.point_coral_exist and not abs_frame)
+                                                               prefix_match=self.point_coral_exist and not abs_frame,
+                                                               pred_knn=pred_knn, gt_knn=gt_knn)
                 else:
                     # 只让留下的 token 进内层匹配，匹配下标再映射回 P 个 token 的下标
-                    # （keep 只在 abs_frame 下出现，与前缀匹配互斥，故 prefix_match=False）
+                    # （keep 只在 abs_frame 下出现，与前缀匹配/KNN 均互斥）
                     kidx = kidx_b[off_b[k]:off_b[k + 1]]
                     n_keep = n_keep_b[k]
                     row_ind, col_ind = self._inner_point_match(
@@ -583,6 +629,10 @@ class SetCriterion(nn.Module):
                         coord_loss = coord_loss + self._point_coord_rho((pred_m - gt_m).abs(), True).sum()
                     else:
                         coord_loss = coord_loss + F.l1_loss(pred_m, gt_m, reduction='sum')
+                    if pred_knn is not None:
+                        # ŷ^k 的 L1 回归（仅匹配点）。官方 (x, y, d) 共用一个 L1，这里拆成独立的 key
+                        knn_loss = knn_loss + F.l1_loss(
+                            pred_knn[row_ind], gt_knn[col_ind], reduction='sum')
 
                 # Ni==0 的 wheat 实例贡献 P 个纯负样本，但推理时按类别门控、
                 # 它们本就不输出点，这部分监督只在误分类时生效，故可降权。
@@ -623,6 +673,8 @@ class SetCriterion(nn.Module):
             'loss_point_coord': coord_loss / denom,
             'loss_point_cls': cls_term,
         }
+        if pred_knns is not None:
+            losses['loss_point_knn'] = knn_loss / denom
         return losses
 
     def prep_for_dn(self,mask_dict):

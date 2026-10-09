@@ -103,7 +103,8 @@ def _grid_shape(n):
 # --------------------------------------------------------------------------
 # 数据收集：两张图共用，内层匹配只做一遍
 # --------------------------------------------------------------------------
-def _collect_items(criterion, pred_coords, pred_pt_logits, targets, indices, b, W, H, denom, abs_frame=False):
+def _collect_items(criterion, pred_coords, pred_pt_logits, targets, indices, b, W, H, denom,
+                   abs_frame=False, pred_knns=None):
     """整理第 b 张图每个 GT 实例的绘图数据。
 
     返回 (items, n_clamped_total)。items 已按"有小穗点优先、点多优先"排好序。
@@ -142,7 +143,10 @@ def _collect_items(criterion, pred_coords, pred_pt_logits, targets, indices, b, 
         n_clamped_total += n_clamped
 
         iso_scale = criterion._point_iso_scale(wh, targets[b].get("image_wh"))
-        row_ind, col_ind = criterion._inner_point_match(pred_rel, pred_lg, gt_rel, iso_scale, robust=abs_frame)
+        # POINT_KMO=True 时匹配多一项近邻代价，必须把 ŷ^k 一起传进去，画的才是 loss 用的配对
+        pred_knn = pred_knns[b, q_i] if pred_knns is not None else None
+        row_ind, col_ind = criterion._inner_point_match(pred_rel, pred_lg, gt_rel, iso_scale,
+                                                        robust=abs_frame, pred_knn=pred_knn)
 
         # 框相对 -> 原图像素
         bx0, by0 = float(x0) * W, float(y0) * H
@@ -502,6 +506,9 @@ def visualize_point_match(criterion, outputs, targets, indices, batched_inputs=N
 
     pred_coords = outputs["pred_point_coords"].detach().float()     # [B, Q, P, 2] 框相对
     pred_pt_logits = outputs["pred_point_logits"].detach().float()  # [B, Q, P, 1]
+    pred_knns = outputs.get("pred_point_knn")                       # [B, Q, P, 1]，仅 POINT_KMO=True
+    if pred_knns is not None:
+        pred_knns = pred_knns.detach().float()
     P = pred_coords.shape[2]
 
     # loss_points 的归一化分母 num_pos：整个 batch 里所有外层匹配实例的 GT 小穗点总数。
@@ -532,7 +539,8 @@ def visualize_point_match(criterion, outputs, targets, indices, batched_inputs=N
 
         items, n_clamped = _collect_items(criterion, pred_coords, pred_pt_logits,
                                           targets, indices, b, W, H, denom,
-                                          abs_frame=bool(outputs.get("pred_point_abs", False)))
+                                          abs_frame=bool(outputs.get("pred_point_abs", False)),
+                                          pred_knns=pred_knns)
         if not items:
             continue
         shown = items[:MAX_INSTANCES]
