@@ -170,6 +170,9 @@ class MaskDINO(nn.Module):
         # 否则各层的 loss_point_knn* 会在 forward 末尾因不在 weight_dict 里而被 pop 掉
         if cfg.MODEL.MaskDINO.POINT_KMO:
             weight_dict.update({"loss_point_knn": cfg.MODEL.MaskDINO.POINT_KNN_WEIGHT})
+        # combo：group 层 CoralHead 计数损失（挂实例 query，无需匹配；深监督展开同理）
+        if cfg.MODEL.MaskDINO.POINT_CORAL_EXIST and cfg.MODEL.MaskDINO.POINT_GROUP_DECODER:
+            weight_dict.update({"loss_point_coral": cfg.MODEL.MaskDINO.POINT_CLASS_WEIGHT})
         # two stage is the query selection scheme
         if cfg.MODEL.MaskDINO.TWO_STAGE:
             interm_weight_dict = {}
@@ -337,6 +340,10 @@ class MaskDINO(nn.Module):
             point_keep_results = outputs.get("pred_point_keep")
             if point_keep_results is None:
                 point_keep_results = [None] * len(batched_inputs)
+            # combo：最终层 instance query 的 CORAL 序数 logits（[B, Q, T]），推理给出计数 n_k
+            point_coral_results = outputs.get("pred_point_coral")
+            if point_coral_results is None:
+                point_coral_results = [None] * len(batched_inputs)
             # upsample masks
             mask_pred_results = F.interpolate(
                 mask_pred_results,
@@ -348,8 +355,8 @@ class MaskDINO(nn.Module):
             del outputs
 
             processed_results = []
-            for mask_cls_result, mask_pred_result, mask_box_result, point_coord_result, point_logit_result, point_keep_result, input_per_image, image_size in zip(
-                mask_cls_results, mask_pred_results, mask_box_results, point_coord_results, point_logit_results, point_keep_results, batched_inputs, images.image_sizes
+            for mask_cls_result, mask_pred_result, mask_box_result, point_coord_result, point_logit_result, point_keep_result, point_coral_result, input_per_image, image_size in zip(
+                mask_cls_results, mask_pred_results, mask_box_results, point_coord_results, point_logit_results, point_keep_results, point_coral_results, batched_inputs, images.image_sizes
             ):  # image_size is augmented size, not divisible to 32
                 height = input_per_image.get("height", image_size[0])  # real size
                 width = input_per_image.get("width", image_size[1])
@@ -387,7 +394,7 @@ class MaskDINO(nn.Module):
                         # 分组 decoder 的小穗点与框同为 padded 图像归一化坐标，用同一套缩放换到原图像素
                         point_coord_result = point_coord_result * point_coord_result.new_tensor([width, height])
 
-                    instance_r = retry_if_cuda_oom(self.instance_inference)(mask_cls_result, mask_pred_result, mask_box_result, point_coord_result, point_logit_result, point_keep=point_keep_result)
+                    instance_r = retry_if_cuda_oom(self.instance_inference)(mask_cls_result, mask_pred_result, mask_box_result, point_coord_result, point_logit_result, point_keep=point_keep_result, point_coral=point_coral_result)
                     processed_results[-1]["instances"] = instance_r
 
             return processed_results
@@ -526,8 +533,10 @@ class MaskDINO(nn.Module):
             return panoptic_seg, segments_info
 
     def instance_inference(self, mask_cls, mask_pred, mask_box_result, point_coords=None, point_logits=None,
-                           point_keep=None):
-        """point_keep: [Q, P] bool 或 None，小穗 token 的存活掩码（decoder 逐层剔除时给出），与点预测按同一套 topk 选。"""
+                           point_keep=None, point_coral=None):
+        """point_keep: [Q, P] bool 或 None，小穗 token 的存活掩码（decoder 逐层剔除时给出），与点预测按同一套 topk 选。
+        point_coral: [Q, T] 或 None，combo（分组 decoder + CORAL）最终层 instance query 的序数 logits，
+        推理按求和规则给出该实例的小穗计数 n_k（coral 管「数几个」，focal+NMS 管「选哪些」）。"""
         # mask_pred is already processed to have the same shape as original input
         image_size = mask_pred.shape[-2:]
         scores = mask_cls.sigmoid()  # [100, 80]
@@ -543,6 +552,8 @@ class MaskDINO(nn.Module):
             point_logits = point_logits[topk_indices]   # [K, P, 1]
             if point_keep is not None:
                 point_keep = point_keep[topk_indices]   # [K, P] bool
+            if point_coral is not None:
+                point_coral = point_coral[topk_indices]  # [K, T]
         # if this is panoptic segmentation, we only keep the "thing" classes
         if self.panoptic_on:
             keep = torch.zeros_like(scores_per_image).bool()
@@ -556,6 +567,8 @@ class MaskDINO(nn.Module):
                 point_logits = point_logits[keep]
                 if point_keep is not None:
                     point_keep = point_keep[keep]
+                if point_coral is not None:
+                    point_coral = point_coral[keep]
         result = Instances(image_size)
         # mask (before sigmoid)
         result.pred_masks = (mask_pred > 0).float()
@@ -585,7 +598,28 @@ class MaskDINO(nn.Module):
                 if int(labels_per_image[k].item()) == self.spikelet_class_id:
                     score_k = point_logits[k].sigmoid().squeeze(-1)   # [P]
                     keep_pt = score_k > self.point_threshold
-                    if self.point_coral_exist and not self.point_abs_coords:
+                    if self.point_abs_coords and self.point_coral_exist and point_coral is not None:
+                        # combo：coral 管「数几个」（最终层序数 logits 按 0.5 求和，与 BCE 标定一致，不占
+                        # TEST.POINT_THRESHOLD），focal+NMS 管「选哪些」（候选按分数取 top-n_k，
+                        # 候选不足 n_k 时全取——预注册写明的截断规则）
+                        n_k = int((point_coral[k].sigmoid() > 0.5).sum().item())
+                        x0, y0, x1, y1 = boxes_xyxy[k]
+                        bw = (x1 - x0).clamp(min=0)
+                        bh = (y1 - y0).clamp(min=0)
+                        xy_all = point_coords[k]                          # [P, 2] 已是像素（见 forward）
+                        if self.point_nms_kappa > 0:
+                            radius = self.point_nms_kappa * torch.sqrt(bw.clamp(min=1e-6) * bh.clamp(min=1e-6))
+                            keep_pt = keep_pt & greedy_point_nms(xy_all, score_k, radius)
+                        if point_keep is not None:
+                            keep_pt = keep_pt & point_keep[k].to(keep_pt.device)
+                        cand = keep_pt.nonzero(as_tuple=True)[0]          # 候选 token 下标
+                        # 按存在性分数降序取前 n_k 个（cand 不足 n_k 时全取）
+                        order = score_k[cand].argsort(descending=True)
+                        sel = cand[order[:n_k]]
+                        xy = xy_all[sel]
+                        keep_pt = torch.zeros_like(keep_pt)
+                        keep_pt[sel] = True
+                    elif self.point_coral_exist and not self.point_abs_coords:
                         # CE 原路径：按求和计数、取前缀，不要求 bias 已经排好序（定理 1 只保证最优点有序）
                         n_k = int(keep_pt.sum().item())
                         keep_pt = torch.arange(score_k.numel(), device=score_k.device) < n_k

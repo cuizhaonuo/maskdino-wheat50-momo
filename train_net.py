@@ -70,6 +70,7 @@ import weakref
 
 # 注册数据集
 from data_register import wheat_data, maize_rice_data, xinxiang_data, gwhd2021_data, wheat_data_cat1_quality, wheat_data_cat2, wheat_data_cat3
+from maskdino.modeling.coral import CoralHead
 
 
 # 小穗点头的参数名子串（decoder 中的 point_coord_embed / point_class_embed，
@@ -337,6 +338,10 @@ class Trainer(DefaultTrainer):
                 hyperparams = copy.copy(defaults)
                 if "backbone" in module_name:
                     hyperparams["lr"] = hyperparams["lr"] * cfg.SOLVER.BACKBONE_MULTIPLIER
+                # CoralHead 根级 bias（T 个序数阈值）：mini 实验诊断其收敛过慢/卡住，
+                # lr ×10 单独成组。MLP 内部的 bias（score.layers.N.bias）不受影响。
+                if isinstance(module, CoralHead) and module_param_name == "bias":
+                    hyperparams["lr"] = hyperparams["lr"] * 10
                 if (
                     "relative_position_bias_table" in module_param_name
                     or "absolute_pos_embed" in module_param_name

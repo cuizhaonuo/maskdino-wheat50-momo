@@ -25,7 +25,7 @@ from detectron2.projects.point_rend.point_features import (
 from ..utils.misc import is_dist_avail_and_initialized, nested_tensor_from_tensor_list
 from ..utils.point_nms import greedy_point_nms
 from maskdino.utils import box_ops
-from .coral import coral_loss
+from .coral import coral_loss, coral_levels
 
 try:
     # 正负样本匹配的 debug 可视化。要关掉请改各模块顶部的 ENABLED = False，
@@ -533,6 +533,9 @@ class SetCriterion(nn.Module):
         abs_frame = bool(outputs.get('pred_point_abs', False))
         # per-dict 分派：group 层 dict 无 pred_point_knn，自然跳过 KNN 代价与损失（不按全局 flag 断言）
         pred_knns = outputs.get('pred_point_knn')    # [B, Q, P, 1] 或 None
+        # combo 限定：group 层 instance query 上的 CORAL 序数 logits [B, Q, T]（ coral 管「数几个」，
+        # 监督目标是 min(Ni,P) 的 levels，由外层配对直接给出、不需内层匹配）
+        pred_coral = outputs.get('pred_point_coral')
         device = pred_coords.device
         alpha, gamma = self.point_focal_alpha, 2.0
         # 小穗点 NMS 的存活掩码来源（见上）。pred_point_keep 一次搬到 CPU，逐实例取用
@@ -547,6 +550,8 @@ class SetCriterion(nn.Module):
         num_pos = 0  # 总匹配小穗数，用于归一化
         # POINT_CORAL_EXIST：逐实例收集存在性 logit / 前缀目标 / 权重，循环后一次算 CORAL 损失
         coral_logits, coral_levels_, coral_weights = [], [], []
+        # combo 的 group 层 CORAL 计数头：逐实例收集序数 logit / levels 目标 / 权重（独立于上面的 slot 层路径）
+        coral2_logits, coral2_levels_, coral2_weights = [], [], []
 
         for b, (src_idx, tgt_idx) in enumerate(indices):
             if src_idx.numel() == 0:
@@ -637,6 +642,13 @@ class SetCriterion(nn.Module):
                 # Ni==0 的 wheat 实例贡献 P 个纯负样本，但推理时按类别门控、
                 # 它们本就不输出点，这部分监督只在误分类时生效，故可降权。
                 w = 1.0 if Ni > 0 else self.point_empty_cls_weight
+                if pred_coral is not None:
+                    # combo group 层：计数目标 = min(Ni, T) 的序数 levels，与内层匹配无关
+                    coral2_logits.append(pred_coral[b, q_i].float())
+                    coral2_levels_.append(coral_levels(
+                        torch.tensor(min(Ni, self.num_spikelet_points), device=device),
+                        self.num_spikelet_points))
+                    coral2_weights.append(w)
                 if self.point_coral_exist and not abs_frame:
                     # 前缀匹配下 tgt_exist 就是 levels = [1]*min(Ni,P) + [0]*(P-min(Ni,P))
                     coral_logits.append(pred_lg.squeeze(-1))
@@ -659,9 +671,10 @@ class SetCriterion(nn.Module):
                 num_pos += Ni
 
         denom = max(num_pos, 1)
-        if self.point_coral_exist:
+        if self.point_coral_exist and not abs_frame:
             # CORAL：每实例 P 个任务的 BCE 取均值，实例间按 w 加权平均（口径与基线的 sum/num_pos 不同，
-            # 见 maskdino/modeling/coral.py 与 experiments-bank/ideas/coral-exist.md）
+            # 见 maskdino/modeling/coral.py 与 experiments-bank/ideas/coral-exist.md）。
+            # combo 的 group 层（abs_frame=True）不走这里：存在性仍用 focal（下行），计数走 loss_point_coral。
             if coral_logits:
                 wt = torch.as_tensor(coral_weights, device=device, dtype=torch.float32)
                 cls_term = coral_loss(torch.stack(coral_logits), torch.stack(coral_levels_), wt)
@@ -675,6 +688,14 @@ class SetCriterion(nn.Module):
         }
         if pred_knns is not None:
             losses['loss_point_knn'] = knn_loss / denom
+        if pred_coral is not None:
+            # combo group 层的 CORAL 计数损失（独立 loss 键，权重 = POINT_CLASS_WEIGHT，见 maskdino.from_config）
+            if coral2_logits:
+                wt2 = torch.as_tensor(coral2_weights, device=device, dtype=torch.float32)
+                losses['loss_point_coral'] = coral_loss(
+                    torch.stack(coral2_logits), torch.stack(coral2_levels_), wt2)
+            else:
+                losses['loss_point_coral'] = pred_coral.sum() * 0.0
         return losses
 
     def prep_for_dn(self,mask_dict):
