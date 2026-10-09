@@ -1,6 +1,6 @@
 # 想法：小穗 token 逐层点 NMS 后再做内层匹配 · arm A（match：只在匹配与损失侧做）
 
-状态：**预注册，已开跑（2026-10-08 17:09:19 启动）** ｜ 提出 2026-10-08 ｜ 分支 `mini/group-nms-match`（从 `mini/group-decoder`@`00a7aaf` 开出，100 epoch）｜ 配置
+状态：**歧义（100 epoch，2026-10-09；主判据与 E0 持平，机制未启动，护栏 G 未过，计数次判据成立但收益来自推理 NMS）**，见 [exp-2026-10-08-mini-group-nms-match](../experiments/exp-2026-10-08-mini-group-nms-match.md) ｜ 提出 2026-10-08 ｜ 分支 `mini/group-nms-match`（从 `mini/group-decoder`@`00a7aaf` 开出，100 epoch）｜ 配置
 `wheat_joint_single_stage_mini_group_nms_match.yaml`（`_BASE_` 为 `wheat_joint_single_stage_mini_group.yaml`，即 E3 的配置）｜ 输出 `output_v2/exp-1008-mini-group-nms-match`
 ｜ 代码提交 `df90505`（共享 NMS 工具 + match 模式）｜ 启动提交 `1e73b5f`｜ 启动时间 2026-10-08 17:09:19，qiuhao A100（GPU1），与 arm B 的冒烟同卡
 
@@ -283,3 +283,32 @@ python myscripts/backup/vis_process/point_token_diag.py --sweep --run-dir output
   再加 match 的额外耗时估，约 13~15 h。另加 25 次评估，每次约 2.5~3 min，共约 1 h。
 - 峰值显存约 26~27 GB（冒烟 max_mem 25.9 G），只能用 qiuhao 的 A100（GPU1）。
 - 每次存 checkpoint 785 MB × 25 个，约 20 GB 磁盘。
+
+## 结论（2026-10-09）
+
+**歧义：主判据与 E0 持平（+0.00006）；机制未启动（M1、M2 未过），护栏 G 未过；计数次判据成立，但按预注册归因为「收益来自推理 NMS」；
+segm / recall 护栏过。** 按上面「预期与判否线」判，读数一律是默认读数（阈值 0.35、推理 NMS κ=0.05，未做阈值扫描）。
+run：`output_v2/exp-1008-mini-group-nms-match`（12500/12500 iter · 25/25 评估 · 0 报错）。
+详见 [exp-2026-10-08-mini-group-nms-match](../experiments/exp-2026-10-08-mini-group-nms-match.md)。
+
+| 判据 | 要求 | 实测 | |
+|:--|:--|:--|:--:|
+| M1 跨层改判率均值 | ≤ 0.0190 | 0.0325（E3 plain 0.0271，E3 + κ0.05 NMS 0.0319） | ❌ |
+| M2 AUC_surv | ≥ 0.7405 | 0.6663（E3 + κ0.05 NMS 0.6905） | ❌ |
+| 护栏 G 覆盖损失 | ≤ 2.15 个百分点 | 2.256（E3 + κ0.05 NMS 2.149） | ❌ |
+| 主判据：读数那次 `matched_F1@8`（对 E0） | ≥ 0.6428 成立；≤ E0（0.6227659）判否 | 0.6228289（iter 9999；比 E0 高 0.000063） | 歧义 |
+| 次判据：读数那次 `count_MAE_spike` | ≤ 2.21 | 2.120 | ✅ |
+| 护栏 `segm/AP` 全程峰值 | ≥ 77.80 | 78.15（@11499） | ✅ |
+| 护栏 `spike_recall` 全程峰值 | ≥ 0.9311 | 0.9494（@7499） | ✅ |
+| 归因：对「E3 + 推理 NMS κ0.05」（iter 9499：0.6348 / 2.312） | F1@8 ≥ 0.6548 或计数 ≤ 2.081 → 训练侧有贡献 | 0.6228 / 2.120 | 收益来自推理 NMS |
+| 归因：A 对 B（读数那次 F1@8 之差 ≤ 0.015 → 无差别） | — | 待 arm B 跑完 | — |
+
+诊断在 qiuhao GPU1 上跑（`output_v2/_diag-1009-group-nms/A_match.json`），`readout_model` 的 matched_F1@8 与计数与训练日志末值逐位相同。
+
+读法：
+
+- 跨层改判率 0.0325，与「E3 只加匹配前 NMS」的构造值 0.0319 相同：训练没有让匹配更稳。AUC_surv 比 E3 + 同样 NMS 低 0.024。
+- 被压的 token 不再被判负，A 的近重复比 E3 多（不带推理 NMS 时计数 3.02、偏差 +2.85）；打开推理 NMS 后与 E3 + 推理 NMS 打平。
+- 后半程 13 次评估里，A 的 matched_F1@8 有 12 次低于同 iter 的 E3 + 推理 NMS（均值 0.6274 对 0.6357）；计数均值相同（2.664 对 2.677）。
+  最终评估的计数（MAE 2.592、偏差 +2.37、r 0.563）与 E3 + 推理 NMS（2.597、+2.27、0.551）几乎重合。
+- 起步阶段（iter 39~319）token 塌缩、饿死 100%，A 与 E3（同种子）都有，不是 NMS 造成的；iter 879 起饿死 < 1%，后程为 0。
