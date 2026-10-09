@@ -1,0 +1,33 @@
+# ============================================================================
+# 完整集 · full/combo · coral-exist + kmo-matcher + group-nms-match 三合一完整模型
+#   预注册：experiments-bank/ideas/full-combo.md（判否线在跑之前写死）
+#   主参照：output_v2/exp-0922-single-stage-p30 及本批三个单点消融臂
+#
+# 组合语义（方案 b，用户决策 2026-10-09）：
+#   - slot 语义层（layer-0 / interm 的 MLP 点头）：CE 前缀内层匹配（纯坐标 L1，不加 knn 代价）
+#     + CoralHead 逐 slot 存在性 + KMO 的 loss_point_knn 辅助回归照常监督；
+#   - group 层（第 1~9 层小穗 token）：GN 的逐 token focal + 训练侧点 NMS 匹配；
+#     CoralHead 额外挂在实例 query 上输出 pred_point_coral [B,Q,T=30]，
+#     监督 = coral_levels(min(Ni, P))（无需匹配，新增 loss_point_coral，权重=POINT_CLASS_WEIGHT）；
+#   - 推理：coral 管「数几个」——n_k = 最终层 pred_point_coral sigmoid>0.5 求和（阈值 0.5 代码内固定，
+#     与 TEST.POINT_THRESHOLD 无关，故此处保持 0.35 用于 focal 候选过滤）；
+#     focal+NMS 管「选哪些」——token 分数 >0.35 ∧ 贪心 NMS 存活，按分数取 top-n_k。
+#
+# 与 full_group_nms_match 的差异【六处】：POINT_CORAL_EXIST + KM 四键（POINT_KMO/K/COST/LOSS
+# 权重）+ 上述 coral 上 group 层的代码语义。TEST.POINT_THRESHOLD 保持 0.35（见上）。
+# CoralHead 根级 bias lr ×10 由 train_net.py 参数组实现（mini CE 确诊 bias 卡住），预注册中声明。
+#
+# 用法：
+#   python train_net.py --num-gpus 1 \
+#     --config-file configs/coco/instance-segmentation/wheat_joint_single_stage_full_combo.yaml \
+#     OUTPUT_DIR /public/home/zncui/pycharm_project/maskdino-wheat50/output_v2/<run-name>
+# ============================================================================
+_BASE_: wheat_joint_single_stage_full_group_nms_match.yaml
+
+MODEL:
+  MaskDINO:
+    POINT_CORAL_EXIST: True
+    POINT_KMO: True
+    POINT_KMO_K: 3
+    COST_POINT_KNN_WEIGHT: 5.0
+    POINT_KNN_WEIGHT: 5.0

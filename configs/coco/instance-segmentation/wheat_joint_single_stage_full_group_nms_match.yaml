@@ -1,0 +1,44 @@
+# ============================================================================
+# 完整集 · full/group-nms-match · 分组 decoder + 小穗 token 逐层点 NMS 后再内层匹配（单点消融）
+#   预注册：experiments-bank/ideas/full-group-nms-match.md（判否线在跑之前写死）
+#   主参照：output_v2/exp-0922-single-stage-p30（26000 iter、300 query、P=30，segm 81.97 / MAE 2.77）
+#   mini 对应臂：mini/group-nms-match（MAE 2.120；判定歧义——收益主要来自推理 NMS，机制未启动）
+#
+# 【完整集消融口径 = NMS 也重训】（用户决策 2026-10-09）：不是只在 baseline checkpoint 上开推理
+# NMS 评测，而是训练侧 NMS 匹配 + 推理侧 NMS 同时打开从头训，与 mini 臂口径一致。
+#
+# 与 wheat_joint_single_stage.yaml 的差异（八处，= mini/group-decoder 结构四键 + NMS 两键 +
+# NUM_OBJECT_QUERIES/NUM_POINTS，全部继承 mini/group-nms-match 的语义）：
+#   1) NUM_OBJECT_QUERIES: 300 -> 100（GN 架构在 mini 即 100 query 验证；与 p30 的 300 query
+#      差异在预注册中声明，判读时需注意）
+#   2) NUM_POINTS: 25 -> 30（每穗 max 31、p99 22；按 Ki=30 设计）
+#   3) POINT_GROUP_DECODER: True —— 每个匹配 query 挂 K=30 个小穗 token；实例内 SA → 实例 token
+#      走原层 → 小穗 token 同 slot 跨实例 SA / 2-D 点 cross-attn / FFN → 参考点逐层细化。
+#   4) POINT_COORD_NORM: iso（各向同性误差）
+#   5) POINT_COORD_ROBUST_C: 1.0（小穗 token 绝对坐标初值离 GT 远，ρ(e)=c·log(1+|e|/c) 远处梯度变弱）
+#   6) POINT_NMS_MODE: none -> match（第 1~9 层在内层匈牙利前按存在性分数做贪心 NMS，κ·sqrt(w·h)，
+#      被压 token 不进匹配/不算损失；layer-0 与 interm 的 MLP 点头不受影响）
+#   7) POINT_NMS_KAPPA / TEST.POINT_NMS_KAPPA: κ = 0.05（训练/推理同值；E3 全 val 诊断后用户定）
+#   ACROSS_ATTN/DIM_FEEDFORWARD/WITHIN_GATE 为结构默认，显式写出便于对照。
+#
+# 用法：
+#   python train_net.py --num-gpus 1 \
+#     --config-file configs/coco/instance-segmentation/wheat_joint_single_stage_full_group_nms_match.yaml \
+#     OUTPUT_DIR /public/home/zncui/pycharm_project/maskdino-wheat50/output_v2/<run-name>
+# ============================================================================
+_BASE_: wheat_joint_single_stage.yaml
+
+MODEL:
+  MaskDINO:
+    NUM_OBJECT_QUERIES: 100
+    NUM_POINTS: 30
+    POINT_GROUP_DECODER: True
+    POINT_ACROSS_ATTN: "slot"
+    POINT_DIM_FEEDFORWARD: 1024
+    POINT_WITHIN_GATE: True
+    POINT_COORD_NORM: "iso"
+    POINT_COORD_ROBUST_C: 1.0
+    POINT_NMS_MODE: "match"
+    POINT_NMS_KAPPA: &kappa 0.05
+    TEST:
+      POINT_NMS_KAPPA: *kappa

@@ -1,0 +1,29 @@
+# ============================================================================
+# 完整集 · full/coral-exist · 秩一致存在性头 + 前缀内层匹配（单点消融）
+#   预注册：experiments-bank/ideas/full-coral-exist.md（判否线在跑之前写死）
+#   主参照：output_v2/exp-0922-single-stage-p30（26000 iter、300 query、P=30，segm 81.97 / MAE 2.77）
+#   mini 对应臂：mini/coral-exist（MAE 1.666，segm 78.28，护栏过）
+#
+# 与 wheat_joint_single_stage.yaml 的差异【只有两项】（同 mini 臂口径）：
+#   MODEL.MaskDINO.POINT_CORAL_EXIST: True
+#     ① point_class_embed 改为 CoralHead：slot k 的 logit = g(h) + b_k（共享打分 + 25 个有序 bias）；
+#     ② 内层匹配只让前 min(Ni, 25) 个 slot 参与匈牙利（代价只用坐标 L1），存在性目标变成有序前缀；
+#     ③ 存在性损失由 focal 换成 CORAL 的 BCE。
+#   MODEL.MaskDINO.TEST.POINT_THRESHOLD: 0.35 -> 0.5
+#     CORAL 决策规则 K = sum_k 1[P(Ni>k) > 0.5]，推理输出前 K 个 slot。
+#
+# 【与 mini 臂的非严格同配置声明】train_net.py 对 CoralHead 根级 bias 单独 lr ×10
+# （mini CE 确诊 bias 被 lr 卡住未收敛）；该项在预注册中声明，mini/full 对比时需注意。
+#
+# 用法：
+#   python train_net.py --num-gpus 1 \
+#     --config-file configs/coco/instance-segmentation/wheat_joint_single_stage_full_coral_exist.yaml \
+#     OUTPUT_DIR /public/home/zncui/pycharm_project/maskdino-wheat50/output_v2/<run-name>
+# ============================================================================
+_BASE_: wheat_joint_single_stage.yaml
+
+MODEL:
+  MaskDINO:
+    POINT_CORAL_EXIST: True
+    TEST:
+      POINT_THRESHOLD: 0.5
