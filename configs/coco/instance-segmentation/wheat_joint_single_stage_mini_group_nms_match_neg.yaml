@@ -1,0 +1,27 @@
+# ============================================================================
+# 单阶段联合训练 · 500 图小集 · 分组 decoder + 小穗 token 逐层点 NMS 后再做内层匹配，被压掉的 token 判负
+# （mini/group-nms-match-neg）
+#   预注册：experiments-bank/ideas/group-nms-match-neg.md（判否线在跑之前写死）
+#   主对照：E0（mini/baseline 100 epoch，output_v2/exp-0923-mini-ep100）；
+#   父 arm：A（wheat_joint_single_stage_mini_group_nms_match.yaml，mini/group-nms-match，
+#         output_v2/exp-1008-mini-group-nms-match）。本分支从 mini/group-nms-match@bfe1d7e 开出（用户 2026-10-09 指定）。
+#
+# 与 A 的差异【只有一处】：
+#   POINT_NMS_SUPPRESSED: ignore -> negative
+#     A：被 NMS 压掉的 token 不算存在性损失，存在性 focal 只对留下的 token 求和。
+#     本 arm：被压掉的 token 存在性目标为 0、focal 照常计入，即对全部 30 个 token 求和（与 E3 同式）。
+#     匹配仍只在 NMS 留下的 token 之间做，坐标损失仍只算配上的。
+# 不变（全部继承 A）：POINT_NMS_MODE match、训练侧 κ 0.05（GT 框）、推理侧 NMS κ 0.05（预测框）、POINT_THRESHOLD 0.35、
+#   不补回、point_nms/* 统计、损失分母、Ni=0 实例的权重，以及 E3 的分组 decoder 结构、schedule、数据与其余旋钮。
+# 相对 E3 的训练侧唯一差别：正样本只能从 NMS 留下的 token 里选。
+#
+# 用法：
+#   python train_net.py --num-gpus 1 \
+#     --config-file configs/coco/instance-segmentation/wheat_joint_single_stage_mini_group_nms_match_neg.yaml \
+#     OUTPUT_DIR /public/home/zncui/pycharm_project/maskdino-wheat50/output_v2/<run-name>
+# ============================================================================
+_BASE_: wheat_joint_single_stage_mini_group_nms_match.yaml
+
+MODEL:
+  MaskDINO:
+    POINT_NMS_SUPPRESSED: "negative"
