@@ -735,10 +735,10 @@ class MaskDINODecoder(nn.Module):
                 predictions_point_coral
             )
         }
-        if self.point_kmo and predictions_point_knn[-1] is not None:
+        if self.point_kmo and predictions_point_knn is not None and predictions_point_knn[-1] is not None:
             # combo 下最后一层是 group 层、无 knn（None），out 不放该键，criterion 按 dict 内容分派
             out['pred_point_knn'] = predictions_point_knn[-1]
-        if predictions_point_coral[-1] is not None:
+        if predictions_point_coral is not None and predictions_point_coral[-1] is not None:
             # combo：最终层 instance query 的 CORAL 序数 logits [B, Q, T]，推理给出计数 n_k
             out['pred_point_coral'] = predictions_point_coral[-1]
         if self.two_stage:
