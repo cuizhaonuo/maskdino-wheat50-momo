@@ -1,6 +1,6 @@
 # 想法：小穗 token 逐层点 NMS 后再做内层匹配，被压掉的 token 判负 · arm A-neg（mini/group-nms-match-neg）
 
-状态：**预注册，已开跑（2026-10-09 15:58:03 启动）** ｜ 提出 2026-10-09 ｜ 分支 `mini/group-nms-match-neg`（从 `mini/group-nms-match`@`bfe1d7e` 开出，100 epoch）｜ 配置
+状态：**歧义（100 epoch，2026-10-10；主判据比 E0 高 0.0089，机制未启动，护栏 G 未过，计数次判据不成立，归因为推理 NMS，对 A 无差别）**，见 [exp-2026-10-09-mini-group-nms-match-neg](../experiments/exp-2026-10-09-mini-group-nms-match-neg.md) ｜ 提出 2026-10-09 ｜ 分支 `mini/group-nms-match-neg`（从 `mini/group-nms-match`@`bfe1d7e` 开出，100 epoch）｜ 配置
 `wheat_joint_single_stage_mini_group_nms_match_neg.yaml`（`_BASE_` 为 `wheat_joint_single_stage_mini_group_nms_match.yaml`，即 arm A 的配置）｜
 输出 `output_v2/exp-1009-mini-group-nms-match-neg` ｜ 代码提交 `1dffc3b` ｜ 启动提交 `5673db5` ｜
 启动时间 2026-10-09 15:58:03，qiuhao A100（GPU1）。开跑时卡上没有本组的其他 run，之后有别的用户的小任务同卡（约 5.6 GB）
@@ -303,3 +303,45 @@ python myscripts/backup/vis_process/point_token_diag.py --sweep --run-dir output
     ```
   - `expandable_segments` 只减少显存碎片，不改数值。arm B 也用了它，arm A 没用。
 - **首个日志点**：iter 19，eta 12:37:50，0 报错。
+
+## 结论（2026-10-10）
+
+**歧义：主判据比 E0 高 0.0089；机制未启动（M1、M2 未过），护栏 G 未过；计数次判据不成立（2.232，差 0.022）；
+segm / recall 护栏过；归因按预注册记「收益来自推理 NMS」；对 A 记「判负与否无差别」。**
+按上面「预期与判否线」判，读数一律是默认读数（阈值 0.35、推理 NMS κ=0.05，未做阈值扫描）。
+run：`output_v2/exp-1009-mini-group-nms-match-neg`（12500/12500 iter · 25/25 评估 · 0 报错）。
+详见 [exp-2026-10-09-mini-group-nms-match-neg](../experiments/exp-2026-10-09-mini-group-nms-match-neg.md)。
+
+| 判据 | 要求 | 实测 | |
+|:--|:--|:--|:--:|
+| M1 跨层改判率均值 | ≤ 0.0190 | 0.0333（A 0.0325，E3 + κ0.05 NMS 0.0319，E3 plain 0.0271） | ❌ |
+| M2 AUC_surv | ≥ 0.7405 | 0.6569（A 0.6663，E3 + κ0.05 NMS 0.6905） | ❌ |
+| 护栏 G 覆盖损失 | ≤ 2.1486 个百分点 | 2.243（A 2.256，E3 + κ0.05 NMS 2.149） | ❌ |
+| 主判据：读数那次 `matched_F1@8`（对 E0） | ≥ 0.6428 成立；≤ 0.6227659 判否 | 0.6316923（iter 9499；比 E0 高 0.0089） | 歧义 |
+| 次判据：读数那次 `count_MAE_spike` | ≤ 2.21 | 2.232 | ❌ |
+| 护栏 `segm/AP` 全程峰值 | ≥ 77.80 | 78.47（@9999） | ✅ |
+| 护栏 `spike_recall` 全程峰值 | ≥ 0.9311 | 0.9560（@7499） | ✅ |
+| 归因：对「E3 + 推理 NMS κ0.05」（iter 9499：0.6348 / 2.312） | F1@8 ≥ 0.6548 或计数 ≤ 2.081 → 训练侧有贡献 | 0.6317 / 2.232 | 收益来自推理 NMS |
+| 对 A（读数那次 F1@8 之差 ≤ 0.015 → 无差别） | — | 0.6317 − 0.6228 = +0.0089 | 判负与否无差别 |
+
+诊断在 qiuhao GPU1 上跑（`output_v2/_diag-1009-group-nms-match-neg/Aneg_match_neg.json`），`readout_model` 的 matched_F1@8 与计数与训练日志末值逐位相同。
+读数那次的逐穗明细来自 `model_0009499.pth` 的 `--eval_only` 重跑（`output_v2/_eval-1010-group-nms-match-neg-readout/9499/`），40 项指标与内置评估逐位相同。
+
+报告项（不作判据）：
+
+| | A-neg | E3 | E3 + κ0.05 推理 NMS | A | B |
+|:--|--:|--:|--:|--:|--:|
+| <3 px 重复点（阈值后、不带 NMS） | 0.41% | 0.39% | 同 E3 | 0.69% | 1.59% |
+| AUC_all | 0.6921 | 0.6989 | 同 E3 | 0.6896 | 0.6661 |
+| `auc_supneg` | 0.7591 | 0.6989（什么都没压） | 0.7569 | 0.7526 | — |
+| 不带推理 NMS 的计数 / 偏差 | 2.715 / +2.54 | 2.764 / +2.53 | 同 E3 | 3.024 / +2.85 | 3.784 / +3.66 |
+
+读法：
+
+- **判负把近重复的分数压了回去，但只在分数上。** 重复点与不带 NMS 的计数回到 E3 的水平，`auc_supneg` 最高。
+  但 token 在位置上的近重复比 A 还多（训练中被压约 7.8% 对 5.9%），AUC_all 只比 A 高 0.0025，留下的 token 之间的排序（AUC_surv）没有变好。
+- **端到端回到「E3 + 推理 NMS」的水平，没有超过。** 后半程 F1@8 均值 0.6353 对 0.6357，末值 0.6415 对 0.6416。
+  A 相对它的退步（后半程均值 −0.008）消失了。
+- **对 A 方向一致、幅度在噪声内。** 后半程 13 次里 12 次 F1@8 高于 A，均值 +0.008；但这是同一个 run 内彼此相关的评估、单种子，按预注册记无差别。
+- **计数的相关性变好**（r 0.593~0.599，A 0.563，E3 0.552），与 B 相同；计数 MAE 仍由 +1.9~+2.4 的偏差主导。
+- **起步更慢，没有后果。** 塌缩窗口（iter 39~179）与 A、E3 相同，但到 iter 439 才散开（A 319），iter 999 的评估只出 28 个点，iter 1499 起追平。
