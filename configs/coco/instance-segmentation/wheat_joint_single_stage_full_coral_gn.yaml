@@ -1,0 +1,28 @@
+# ============================================================================
+# 完整集 · full/coral-gn · CoralHead 计数头 + Group 分组解码架构 两两组合消融臂（A+C）
+#   预注册：experiments-bank/ideas/full-coral-gn.md（判定线在跑之前写死）
+#   主参照：output_v2/exp-1009-full-combo 及单点臂 exp-1009-full-coral-exist /
+#           exp-1009-full-group-nms-match
+#
+# 与 full/combo 的差异【只关掉一个 flag】：POINT_KMO 系列四键不开
+# （POINT_KMO / POINT_KMO_K / COST_POINT_KNN_WEIGHT / POINT_KNN_WEIGHT 均取默认关闭），
+# 其余与 combo 完全一致：
+#   - slot 语义层（layer-0 / interm 的 MLP 点头）：CE 前缀内层匹配（纯坐标 L1）+
+#     CoralHead 逐 slot 存在性（CORAL BCE）；
+#   - group 层（第 1~9 层小穗 token）：GN 逐 token focal + 训练侧点 NMS 匹配；
+#     CoralHead 额外挂在实例 query 上输出 pred_point_coral [B,Q,30]，
+#     监督 = coral_levels(min(Ni,30))（loss_point_coral，权重=POINT_CLASS_WEIGHT）；
+#   - 推理：coral 管「数几个」（sigmoid>0.5 求和，阈值代码内固定），
+#     focal+NMS（κ=0.05）管「选哪些」，按分数取 top-n_k。
+#   CoralHead 根级 bias lr ×10 由 train_net.py 参数组实现（同 combo/CE 臂口径）。
+#
+# 用法：
+#   python train_net.py --num-gpus 1 \
+#     --config-file configs/coco/instance-segmentation/wheat_joint_single_stage_full_coral_gn.yaml \
+#     OUTPUT_DIR /public/home/zncui/pycharm_project/maskdino-wheat50/output_v2/exp-1011-full-coral-gn
+# ============================================================================
+_BASE_: wheat_joint_single_stage_full_group_nms_match.yaml
+
+MODEL:
+  MaskDINO:
+    POINT_CORAL_EXIST: True
