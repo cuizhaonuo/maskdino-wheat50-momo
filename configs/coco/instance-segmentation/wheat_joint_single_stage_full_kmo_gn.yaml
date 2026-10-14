@@ -1,0 +1,27 @@
+# ============================================================================
+# 完整集 · full/kmo-gn · 两两组合消融臂 B+C（kmo-matcher + group-nms-match）
+#   预注册：experiments-bank/ideas/full-kmo-gn.md（判定线在跑之前写死）
+#   主参照：output_v2/exp-0922-single-stage-p30、本批三个单点臂与 full/combo
+#
+# 本臂语义（2^3 消融立方体的 B+C 顶点）：
+#   - 代码 = full/combo 合并代码原样（本分支从 full/combo 切出，不改 maskdino/）；
+#   - 相对 full/combo 只关掉一个 flag：POINT_CORAL_EXIST（不开 coral 存在性头）；
+#   - 保留：KMO 匹配代价（POINT_KMO/K/COST/LOSS 四键）+ GN 分组解码架构
+#     （逐 token focal + 训练侧点 NMS 匹配 + 100 query / P=30，继承自 _BASE_）。
+#
+# 与 _BASE_（full_group_nms_match.yaml）的差异【四处】：POINT_KMO / POINT_KMO_K /
+# COST_POINT_KNN_WEIGHT / POINT_KNN_WEIGHT。TEST.POINT_THRESHOLD 保持 _BASE_ 原值。
+#
+# 用法：
+#   python train_net.py --num-gpus 1 \
+#     --config-file configs/coco/instance-segmentation/wheat_joint_single_stage_full_kmo_gn.yaml \
+#     OUTPUT_DIR /public/home/zncui/pycharm_project/maskdino-wheat50/output_v2/exp-1011-full-kmo-gn
+# ============================================================================
+_BASE_: wheat_joint_single_stage_full_group_nms_match.yaml
+
+MODEL:
+  MaskDINO:
+    POINT_KMO: True
+    POINT_KMO_K: 3
+    COST_POINT_KNN_WEIGHT: 5.0
+    POINT_KNN_WEIGHT: 5.0
