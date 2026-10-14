@@ -1,0 +1,27 @@
+# ============================================================================
+# 完整集 · full/coral-kmo · 两两组合消融臂（A+B: CoralHead 计数头 + KMO 匹配代价, slot 架构, 无 group 层）
+#   预注册：experiments-bank/ideas/full-coral-kmo.md（判定线在跑之前写死）
+#   主参照：output_v2/exp-0922-single-stage-p30（26000 iter、300 query、P=30，segm 81.97 / MAE 2.77）
+#   同批单点参照：full/coral-exist（A）、full/kmo-matcher（B）
+#
+# 与 _BASE_（wheat_joint_single_stage_full_coral_exist.yaml）的差异【只有 KM 四键】：
+#   MODEL.MaskDINO.POINT_KMO: True        开启 KMO 匹配代价
+#   MODEL.MaskDINO.POINT_KMO_K: 3         knn 近邻数
+#   MODEL.MaskDINO.COST_POINT_KNN_WEIGHT: 5.0   匹配代价中 knn 项权重
+#   MODEL.MaskDINO.POINT_KNN_WEIGHT: 5.0        knn 损失权重
+# 即：在 full/combo 代码上只开 POINT_CORAL_EXIST（经 _BASE_ 继承）+ KM 四键，
+# 不开 POINT_GROUP_NMS_MATCH（保持 slot 架构，无 group 层）。
+#
+# 用法：
+#   python train_net.py --num-gpus 1 \
+#     --config-file configs/coco/instance-segmentation/wheat_joint_single_stage_full_coral_kmo.yaml \
+#     OUTPUT_DIR /public/home/zncui/pycharm_project/maskdino-wheat50/output_v2/exp-1011-full-coral-kmo
+# ============================================================================
+_BASE_: wheat_joint_single_stage_full_coral_exist.yaml
+
+MODEL:
+  MaskDINO:
+    POINT_KMO: True
+    POINT_KMO_K: 3
+    COST_POINT_KNN_WEIGHT: 5.0
+    POINT_KNN_WEIGHT: 5.0
