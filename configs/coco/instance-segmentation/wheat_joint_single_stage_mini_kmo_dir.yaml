@@ -1,0 +1,42 @@
+# ============================================================================
+# 单阶段联合训练 · 500 图小集 · KMO 内层点匹配 · 近邻方向描述子（mini/kmo-dir，KMO v2 臂 A）
+#   预注册：experiments-bank/ideas/kmo-dir.md（判否线已在跑之前写死）
+#   主对照 E0：mini/baseline 100 epoch（output_v2/exp-0923-mini-ep100，不开 KMO）
+#   归因参照：KMO 100 epoch（mini/kmo-matcher，output_v2/exp-0924-mini-kmo-matcher-ep100，dist、K=3）
+#
+# 与 wheat_joint_single_stage_mini_kmo_ep100.yaml（KMO 100 epoch）的差异【只有 KMO 的近邻描述子】：
+#   y^k 从「到 K=3 个最近邻的平均距离」（1 维，sigmoid）换成「指向 K=2 个最近邻的单位向量的平均」
+#     c_i = (1/k_eff)·Σ_j (p_j - p_i)/‖p_j - p_i‖，k_eff = min(K, Ni-1)，框相对坐标（2 维，头过 tanh），
+#   代价 C += 5·s·|ĉ - c|₁，损失 loss_point_knn = s·L1(ĉ, c)（×5），s = POINT_KMO_DIR_SCALE = 0.13044。
+#   两个权重（COST_POINT_KNN_WEIGHT / POINT_KNN_WEIGHT 都是 5）、DETACH（False）、schedule、数据与其余旋钮
+#   一律继承不动。启动前已用解析后的 cfg 逐项核对：只差 POINT_KMO_DESC、POINT_KMO_K 两个键；
+#   POINT_KMO_DIR_SCALE 与 maskdino/config.py 的默认值相同（dist 下不用），这里显式写出以便对照。
+#   与 E0 的差异 = 打开 POINT_KMO（dir 描述子）。
+#
+# 为什么换描述子（数字见预注册的「动机」）：
+#   1) 距离 y^k 的方差 43% 在穗间，按穗平均与 Ni 的相关 r = -0.81，是计数信号。内层匹配只在一个穗内做，
+#      穗间那部分对同穗所有 GT 是常数，改不了任何配对，KMO 头却要经共享 decoder 学它（L1 ×5，11 层）。
+#      用户要求 kmo-matcher 与 coral-exist（计数）原理独立，KMO 不该学计数。
+#   2) 方向描述子尺度无关，按穗平均的模长与 Ni 的 r ≈ +0.01，不含计数信息；它编码「近邻在哪一侧」：
+#      两侧都有近邻（穗中段）时 c ≈ 0，近邻都在一侧（穗端、单侧点）时 |c| ≈ 1。
+#      K=2 与动机里的统计同口径（模长、56% 两侧都有近邻、配对模拟都按 k=2 算）。
+#   3) 配对模拟（val 613 穗）：头完全准时，内层匈牙利配回来源的比例 L1 93.2% -> 距离 95.7% -> 方向 98.2%；
+#      头若只知道点头那么多，方向反而降到 90.9%（距离 93.1%）。收益全靠头比点头更懂局部结构，
+#      所以机制门 M1 是 e_head < e_proxy。
+#
+# 用法：
+#   python train_net.py --num-gpus 1 \
+#     --config-file configs/coco/instance-segmentation/wheat_joint_single_stage_mini_kmo_dir.yaml \
+#     OUTPUT_DIR output_v2/<run-name>
+# ============================================================================
+_BASE_: wheat_joint_single_stage_mini_kmo_ep100.yaml
+
+MODEL:
+  MaskDINO:
+    # 近邻方向描述子（2 维，tanh），定义见 maskdino/config.py 的 POINT_KMO_DESC。
+    POINT_KMO_DESC: "dir"
+    # 近邻数（不含自身）：3 -> 2。
+    POINT_KMO_K: 2
+    # 尺度 s：mini train 全部 wheat_2（Ni>=2）GT 小穗到其 2 个最近邻的平均距离（框相对）的中位数（43024 点）。
+    # 把单位方向换算成与坐标同量纲的长度：近邻都在一侧时 s·c 约等于指向近邻的平均偏移，与 L1 坐标项可比。
+    POINT_KMO_DIR_SCALE: 0.13044
