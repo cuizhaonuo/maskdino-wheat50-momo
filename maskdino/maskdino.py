@@ -206,6 +206,8 @@ class MaskDINO(nn.Module):
             point_kmo=cfg.MODEL.MaskDINO.POINT_KMO,
             point_kmo_k=cfg.MODEL.MaskDINO.POINT_KMO_K,
             point_cost_knn=cfg.MODEL.MaskDINO.COST_POINT_KNN_WEIGHT,
+            point_kmo_desc=cfg.MODEL.MaskDINO.POINT_KMO_DESC,
+            point_kmo_dir_scale=cfg.MODEL.MaskDINO.POINT_KMO_DIR_SCALE,
         )
 
         return {

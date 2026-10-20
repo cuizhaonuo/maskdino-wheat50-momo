@@ -502,7 +502,7 @@ def visualize_point_match(criterion, outputs, targets, indices, batched_inputs=N
 
     pred_coords = outputs["pred_point_coords"].detach().float()     # [B, Q, P, 2] 框相对
     pred_pt_logits = outputs["pred_point_logits"].detach().float()  # [B, Q, P, 1]
-    pred_knns = outputs.get("pred_point_knn")                       # [B, Q, P, 1]，仅 POINT_KMO=True
+    pred_knns = outputs.get("pred_point_knn")                       # [B, Q, P, D]，仅 POINT_KMO=True（D=1 dist / 2 dir）
     if pred_knns is not None:
         pred_knns = pred_knns.detach().float()
     P = pred_coords.shape[2]

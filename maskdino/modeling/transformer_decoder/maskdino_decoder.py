@@ -48,6 +48,8 @@ class MaskDINODecoder(nn.Module):
             num_points: int,
             point_class_mlp: bool = False,
             point_kmo: bool = False,
+            point_kmo_desc: str = "dist",
+            point_kmo_detach: bool = False,
             nheads: int,
             dim_feedforward: int,
             dec_layers: int,
@@ -172,11 +174,19 @@ class MaskDINODecoder(nn.Module):
         self.bbox_embed = nn.ModuleList(box_embed_layerlist)
         self.decoder.bbox_embed = self.bbox_embed
 
-        # KMO（CLTR Eq.3）：每个点槽再预测一个近邻平均距离 ŷ^k（框相对 [0,1]），只用于训练期内层匹配。
+        # KMO（CLTR Eq.3）：每个点槽再预测一个近邻描述子 ŷ^k，只用于训练期内层匹配。
+        #   POINT_KMO_DESC="dist"：近邻平均距离（框相对 [0,1]），D=1，过 sigmoid（现状）；
+        #   POINT_KMO_DESC="dir" ：近邻方向描述子，D=2，过 tanh（分量 ∈ [-1,1]）。
         # 放在 __init__ 末尾，不打乱已有模块的随机初始化顺序；关闭时不建，参数表与现状一致。
+        # dist 时输出维 num_points*1 == num_points，与 mini/kmo-matcher 的头同形、同初始化。
         self.point_kmo = point_kmo
+        assert point_kmo_desc in ("dist", "dir"), f"POINT_KMO_DESC 只支持 'dist' / 'dir'，收到 {point_kmo_desc!r}"
+        self.point_kmo_desc = point_kmo_desc
+        self.point_kmo_dim = 2 if point_kmo_desc == "dir" else 1
+        # POINT_KMO_DETACH：头读 decoder_output.detach()，loss_point_knn 不回传到共享的 decoder / 主干
+        self.point_kmo_detach = point_kmo_detach
         if point_kmo:
-            self.point_knn_embed = MLP(hidden_dim, hidden_dim, num_points, 3)
+            self.point_knn_embed = MLP(hidden_dim, hidden_dim, num_points * self.point_kmo_dim, 3)
 
 
     @classmethod
@@ -191,6 +201,8 @@ class MaskDINODecoder(nn.Module):
         ret["num_points"] = cfg.MODEL.MaskDINO.NUM_POINTS
         ret["point_class_mlp"] = cfg.MODEL.MaskDINO.POINT_CLASS_MLP
         ret["point_kmo"] = cfg.MODEL.MaskDINO.POINT_KMO
+        ret["point_kmo_desc"] = cfg.MODEL.MaskDINO.POINT_KMO_DESC
+        ret["point_kmo_detach"] = cfg.MODEL.MaskDINO.POINT_KMO_DETACH
         # Transformer parameters:
         ret["nheads"] = cfg.MODEL.MaskDINO.NHEADS
         ret["dim_feedforward"] = cfg.MODEL.MaskDINO.DIM_FEEDFORWARD
@@ -603,7 +615,8 @@ class MaskDINODecoder(nn.Module):
             # out_boxes: (num_layers + 1, bs, dn_pad + num_queries, 4)
             # predictions_point_coord: (num_layers + 1, bs, dn_pad + num_queries, P, 2)
             # predictions_point_logit: (num_layers + 1, bs, dn_pad + num_queries, P, 1)
-            # predictions_point_knn:   (num_layers + 1, bs, dn_pad + num_queries, P, 1)，仅 KMO 开启时
+            # predictions_point_knn:   (num_layers + 1, bs, dn_pad + num_queries, P, D)，仅 KMO 开启时；
+            #                          D=1（POINT_KMO_DESC="dist"）/ 2（"dir"）
             predictions_class, out_boxes,predictions_mask,predictions_point_coord,predictions_point_logit,predictions_point_knn=\
                 self.dn_post_process(predictions_class,out_boxes,mask_dict,predictions_mask,
                                      predictions_point_coord,predictions_point_logit,predictions_point_knn)
@@ -650,10 +663,13 @@ class MaskDINODecoder(nn.Module):
         b, q = decoder_output.shape[:2]
         outputs_point_coord = self.point_coord_embed(decoder_output).reshape(b, q, self.num_points, 2).sigmoid()
         outputs_point_logit = self.point_class_embed(decoder_output).reshape(b, q, self.num_points, 1)
-        # KMO：逐槽的近邻平均距离 ŷ^k（框相对 [0,1]，与坐标同样过 sigmoid）
+        # KMO：逐槽的近邻描述子 ŷ^k，[b, q, P, D]。dist：平均近邻距离（框相对 [0,1]，与坐标同样过 sigmoid）；
+        # dir：方向描述子（过 tanh）。DETACH 时头读 detach 后的特征，前向数值不变，只切断回传。
         outputs_point_knn = None
         if self.point_kmo:
-            outputs_point_knn = self.point_knn_embed(decoder_output).reshape(b, q, self.num_points, 1).sigmoid()
+            knn_in = decoder_output.detach() if self.point_kmo_detach else decoder_output
+            outputs_point_knn = self.point_knn_embed(knn_in).reshape(b, q, self.num_points, self.point_kmo_dim)
+            outputs_point_knn = outputs_point_knn.tanh() if self.point_kmo_desc == "dir" else outputs_point_knn.sigmoid()
 
         return outputs_class, outputs_mask, outputs_point_coord, outputs_point_logit, outputs_point_knn
 

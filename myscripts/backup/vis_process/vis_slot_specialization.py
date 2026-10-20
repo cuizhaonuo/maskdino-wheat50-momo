@@ -72,7 +72,7 @@ def record(criterion, outputs, targets, indices, batched_inputs=None):
     """累计一次 criterion 调用里所有有小穗点实例的匹配结果。"""
     pred_coords = outputs["pred_point_coords"].detach().float()
     pred_lgts = outputs["pred_point_logits"].detach().float()
-    pred_knns = outputs.get("pred_point_knn")    # 仅 POINT_KMO=True 时存在
+    pred_knns = outputs.get("pred_point_knn")    # [B, Q, P, D]，仅 POINT_KMO=True 时存在（D=1 dist / 2 dir）
     if pred_knns is not None:
         pred_knns = pred_knns.detach().float()
     P = pred_coords.shape[2]
