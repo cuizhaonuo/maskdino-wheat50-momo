@@ -1,0 +1,219 @@
+# 想法：KMO 头的输入 detach —— 让 KMO 只通过匹配起作用
+
+状态：**预注册**（判定线在跑之前写死）｜ 提出 2026-10-20 ｜ 分支 `mini/kmo-detach`（从 `mini/kmo-dir`@`f7d1140` 开出，代码与 `mini/kmo-dir` 相同）｜ 配置 `configs/coco/instance-segmentation/wheat_joint_single_stage_mini_kmo_detach.yaml` ｜ 输出 `output_v2/exp-1020-mini-kmo-detach`
+
+> KMO v2 三臂之一（臂 C）。三臂都从 `mini/kmo-dir`@`f7d1140` 开出，代码完全相同，只差配置。`f7d1140` 是代码提交，
+> 在 `mini/kmo-matcher`@`3319798` 上给 KMO 加了两个开关，默认值下与 `mini/kmo-matcher` 逐位一致。
+> 三臂分工：臂 A `mini/kmo-dir` 换方向描述子；臂 C（本分支）只开 detach；臂 D `mini/kmo-auxonly` 只把匹配代价权重置 0。
+
+## 动机
+
+### 三个创新点要原理独立
+
+三个创新点将放进同一个模型：coral-exist（秩一致存在性头，管计数）、kmo-matcher（KMO 内层点匹配，管穗内配对）、
+group-nms-match（匹配前的逐层点 NMS）。这要求它们原理独立，各自只动自己那一环，叠在一起时不互相抵消。
+落到 KMO 上，就是 KMO 不能碰计数。
+
+### KMO 的 y^k 里有计数信号，KMO 头却经共享 decoder 学它
+
+数据来自 2026-10-20 的离线统计（只读标注，CPU）：
+
+- KMO 的 y^k 是 k=3 的平均近邻距离（框相对）。它的方差 57% 在穗内、43% 在穗间。
+  按穗平均后，y^k 与 Ni 的相关 r = −0.81，所以 y^k 带着计数信号。
+- 内层匹配只在一个穗内做。穗间那部分对同穗所有 GT 是常数，改不了任何配对。
+- KMO 头却要经共享 decoder 学完整的 y^k（L1 ×5；共 11 个 `loss_point_knn*`，来自 interm、初始预测和 9 层 decoder）。
+  所以对配对没用的穗间部分，也照样通过 `loss_point_knn` 回传进共享特征。这可能就是 KMO 计数副作用的来源。
+
+已有的计数证据：
+
+- 读数那次（iter 8999），KMO 的计数是 2.4878，E0 是 2.4648，高 0.023，单种子下在噪声内。
+- 末值差得多一些：2.82 vs 2.60，差值几乎全是偏差（逐穗偏差 +2.68 vs +2.41），
+  见 [exp-2026-09-24-mini-kmo-matcher-ep100](../experiments/exp-2026-09-24-mini-kmo-matcher-ep100.md)。
+
+所以副作用是否真的存在还说不准。本臂要回答的是：去掉这条回传路径以后，KMO 是否不伤计数。
+
+### B 诊断：KMO 头不比「由预测点推算」更懂局部结构
+
+诊断设置：2026-10-20，扩展版 `kmo_match_diag.py`，在现有 KMO 100 epoch 上跑；train 100 batch，看最后一层，
+L1-only 配对，只取 Ni ≥ 3 的实例，共 1586 个。
+JSON 在 `output_v2/exp-0924-mini-kmo-matcher-ep100/kmo_diag/model_{0008999,final}.v2.json`。
+
+| | iter 8999 | final |
+|:--|--:|--:|
+| e_head（KMO 头） | 0.01769 | 0.01707 |
+| e_proxy（由配上槽自己的预测点推算） | 0.01746 | 0.01721 |
+| e_const（该实例 GT 中位数，偏乐观，只作参照） | 0.01575 | 0.01575 |
+| e_head < e_proxy 的实例比例 | 52.7% | 55.6% |
+| 穗内 r / 改判率 / 平局互换率 | 0.533 / 13.9% / 0.32% | 0.544 / 12.7% / 0.63% |
+
+**读法：**
+
+- KMO 头对局部结构的了解，与「从预测点推算」基本一样。
+- 所以匹配项在实际中接近噪声级的平局打破。
+- KMO 约 +0.015 的定位收益（读数那次 `matched_F1@8` 0.6378 vs E0 0.6228），可能主要来自辅助回归损失对共享特征的塑形，
+  而不是来自匹配。
+
+### 本臂与臂 D 合起来做 2×2 归因
+
+KMO 由两部分绑在一起：匹配代价，加上经共享 decoder 回传的辅助回归损失。
+本臂去掉后者的回传、保留匹配；臂 D 去掉匹配（`COST_POINT_KNN_WEIGHT` 0）、保留辅助损失。连同 E0 与 KMO，正好凑成 2×2：
+
+| | 辅助损失不回传到共享特征 | 辅助损失回传到共享特征 |
+|:--|:--|:--|
+| 不带 KMO 匹配 | E0（`exp-0923-mini-ep100`） | 臂 D `mini/kmo-auxonly` |
+| 带 KMO 匹配 | **臂 C（本分支）** | KMO（`exp-0924-mini-kmo-matcher-ep100`） |
+
+2×2 同时回答两个问题：
+
+1. KMO 的计数副作用（若存在）走的是哪条路。
+2. KMO 的定位收益来自匹配，还是来自辅助损失。
+
+## 修法
+
+没有代码改动。开关随 `f7d1140` 已在代码里（`MODEL.MaskDINO.POINT_KMO_DETACH`，默认 False）。
+本分支只新增配置 `wheat_joint_single_stage_mini_kmo_detach.yaml`：`_BASE_` 是 `wheat_joint_single_stage_mini_kmo_ep100.yaml`（KMO 100 epoch），
+只设 `POINT_KMO_DETACH: True`。
+
+**detach 的位置：** `maskdino/modeling/transformer_decoder/maskdino_decoder.py` 的 `forward_prediction_heads`，
+在 `decoder_norm` 之后、KMO 头 `point_knn_embed`（3 层 MLP）之前：
+
+```python
+knn_in = decoder_output.detach() if self.point_kmo_detach else decoder_output
+outputs_point_knn = self.point_knn_embed(knn_in).reshape(b, q, self.num_points, self.point_kmo_dim)
+```
+
+interm、初始预测和 9 层 decoder 的输出都走这个函数，所以 11 个 `loss_point_knn*` 的输入全部被 detach。
+
+**含义：**
+
+- **前向不变。** ŷ^k 的数值与不 detach 时逐位相同。内层匹配照常用它，
+  代价仍是 Eq.3：C = 5·|p − p̂|₁ + 5·|y^k − ŷ^k| + 2·focal(ĉ)。
+- **反传被切断。** `loss_point_knn`（×5）只训练 KMO 头自己的参数，不再回传到 `decoder_norm` 及其上游
+  （decoder 各层、像素解码器、主干）。
+- **KMO 只剩一条路影响模型其余部分：** ŷ^k 改变内层配对 → 坐标 / 存在性损失的目标跟着变 → 这些损失的梯度去塑形共享特征。
+- **推理不受影响。** KMO 只用于训练期的内层匹配。
+
+## 与对照的差异
+
+- **对 KMO**（`mini/kmo-matcher`，`exp-0924-mini-kmo-matcher-ep100`）：只差 detach。
+  以下全部相同：描述子（dist，k=3）、匹配代价权重 5、损失权重 5、数据、schedule（12500 iter = 100 epoch，bs 4）、
+  初始权重（ImageNet R-50）、`SEED` 42。
+- **对 E0**（`mini/baseline`，`exp-0923-mini-ep100`）：差 `POINT_KMO`（KMO 匹配与 KMO 头）和 detach 两处。
+
+**cfg 核对。** 方法：`get_cfg()` + `add_deeplab_config` + `add_maskdino_config` + `merge_from_file`，在 CPU 上展平后，
+逐项比对全部叶子键。
+
+| 比对 | 叶子键 | 取值不同的键 |
+|:--|--:|:--|
+| 新配置 vs `wheat_joint_single_stage_mini_kmo_ep100.yaml` | 331 / 331 | **只有** `MODEL.MaskDINO.POINT_KMO_DETACH`：False → True |
+| 新配置 vs KMO run 落盘的 `exp-0924-mini-kmo-matcher-ep100/config.yaml` | 331 / 331 | `POINT_KMO_DETACH`，外加 `OUTPUT_DIR`，以及 `ROI_BOX_CASCADE_HEAD.BBOX_REG_WEIGHTS` 的 list / tuple 序列化差别（值相同，MaskDINO 不用） |
+| 新配置 vs E0 落盘的 `exp-0923-mini-ep100/config.yaml` | 331 / 331 | `POINT_KMO`、`POINT_KMO_DETACH`，外加同上两项 |
+
+第二行说明：本分支上的 KMO 配置能复现 KMO run 实际用的 cfg，所以「对 KMO 只差 detach」对那个 run 本身也成立。
+
+## 预期与判否线（跑之前写死）
+
+### 共同口径（KMO v2 三臂共用）
+
+- **对照。** 主对照 E0 = `output_v2/exp-0923-mini-ep100`（mini/baseline 100 epoch）；
+  归因参照 KMO = `output_v2/exp-0924-mini-kmo-matcher-ep100`（`mini/kmo-matcher`）。
+- **读数。** 取后半程（iter ≥ 6250）内置评估里 `count_MAE_spike` 最低的那次，在同一次评估上报全部指标。
+  - 只用默认读数（τ 0.35），不扫阈值。
+  - 单种子，不补种子。
+  - `matched_F1@8` 噪声地板 0.015。
+- **E0 读数（iter 8999）：**
+  - `count_MAE_spike` 2.4648；`matched_F1@3/5/8` 0.1504 / 0.3466 / 0.6228；`spike_recall` 0.9511；segm AP 77.40。
+  - 全程峰值：segm AP 78.80、`spike_recall` 0.9511。
+- **KMO 读数（iter 8999）：**
+  - `count_MAE_spike` 2.4878；`matched_F1@3/5/8` 0.1647 / 0.3579 / 0.6378；`spike_recall` 0.9331；segm AP 77.64。
+  - 全程峰值：segm AP 78.60、`spike_recall` 0.9511。
+- **对 E0 的通用线**（沿用 10-07 那批的预注册）：`matched_F1@8` ≥ 0.6428（+0.02）、segm AP 峰值 ≥ 77.80、`spike_recall` 峰值 ≥ 0.9311。
+- **计数护栏**（本组 KMO 臂专用：三个创新点要原理独立，KMO 不能伤计数）：读数那次 `count_MAE_spike` ≤ 2.4648，即不比 E0 差。
+  KMO 自己是 2.4878（+0.023，单种子下在噪声内）。
+- **机制门的数**：用扩展版 `myscripts/backup/vis_process/kmo_match_diag.py`，在本 run 的 `model_final.pth` 上跑，train 集 `--batches 100`。
+
+以上 E0 / KMO 读数已按两个 run 的 `metrics.json` 复核。
+
+### 机制门
+
+- **M1′（头仍学得到）：** e_head < e_const。
+- **M2：** 改判率 ≥ 1%。
+
+参照值来自 B 诊断（KMO，未 detach，final）：e_head 0.01707、e_const 0.01575、改判率 12.7%。
+按 M1′ 这条线，KMO 自己的头也不过；e_const 是知道每穗 GT 中位数的常数，偏乐观。
+
+### 主判据
+
+两条：
+
+- (i) 读数那次计数 ≤ 2.4648；
+- (ii) 读数那次 `matched_F1@8` ≥ 0.6428。
+
+| 条件 | 判定 |
+|:--|:--|
+| (i)、(ii) 都过 | **成立** |
+| (i) 过、(ii) 不过 | **「不伤计数，但定位收益未过线」** |
+| (i) 不过 | **判否**（detach 没消掉副作用） |
+
+### 归因（对 KMO）
+
+报计数与 `matched_F1@8` 之差（C − KMO）；在噪声内不下结论。
+
+### 2×2 归因（与臂 D 合报）
+
+E0 = 都没有，C = 只有匹配，D = 只有辅助损失，KMO = 都有。
+
+- 匹配主效应 = ((C − E0) + (KMO − D)) / 2
+- 辅助损失主效应 = ((D − E0) + (KMO − C)) / 2
+
+在 `matched_F1@8` 与计数上各报，都用读数那次。单种子，F1 小于 0.015 的差不下结论。
+
+### 护栏
+
+- segm AP 峰值 ≥ 77.80；
+- `spike_recall` 峰值 ≥ 0.9311。
+
+## 实施前已完成的验证
+
+### 代码提交 `f7d1140` 的验证
+
+产物在 `output_v2/_smoke-1020-kmo-v2/`，汇总见 `equiv/compare.txt`。
+
+- **默认开关下与 `mini/kmo-matcher` 逐位等价**（默认开关即 `POINT_KMO_DESC=dist`、`POINT_KMO_DETACH=False`）。
+  - 设置：mini train 前 2 张图，训练态 fp32 前向一次。
+  - 结果：138 项 loss 全部逐位相等，参数量 52,438,442，738 个 state_dict 张量的哈希相同。
+- **DETACH 检查**（本臂的组合 dist + DETACH；1 张图，只对 11 个 `loss_point_knn*` 求和后反传）。
+  - 开时，KMO 头以外 409 个参数的梯度全为 None，decoder 0/208 个参数有梯度；KMO 头的各参数都有非零梯度。
+  - 关时，decoder 202/208 个参数有非零梯度，主干也有。
+  - 同一描述子下，开与关的前向 loss 逐位相同。
+
+### 本分支
+
+- **cfg 核对：** 见上「与对照的差异」，新配置相对 KMO 100 epoch 只差 `POINT_KMO_DETACH`。
+- **目标卡冒烟：待补。** 计划如下，脚本是 `output_v2/_smoke-1020-kmo-v2/scripts/detach_run_smoke.sh`：
+  - 新配置原样（`IMS_PER_BATCH` 4），加 `SOLVER.MAX_ITER 40 TEST.EVAL_PERIOD 0 SOLVER.CHECKPOINT_PERIOD 40`，
+    输出到 `output_v2/_smoke-1020-kmo-v2/smoke40-kmo-detach`；
+  - 检查全部 loss 有限、11 个 `loss_point_knn*` 都在，记第 20 iter 之后的 s/iter 与峰值显存；
+  - 再在冒烟的 `model_final.pth` 上跑诊断 `--batches 5`，确认字段齐全。
+
+## 已知限制
+
+- **只能证明「不比 E0 差」。** KMO 自己的计数差（+0.023）在单种子噪声内。
+  即使 detach 真的消掉了副作用，读数上也只能看到「≤ 2.4648」，看不出「比 KMO 好」。
+  反过来，(i) 是不带余量的硬线，单种子噪声也可能让本臂在没有副作用时不过线。
+- **detach 后，KMO 头只能依赖别的损失塑形的特征。**
+  - 头不能再让共享特征迁就自己，ŷ^k 可能学得更差（e_head 变大），匹配项也随之更接近噪声。
+  - 因此本臂里的「匹配」与 KMO 里的「匹配」不完全是同一个东西，2×2 的匹配主效应是这两种头的平均。
+  - 交互项 KMO − C − D + E0 若明显不为零，两个主效应都要打折看。
+- **两个主效应之和恒等于 KMO − E0**（`matched_F1@8` +0.0150、计数 +0.0230）。
+  总量本身就在噪声地板上，拆开后各自更小，2×2 很可能落在噪声内，按「不下结论」处理。
+- **单种子。** 与所有 mini 实验一致，不补种子。
+
+## 成本
+
+- **卡：** 本批启动安排为 xuyu A100 GPU1，与别人的进程（约 16 GB）共卡。
+- **训练：** 12500 iter，约 11.5 h。
+  - 估算依据：KMO 100 epoch 在同一张卡上实测 3.07 s/iter，全程 11:34:34（其中评估 55:43），当时与 mini/q100、mini/iso-norm 共卡。
+  - detach 只省掉 KMO 头往 decoder 的一段反传，开销基本不变。
+  - 目标卡冒烟的 s/iter 待补，出来后据此更新。
+- **诊断：** `model_final` 上的机制诊断（100 batch）约 3 min。

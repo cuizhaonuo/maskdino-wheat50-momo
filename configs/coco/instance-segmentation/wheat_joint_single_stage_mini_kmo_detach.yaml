@@ -1,0 +1,30 @@
+# ============================================================================
+# 单阶段联合训练 · 500 图小集 · KMO 头的输入 detach（mini/kmo-detach，KMO v2 臂 C）
+#   预注册：experiments-bank/ideas/kmo-detach.md（判否线已在跑之前写死）
+#   主对照：E0 = mini/baseline 100 epoch（output_v2/exp-0923-mini-ep100）
+#   归因参照：KMO = mini/kmo-matcher 100 epoch（output_v2/exp-0924-mini-kmo-matcher-ep100），即本文件的 _BASE_
+#
+# 与 wheat_joint_single_stage_mini_kmo_ep100.yaml（KMO 100 epoch）的差异【只有 POINT_KMO_DETACH 一处】
+# （启动前已用解析后的 cfg 逐项核对）：
+#   KMO 头 point_knn_embed 改读 decoder_output.detach()。头仍由 loss_point_knn（×5，最后一层 + 9 个 aux + interm）
+#   训练，但这个损失不再回传到共享的 decoder / 主干；KMO 对模型其余部分只通过内层匹配（Eq.3 的代价项）起作用。
+#   前向数值不变（开 / 关的前向 loss 逐位相同），只切断回传。描述子仍是 dist（k=3 平均近邻距离），
+#   匹配代价权重 5、损失权重 5、schedule（12500 iter = 100 epoch）全部继承不动。
+#
+# 为什么：三个创新点（coral-exist / kmo-matcher / group-nms-match）要放进同一个模型，要求原理独立。
+#   y^k 的方差 43% 在穗间，按穗平均与 Ni 的相关 r = −0.81，是计数信号。内层匹配只在一个穗内做，
+#   穗间那部分对同穗所有 GT 是常数、改不了任何配对，KMO 头却要经共享 decoder 学它，可能就是计数副作用的来源。
+#   detach 后，y^k 不再塑形共享特征，KMO 只剩「改配对」这一条路，原理上与计数独立。
+#   本臂（只有匹配）与臂 D mini/kmo-auxonly（只有辅助损失）合起来，对 E0 / KMO 做 2×2 归因。
+#
+# 用法：
+#   python train_net.py --num-gpus 1 \
+#     --config-file configs/coco/instance-segmentation/wheat_joint_single_stage_mini_kmo_detach.yaml \
+#     OUTPUT_DIR output_v2/<run-name>
+# ============================================================================
+_BASE_: wheat_joint_single_stage_mini_kmo_ep100.yaml
+
+MODEL:
+  MaskDINO:
+    # 默认 False（与 mini/kmo-matcher 逐位一致）；True = KMO 头读 detach 后的 decoder 特征。
+    POINT_KMO_DETACH: True
