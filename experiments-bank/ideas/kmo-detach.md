@@ -1,6 +1,6 @@
 # 想法：KMO 头的输入 detach —— 让 KMO 只通过匹配起作用
 
-状态：**预注册**（判定线在跑之前写死；启动前修订过一次，见文末「预注册修订」）｜ 提出 2026-10-20 ｜ 分支 `mini/kmo-detach`（从 `mini/kmo-dir`@`f7d1140` 开出，代码与 `mini/kmo-dir` 相同）｜ 配置 `configs/coco/instance-segmentation/wheat_joint_single_stage_mini_kmo_detach.yaml` ｜ 输出 `output_v2/exp-1020-mini-kmo-detach`
+状态：**预注册判定：判否**（detach 没消掉副作用：读数那次计数 2.5487，线 ≤ 2.4648；机制门、`matched_F1@8` 0.6443 与护栏都过）｜ 验证于 [exp-2026-10-20-mini-kmo-detach](../experiments/exp-2026-10-20-mini-kmo-detach.md) ｜ 提出 2026-10-20（判定线在跑之前写死，启动前修订过一次，见「预注册修订」）｜ 分支 `mini/kmo-detach`（从 `mini/kmo-dir`@`f7d1140` 开出，代码与 `mini/kmo-dir` 相同）｜ 配置 `configs/coco/instance-segmentation/wheat_joint_single_stage_mini_kmo_detach.yaml` ｜ 输出 `output_v2/exp-1020-mini-kmo-detach`
 
 > KMO v2 三臂之一（臂 C）。三臂都从 `mini/kmo-dir`@`f7d1140` 开出，代码完全相同，只差配置。`f7d1140` 是代码提交，
 > 在 `mini/kmo-matcher`@`3319798` 上给 KMO 加了两个开关，默认值下与 `mini/kmo-matcher` 逐位一致。
@@ -246,3 +246,26 @@ M2 的 1%、护栏 77.80 / 0.9311，都与初稿（`931419c`）相同。
 4. **成本改用本配置在目标卡上的冒烟实测**（3.48 s/iter），并写明用卡是本批的临时例外，附用户原话。
    初稿借用的是 KMO 100 epoch 的 3.07 s/iter。
 5. **冒烟从「待补」改为实测结果**，见「实施前已完成的验证」。
+
+## 结论（2026-10-21）
+
+**预注册判定：「判否」（detach 没消掉副作用）。** 详见 [exp-2026-10-20-mini-kmo-detach](../experiments/exp-2026-10-20-mini-kmo-detach.md)。
+
+| | 臂 C（detach） | KMO | E0 | 线 |
+|:--|--:|--:|--:|--:|
+| M1′ 穗内 Pearson r（终） | **0.508** | 0.544 | — | ≥ 0.3 ✅ |
+| M2 改判率（终） | **13.2%** | 12.7% | — | ≥ 1% ✅ |
+| (i) 读数那次 `count_MAE_spike` | **2.5487**（iter 9999） | 2.4878 | 2.4648 | ≤ 2.4648 ❌ |
+| (ii) 读数那次 `matched_F1@8` | **0.6443** | 0.6378 | 0.6228 | ≥ 0.6428 ✅ |
+| 护栏 segm AP 峰值 | 78.79 | 78.60 | 78.80 | ≥ 77.80 ✅ |
+| 护栏 `spike_recall` 峰值 | 0.9657 | 0.9511 | 0.9511 | ≥ 0.9311 ✅ |
+
+- **机制门通过。** detach 后的头仍学到穗内结构，也照样改配对，所以测到的是「只靠匹配的 KMO」。
+  参照项里头的误差变大：e_head 0.01847，高于由预测点推算的 0.01706。
+- **计数没过线，按判定表判否。** 读数那次比 E0 高 0.084。切断 `loss_point_knn` 经共享 decoder 的回传以后，KMO 的计数劣势仍在：
+  同 iter 比，后半程 13 次评估里 C 有 11 次、KMO 有 12 次计数高于 E0。
+- **定位过线，但对 KMO 的差都在噪声内。** `matched_F1@8` 0.6443，比 E0 高 0.0216。
+  对 KMO：`matched_F1@8` +0.0065（`@3` +0.0009、`@5` +0.0116），计数 +0.061，都不下结论。
+- **计数的形态变了。** 最终评估上，C 的计数偏差回到 E0 水平（+2.40；KMO +2.68），但逐穗相关最弱（r 0.611；E0 0.642、KMO 0.658）。
+  这只是末值上的一次评估，不改判定。
+- 2×2 归因待臂 D（`mini/kmo-auxonly`）出结果后补。未做阈值扫描。
