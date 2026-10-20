@@ -1,0 +1,32 @@
+# ============================================================================
+# 单阶段联合训练 · 500 图小集 · KMO 只留辅助损失、去掉匹配项 · 100 epoch（mini/kmo-auxonly，臂 D）
+#   预注册：experiments-bank/ideas/kmo-auxonly.md（判读线已在跑之前写死）
+#   主对照 E0：wheat_joint_single_stage_mini_ep100.yaml（mini/baseline@0f71161，output_v2/exp-0923-mini-ep100）
+#   归因参照 KMO：wheat_joint_single_stage_mini_kmo_ep100.yaml（mini/kmo-matcher，output_v2/exp-0924-mini-kmo-matcher-ep100）
+#
+# 【归因实验，不是改进实验】回答的是「KMO 现有约 +0.015 的定位收益从哪来」，不是为了再提一个点。
+#
+# 与父配置（KMO 100 epoch）的差异【只有 COST_POINT_KNN_WEIGHT 一处】：5.0 -> 0.0（启动前已用解析后的 cfg 逐项核对）。
+#   - 内层匹配退回 Eq.2：C = 5·|p - p̂|₁ + 2·focal(ĉ)，即纯 L1 + 存在性。
+#     权重 0 时 0·|ŷ^k - y^k| 恒为 0（ŷ^k 过 sigmoid，有限），代价矩阵与不开 KMO 时逐位相同，分配不变。
+#   - KMO 头 point_knn_embed 与 loss_point_knn（×5，含 _0~_8 与 _interm，经共享 decoder 回传）原样保留，
+#     只是改在 L1 配对上监督 ŷ^k。POINT_KMO / POINT_KMO_K / POINT_KNN_WEIGHT / DESC / DETACH 全部继承。
+#   - 数据集、schedule、初始权重、其余损失与匹配代价、INPUT 全部继承不动。
+#
+# 为什么：KMO = 匹配代价 + ŷ^k 辅助回归损失，两者绑在一起。KMO 100 epoch 的 B 诊断显示，头对局部结构的了解
+# 与「由配上槽自己的预测点推算」基本一样（最终 e_head 0.01707 vs e_proxy 0.01721），匹配项在实际中接近
+# 噪声级的平局打破；收益可能主要来自辅助损失对共享特征的塑形。本臂去掉匹配项、只留辅助损失，
+# 与 E0（都没有）、臂 C mini/kmo-detach（只有匹配）、KMO（都有）组成 2×2。
+# 这就是 KMO 最初预注册（kmo-matcher.md）里写过、但一直没跑的消融。
+#
+# 用法：
+#   python train_net.py --num-gpus 1 \
+#     --config-file configs/coco/instance-segmentation/wheat_joint_single_stage_mini_kmo_auxonly.yaml \
+#     OUTPUT_DIR /public/home/zncui/pycharm_project/maskdino-wheat50/output_v2/<run-name>
+# ============================================================================
+_BASE_: wheat_joint_single_stage_mini_kmo_ep100.yaml
+
+MODEL:
+  MaskDINO:
+    # 内层匹配中 KMO 项的权重 5.0 -> 0.0：匹配退回 L1 + 存在性；辅助损失的权重 POINT_KNN_WEIGHT 5.0 继承不动。
+    COST_POINT_KNN_WEIGHT: 0.0
