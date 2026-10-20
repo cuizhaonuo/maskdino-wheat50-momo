@@ -1,6 +1,6 @@
 # 想法：KMO 头的输入 detach —— 让 KMO 只通过匹配起作用
 
-状态：**预注册**（判定线在跑之前写死）｜ 提出 2026-10-20 ｜ 分支 `mini/kmo-detach`（从 `mini/kmo-dir`@`f7d1140` 开出，代码与 `mini/kmo-dir` 相同）｜ 配置 `configs/coco/instance-segmentation/wheat_joint_single_stage_mini_kmo_detach.yaml` ｜ 输出 `output_v2/exp-1020-mini-kmo-detach`
+状态：**预注册**（判定线在跑之前写死；启动前修订过一次，见文末「预注册修订」）｜ 提出 2026-10-20 ｜ 分支 `mini/kmo-detach`（从 `mini/kmo-dir`@`f7d1140` 开出，代码与 `mini/kmo-dir` 相同）｜ 配置 `configs/coco/instance-segmentation/wheat_joint_single_stage_mini_kmo_detach.yaml` ｜ 输出 `output_v2/exp-1020-mini-kmo-detach`
 
 > KMO v2 三臂之一（臂 C）。三臂都从 `mini/kmo-dir`@`f7d1140` 开出，代码完全相同，只差配置。`f7d1140` 是代码提交，
 > 在 `mini/kmo-matcher`@`3319798` 上给 KMO 加了两个开关，默认值下与 `mini/kmo-matcher` 逐位一致。
@@ -24,11 +24,7 @@ group-nms-match（匹配前的逐层点 NMS）。这要求它们原理独立，�
 - KMO 头却要经共享 decoder 学完整的 y^k（L1 ×5；共 11 个 `loss_point_knn*`，来自 interm、初始预测和 9 层 decoder）。
   所以对配对没用的穗间部分，也照样通过 `loss_point_knn` 回传进共享特征。这可能就是 KMO 计数副作用的来源。
 
-已有的计数证据：
-
-- 读数那次（iter 8999），KMO 的计数是 2.4878，E0 是 2.4648，高 0.023，单种子下在噪声内。
-- 末值差得多一些：2.82 vs 2.60，差值几乎全是偏差（逐穗偏差 +2.68 vs +2.41），
-  见 [exp-2026-09-24-mini-kmo-matcher-ep100](../experiments/exp-2026-09-24-mini-kmo-matcher-ep100.md)。
+已有的计数证据：读数那次（iter 8999），KMO 的计数是 2.4878，E0 是 2.4648，高 0.023，单种子下在噪声内。
 
 所以副作用是否真的存在还说不准。本臂要回答的是：去掉这条回传路径以后，KMO 是否不伤计数。
 
@@ -136,11 +132,13 @@ interm、初始预测和 9 层 decoder 的输出都走这个函数，所以 11 �
 
 ### 机制门
 
-- **M1′（头仍学得到）：** e_head < e_const。
-- **M2：** 改判率 ≥ 1%。
+M1′ 在启动前换过线，理由见文末「预注册修订」。两项都在最终 checkpoint 上读。
 
-参照值来自 B 诊断（KMO，未 detach，final）：e_head 0.01707、e_const 0.01575、改判率 12.7%。
-按 M1′ 这条线，KMO 自己的头也不过；e_const 是知道每穗 GT 中位数的常数，偏乐观。
+- **M1′（头仍学得到穗内结构）：** 穗内 Pearson r ≥ 0.3，即诊断的 `posthoc_within_inst_pearson_r`。
+- **M2（不是空操作）：** 改判率 ≥ 1%，即诊断的 `M2_override_rate`。
+
+参照值来自 B 诊断（KMO，未 detach，final）：穗内 r 0.544、改判率 12.7%。
+e_head / e_proxy / e_const（KMO 为 0.01707 / 0.01721 / 0.01575）照常报告，只作参照，不作判据。
 
 ### 主判据
 
@@ -149,11 +147,15 @@ interm、初始预测和 9 层 decoder 的输出都走这个函数，所以 11 �
 - (i) 读数那次计数 ≤ 2.4648；
 - (ii) 读数那次 `matched_F1@8` ≥ 0.6428。
 
+先看机制门，再看主判据和护栏。前两行的判定名是启动前补全的，见文末「预注册修订」。
+
 | 条件 | 判定 |
 |:--|:--|
-| (i)、(ii) 都过 | **成立** |
-| (i) 过、(ii) 不过 | **「不伤计数，但定位收益未过线」** |
-| (i) 不过 | **判否**（detach 没消掉副作用） |
+| 机制门不过（M1′ 或 M2） | **「机制未启动」**：主判据照常读数并报告，但不能归因为「只靠匹配的 KMO」 |
+| 机制门过；(i)、(ii) 都过，护栏不过 | **「主判据过线、护栏未过（不记成立）」** |
+| 机制门过；(i)、(ii) 都过，护栏都过 | **成立** |
+| 机制门过；(i) 过、(ii) 不过 | **「不伤计数，但定位收益未过线」** |
+| 机制门过；(i) 不过 | **判否**（detach 没消掉副作用） |
 
 ### 归因（对 KMO）
 
@@ -190,11 +192,15 @@ E0 = 都没有，C = 只有匹配，D = 只有辅助损失，KMO = 都有。
 ### 本分支
 
 - **cfg 核对：** 见上「与对照的差异」，新配置相对 KMO 100 epoch 只差 `POINT_KMO_DETACH`。
-- **目标卡冒烟：待补。** 计划如下，脚本是 `output_v2/_smoke-1020-kmo-v2/scripts/detach_run_smoke.sh`：
-  - 新配置原样（`IMS_PER_BATCH` 4），加 `SOLVER.MAX_ITER 40 TEST.EVAL_PERIOD 0 SOLVER.CHECKPOINT_PERIOD 40`，
-    输出到 `output_v2/_smoke-1020-kmo-v2/smoke40-kmo-detach`；
-  - 检查全部 loss 有限、11 个 `loss_point_knn*` 都在，记第 20 iter 之后的 s/iter 与峰值显存；
-  - 再在冒烟的 `model_final.pth` 上跑诊断 `--batches 5`，确认字段齐全。
+- **目标卡冒烟**：2026-10-20 14:44–14:52，xuyu A100 GPU1，与别人约 16 GB 的进程共卡；
+  从 `931419c` 启动，脚本是 `output_v2/_smoke-1020-kmo-v2/scripts/detach_run_smoke.sh`。
+  - 设置：新配置原样（`IMS_PER_BATCH` 4），加 `SOLVER.MAX_ITER 40 TEST.EVAL_PERIOD 0 SOLVER.CHECKPOINT_PERIOD 40`。
+    输出在 `output_v2/_smoke-1020-kmo-v2/smoke40-kmo-detach`，启动日志是 `output_v2/_smoke-1020-kmo-v2/smoke40-kmo-detach.launch.log`。
+  - 运行：train rc=0，0 个 Traceback。训练结束时的 val 评估跑通（未训练模型，各指标为 0，`count_MAE_img` 48.74）。
+  - 损失：138 项 loss 全部有限；11 个 `loss_point_knn*` 都在，约 1.60–1.66。
+  - 速度与显存：3.48 s/iter（38 iter 用时 2:12），第 20–39 iter 的中位 iter 时间 2.98 s；`max_mem` 22,877 MiB。
+  - 诊断：在冒烟的 `model_final.pth` 上跑 `--batches 5`，rc=0，字段齐全
+    （含 e_head / e_proxy / e_const 与 `posthoc_within_inst_pearson_r`）。头未训练，数值无意义。产物在 `output_v2/_smoke-1020-kmo-v2/detach/`。
 
 ## 已知限制
 
@@ -211,9 +217,32 @@ E0 = 都没有，C = 只有匹配，D = 只有辅助损失，KMO = 都有。
 
 ## 成本
 
-- **卡：** 本批启动安排为 xuyu A100 GPU1，与别人的进程（约 16 GB）共卡。
-- **训练：** 12500 iter，约 11.5 h。
-  - 估算依据：KMO 100 epoch 在同一张卡上实测 3.07 s/iter，全程 11:34:34（其中评估 55:43），当时与 mini/q100、mini/iso-norm 共卡。
-  - detach 只省掉 KMO 头往 decoder 的一段反传，开销基本不变。
-  - 目标卡冒烟的 s/iter 待补，出来后据此更新。
+- **卡：** xuyu A100 GPU1，与别人的进程（约 16 GB）共卡。
+  - 这是本批的临时例外。CLAUDE.md 只许用 qiuhao A100 GPU1。
+  - 用户 2026-10-20 原话：「这次你可以在 ssh qiuhao 的卡 0, ssh xuyu 的卡 0 和 1 和 ssh baiju 的卡 0 上同时进行」。
+- **训练：** 12500 iter，按冒烟实测 3.48 s/iter 估约 12.1 h。
+- **评估：** 25 次约 1 h（KMO 100 epoch 的 25 次评估共 55:43）。
+- **合计：** 约 13 h。可能偏保守：冒烟只有 38 iter，均值受个别慢 iter 影响，第 20–39 iter 的中位是 2.98 s；
+  KMO 100 epoch 在同一张卡上全程实测 3.07 s/iter（11:34:34）。
 - **诊断：** `model_final` 上的机制诊断（100 batch）约 3 min。
+
+## 预注册修订（2026-10-20，启动前）
+
+正式训练启动前改了以下几处。除 M1′ 换线外，判据线的数值一条没动：主判据 (i) ≤ 2.4648 与 (ii) ≥ 0.6428、
+M2 的 1%、护栏 77.80 / 0.9311，都与初稿（`931419c`）相同。
+
+1. **M1′ 换线：e_head < e_const → 穗内 Pearson r ≥ 0.3**（最终 checkpoint，`posthoc_within_inst_pearson_r`）。
+   - 原线不可用。dist 的 e_const 是知道每穗 GT 中位数的常数，偏乐观，B 诊断表里也标为「只作参照」。
+     连没有 detach 的 KMO 自己的头都不过（final 0.01707 vs 0.01575），按原线本臂几乎必然不过，机制门失去区分力。
+   - 新线取自 KMO 100 epoch 原预注册（[kmo-matcher-ep100](kmo-matcher-ep100.md)）的 M1′，KMO 实测 0.544。
+     它直接检验头在同一穗内各槽之间有没有信号，这正是 KMO 改配对所需要的。
+   - e_head / e_proxy / e_const 照常报告，只作参照。
+2. **补全判定名。** 初稿只列了机制门和主判据，没写下面两种情况怎么判：
+   - 机制门（M1′ 或 M2）不过：主判据照常读数，但判定写「机制未启动」。
+     这时 detach 后的头没学到穗内结构，或者不改配对，端到端差异不能归因为「只靠匹配的 KMO」。
+   - (i)、(ii) 都过，但护栏不过：写「主判据过线、护栏未过（不记成立）」。
+3. **删去动机里 KMO 末值计数那句**（2.82 vs 2.60，偏差 +2.68 vs +2.41）。
+   对比一律用后半程 `count_MAE_spike` 最低那次的读数，不用 model_final 末值。
+4. **成本改用本配置在目标卡上的冒烟实测**（3.48 s/iter），并写明用卡是本批的临时例外，附用户原话。
+   初稿借用的是 KMO 100 epoch 的 3.07 s/iter。
+5. **冒烟从「待补」改为实测结果**，见「实施前已完成的验证」。
