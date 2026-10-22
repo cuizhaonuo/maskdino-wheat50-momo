@@ -1,5 +1,7 @@
 # 想法（完整集）：分组 decoder + 小穗 token 逐层点 NMS 后再内层匹配 · full/group-nms-match
 
+> **结果**（2026-10-22 补记）：[exp-2026-10-09-full-group-nms-match](../experiments/exp-2026-10-09-full-group-nms-match.md) —— 按原文判定 **成立**：count 后半程峰值 2.4669 ≤ 2.49，机制读数与推理-only 对照（2026-10-22 补做）都过。附注：这条线拿本臂峰值比 p30 末值，p30 自己的后半程最低 2.4645 也在线下，同 iter 平均只低 0.17。
+
 状态：**预注册**（判定线在跑之前写死）｜ 提出 2026-10-09 ｜ 分支 `full/group-nms-match`（从 `full/combo`@`3bd2071` 开出）｜ 配置
 `wheat_joint_single_stage_full_group_nms_match.yaml`（`_BASE_` 为 `wheat_joint_single_stage.yaml`）｜ 输出 `output_v2/exp-1009-full-group-nms-match`
 ｜ mini 对应臂：`mini/group-nms-match`（[exp-2026-10-08-mini-group-nms-match](../experiments/exp-2026-10-08-mini-group-nms-match.md)：
