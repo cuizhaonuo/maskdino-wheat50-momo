@@ -1,5 +1,7 @@
 # 想法（完整集）：三合一完整模型 coral-exist + kmo-matcher + group-nms-match · full/combo
 
+> **结果**（2026-10-22 补记）：[exp-2026-10-09-full-combo](../experiments/exp-2026-10-09-full-combo.md) —— 判定 **判否**：`matched_F1@8` 后半程峰值 0.6242 ≤ 0.6477；count 峰值 1.3393 也没到「优于各单点」的 1.3190。另含 2³ 立方体总表。
+
 状态：**预注册**（判定线在跑之前写死）｜ 提出 2026-10-09 ｜ 分支 `full/combo`（merge base `mini/group-nms-match`@`bfe1d7e`，
 合并 `mini/coral-exist`@`f029805`、`mini/kmo-matcher`@`3319798`，组合语义提交 `3582dbf`）｜ 配置
 `wheat_joint_single_stage_full_combo.yaml`（`_BASE_` 为 `wheat_joint_single_stage_full_group_nms_match.yaml`）｜ 输出 `output_v2/exp-1009-full-combo`
