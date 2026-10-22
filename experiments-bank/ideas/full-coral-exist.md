@@ -1,5 +1,7 @@
 # 想法（完整集）：秩一致存在性头 + 前缀内层匹配 · full/coral-exist
 
+> **结果**（2026-10-22 补记）：[exp-2026-10-09-full-coral-exist](../experiments/exp-2026-10-09-full-coral-exist.md) —— 判定 **成立**：后半程峰值 count 1.3690（iter 16999）≤ 2.49、`matched_F1@8` 0.6348（iter 24999）≥ 0.6327，护栏全过。
+
 状态：**预注册**（判定线在跑之前写死）｜ 提出 2026-10-09 ｜ 分支 `full/coral-exist`（从 `full/combo`@`3bd2071` 开出）｜ 配置
 `wheat_joint_single_stage_full_coral_exist.yaml`（`_BASE_` 为 `wheat_joint_single_stage.yaml`）｜ 输出 `output_v2/exp-1009-full-coral-exist`
 ｜ mini 对应臂：`mini/coral-exist`（[exp-2026-09-26-mini-coral-exist](../experiments/exp-2026-09-26-mini-coral-exist.md)：count_MAE_spike 峰值 1.67，
