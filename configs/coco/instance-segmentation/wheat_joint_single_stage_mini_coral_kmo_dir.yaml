@@ -1,0 +1,44 @@
+# ============================================================================
+# 单阶段联合训练 · 500 图小集 · CORAL 前缀内层匹配 + KMO 近邻方向描述子（mini/coral-kmo-dir，方案 A）
+#   预注册：experiments-bank/ideas/coral-kmo-dir.md（判定线已在跑之前写死）
+#   主判据：对 coral-exist（mini/coral-exist，output_v2/exp-0926-mini-coral-exist）的 matched_F1@8 增量
+#   主对照 E0：mini/baseline 100 epoch（output_v2/exp-0923-mini-ep100），通用线照报
+#
+# 与 wheat_joint_single_stage_mini_coral_exist.yaml（coral-exist）的差异【只有 KMO 的几项】，
+# 取值与 mini/kmo-dir 臂（wheat_joint_single_stage_mini_kmo_dir.yaml）完全相同，两者之间只差「有没有 coral-exist」：
+#   POINT_KMO True、POINT_KMO_DESC "dir"、POINT_KMO_K 2、POINT_KMO_DIR_SCALE 0.13044、
+#   COST_POINT_KNN_WEIGHT 5.0、POINT_KNN_WEIGHT 5.0、POINT_KMO_DETACH False。
+#   后四项等于 maskdino/config.py 的默认值，显式写出只为对照。启动前已用解析后的 cfg 逐项核对：
+#   对 coral-exist 只差 POINT_KMO、POINT_KMO_DESC、POINT_KMO_K 三个键；
+#   对 mini/kmo-dir 只差 POINT_CORAL_EXIST（True）与 TEST.POINT_THRESHOLD（0.35 -> 0.5），两项都来自 coral-exist。
+#
+# 两者都开时（maskdino/modeling/criterion.py 的 _inner_point_match）：
+#   内层匹配只让前 m = min(Ni, 25) 个 slot 参与匈牙利（coral-exist 的前缀），KMO 项加在这个已经限制到前缀的
+#   [m, Ni] 代价上：C = L1(p, g) + (COST_POINT_KNN_WEIGHT / COST_POINT_COORD_WEIGHT)·s·|ĉ - c|₁，
+#   KMO 对坐标的相对权重与单独用 KMO 时相同。被选中的行集合恒为前缀，CORAL 的 levels 不变：
+#   KMO 只能决定「正样本槽配哪个小穗」，改不了「哪些槽是正样本」。loss_point_knn 照常只在配上的槽上算。
+#
+# 为什么做：单独用 KMO 时，它改变的配对里约 85% 是「哪些槽被选为正样本」变了，这正是 coral-exist 的前缀会固定住的东西。
+#   本臂把 KMO 放进前缀，测它在组合里还有没有独立贡献。
+#
+# 用法：
+#   python train_net.py --num-gpus 1 \
+#     --config-file configs/coco/instance-segmentation/wheat_joint_single_stage_mini_coral_kmo_dir.yaml \
+#     OUTPUT_DIR /public/home/zncui/pycharm_project/maskdino-wheat50/output_v2/exp-<MMDD>-mini-coral-kmo-dir
+# ============================================================================
+_BASE_: wheat_joint_single_stage_mini_coral_exist.yaml
+
+MODEL:
+  MaskDINO:
+    POINT_KMO: True
+    # 近邻方向描述子（2 维，tanh），定义见 maskdino/config.py 的 POINT_KMO_DESC。
+    POINT_KMO_DESC: "dir"
+    # 近邻数（不含自身）：与 mini/kmo-dir 相同，K = 2。
+    POINT_KMO_K: 2
+    # 尺度 s：mini train 全部 wheat_2（Ni>=2）GT 小穗到其 2 个最近邻的平均距离（框相对）的中位数（43024 点）。
+    POINT_KMO_DIR_SCALE: 0.13044
+    # KMO 代价与 ŷ^k 损失的权重，都与坐标项同权（5）。
+    COST_POINT_KNN_WEIGHT: 5.0
+    POINT_KNN_WEIGHT: 5.0
+    # 头读未 detach 的 decoder 输出，与 mini/kmo-dir 相同。
+    POINT_KMO_DETACH: False
