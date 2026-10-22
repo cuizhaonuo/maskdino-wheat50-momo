@@ -1,0 +1,40 @@
+# ============================================================================
+# mini/density-count · 每穗计数交给「密度图在预测 mask 内的积分」
+#   预注册：experiments-bank/ideas/density-count.md（判否线已在跑之前写死）
+#
+# 与 wheat_joint_single_stage_mini_ep100.yaml（mini/baseline 的 100 epoch 基线）的差异：
+#   MODEL.MaskDINO.POINT_DENSITY_HEAD: True
+#     pixel decoder 的 mask_features（1/4 分辨率、256 通道）上接 point_density_head
+#     （3x3 conv 256->128 + GN + ReLU，3x3 conv 128->64 + GN + ReLU，1x1 conv -> softplus），
+#     输出非负密度 D = 每个 1/4 分辨率像素上的小穗数。多两项损失，都只在最后一层算一次：
+#       loss_density       全图逐像素 (D − T)²，每图求和、batch 平均；T = 每个 GT wheat_2 小穗点一个
+#                          σ = POINT_DENSITY_SIGMA（1/4 像素）的归一化高斯；LSJ 截断降级的穗在其 mask 内不计。
+#       loss_density_count 外层匹配上的 wheat_2（Ni >= 1）上 |Σ D·σ(mask_logit.detach()) − Ni|，
+#                          只算预测 mask 与 GT mask IoU >= 0.5 的对，除以这类 GT 实例数。
+#   MODEL.MaskDINO.POINT_DENSITY_WEIGHT: 2.0（默认 1.0）
+#     开训时计数项被 IoU 筛选整体挡掉（mask 还没学好），两项合计的初始占比就是稠密项的占比：
+#     未乘权重约 9.9 / 图（固定 batch 实测 9.898；LSJ 500 次采样 ΣT² 均值 9.95），×2.0 约占总损失 3.3%~4%，
+#     落在 brief 规定的 3%~5%（参照 mini/count-residual 计数损失的初始占比 3.2%）。
+#   MODEL.MaskDINO.POINT_DENSITY_COUNT_WEIGHT: 1.0（= 默认值）：每个实例 |n̂ − Ni| 单位权重，只算最后一层。
+#   MODEL.MaskDINO.TEST.POINT_COUNT_SOURCE: density
+#     wheat_2 的每穗计数 = round(Σ D ⊙ 1[mask_logit > 0])，1/4 分辨率、上采样之前；小穗点照旧按 POINT_THRESHOLD 输出。
+#     同一 checkpoint 用 CLI 覆盖 MODEL.MaskDINO.TEST.POINT_COUNT_SOURCE points 可换回存在性读法再评。
+#   POINT_DENSITY_SIGMA / POINT_DENSITY_COUNT_MIN_IOU / POINT_DENSITY_DETACH / POINT_DENSITY_COUNT_WEIGHT 与默认值相同，写出来只为显式。
+#
+# 用法：
+#   python train_net.py --num-gpus 1 \
+#     --config-file configs/coco/instance-segmentation/wheat_joint_single_stage_mini_density_count.yaml \
+#     OUTPUT_DIR /public/home/zncui/pycharm_project/maskdino-wheat50/output_v2/<run-name>
+# ============================================================================
+_BASE_: wheat_joint_single_stage_mini_ep100.yaml
+
+MODEL:
+  MaskDINO:
+    POINT_DENSITY_HEAD: True
+    POINT_DENSITY_SIGMA: 1.0
+    POINT_DENSITY_WEIGHT: 2.0
+    POINT_DENSITY_COUNT_WEIGHT: 1.0
+    POINT_DENSITY_COUNT_MIN_IOU: 0.5
+    POINT_DENSITY_DETACH: False
+    TEST:
+      POINT_COUNT_SOURCE: "density"

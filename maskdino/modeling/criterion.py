@@ -9,6 +9,7 @@
 MaskFormer criterion.
 """
 import logging
+import math
 
 import torch
 import torch.nn.functional as F
@@ -145,7 +146,9 @@ class SetCriterion(nn.Module):
     def __init__(self, num_classes, matcher, weight_dict, eos_coef, losses,
                  num_points, oversample_ratio, importance_sample_ratio,dn="no",dn_losses=[], panoptic_on=False, semantic_ce_loss=False,
                  num_spikelet_points=50, point_cost_coord=5.0, point_cost_class=2.0,
-                 point_focal_alpha=0.25, point_empty_cls_weight=1.0):
+                 point_focal_alpha=0.25, point_empty_cls_weight=1.0,
+                 point_density=False, point_density_sigma=1.0, point_density_count_min_iou=0.5,
+                 spikelet_class_id=1):
         """Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
@@ -183,6 +186,13 @@ class SetCriterion(nn.Module):
         self.point_focal_alpha = point_focal_alpha
         # Ni==0 实例的存在性损失权重（只作用于 cls_loss 的分子，不影响 denom）
         self.point_empty_cls_weight = point_empty_cls_weight
+        # 小穗密度头（mini/density-count）：point_density=True 时 forward 在最后一层额外算 loss_density /
+        # loss_density_count（见 loss_density），不进 self.losses，因此不随 interm / aux 深监督复制。
+        self.point_density = bool(point_density)
+        self.point_density_sigma = float(point_density_sigma)
+        self.point_density_count_min_iou = float(point_density_count_min_iou)
+        self.spikelet_class_id = int(spikelet_class_id)
+        self._num_density_count_norm = 1.0   # 每次 forward 按 num_masks 的跨卡做法重算
 
     def loss_labels_ce(self, outputs, targets, indices, num_masks):
         """Classification loss (NLL)
@@ -422,6 +432,100 @@ class SetCriterion(nn.Module):
         }
         return losses
 
+    @torch.no_grad()
+    def render_density_target(self, points_px, h, w, stride):
+        """把一张图的 GT 小穗点渲染成 1/4 分辨率的目标密度 [h, w]（fp32），每个点的质量恰为 1。
+
+        坐标约定与 mask 上采样（bilinear, align_corners=False）一致：增广图连续坐标 x（像素 u 覆盖 [u, u+1)）
+        落在 1/stride 网格的连续坐标 x / stride 处，网格像素 j 的中心在 j + 0.5。
+        每个点取 ±ceil(3σ) 的窗口算可分离高斯，出图的格子置 0，再按窗口内总和归一 ——
+        截断与贴边都不丢质量，目标总质量 = 点数。
+        Args:
+            points_px: [K, 2] (x, y)，增广后图像的像素坐标
+        """
+        out = torch.zeros(h * w, dtype=torch.float32, device=points_px.device)
+        if points_px.numel() == 0:
+            return out.view(h, w)
+        sigma = self.point_density_sigma
+        r = int(math.ceil(3.0 * sigma))
+        p = points_px.float() / float(stride)                         # [K, 2] 网格连续坐标
+        base = torch.floor(p).long()                                  # 点所在的格子
+        offs = torch.arange(-r, r + 1, device=p.device)
+        ix = base[:, 0:1] + offs[None]                                # [K, 2r+1]
+        iy = base[:, 1:2] + offs[None]
+        gx = torch.exp(-((ix.float() + 0.5 - p[:, 0:1]) ** 2) / (2 * sigma ** 2))
+        gy = torch.exp(-((iy.float() + 0.5 - p[:, 1:2]) ** 2) / (2 * sigma ** 2))
+        vx = (ix >= 0) & (ix < w)
+        vy = (iy >= 0) & (iy < h)
+        g = (gy * vy)[:, :, None] * (gx * vx)[:, None, :]            # [K, 2r+1, 2r+1]，出图的格子为 0
+        g = g / g.sum(dim=(1, 2), keepdim=True).clamp(min=1e-12)      # 每点质量归一为 1
+        valid = vy[:, :, None] & vx[:, None, :]
+        flat = iy[:, :, None] * w + ix[:, None, :]
+        out.index_add_(0, flat[valid], g[valid])
+        return out.view(h, w)
+
+    def loss_density(self, outputs, targets, indices):
+        """小穗密度头的两项损失，只在最后一层（indices 是最后一层的外层匹配）算一次。
+
+        loss_density（稠密）：Σ_像素 (D − T)²，每图求和、对 batch 取平均。T 由 render_density_target 渲染
+          该图所有 GT wheat_2 小穗点（LSJ 截断降级的穗点已被 mapper 清空，不在其中）；
+          被降级的穗在其 GT mask（1/4 网格上 max-pool 后再外扩 1 格）内不计损失 —— 那里有可见小穗，但没有点。
+        loss_density_count（实例）：外层匹配上的 wheat_2（Ni >= 1）上 |n̂ − Ni|，n̂ = Σ D ⊙ σ(mask_logit.detach())，
+          mask_logit 取该 query 最后一层 1/4 网格上的 logit，detach 后只当积分区域，不给 mask 头 / decoder 任何梯度。
+          只算预测 mask（logit > 0）与 GT mask（1/4 网格上面积占比 >= 0.5）IoU >= point_density_count_min_iou 的对；
+          除以 batch 里 wheat_2 且 Ni >= 1 的 GT 实例数（self._num_density_count_norm），
+          所以 mask 还没学好时这一项自然很小、随 mask 变好逐步加大。
+        全程 fp32（D 本身是 fp32；mask logit 转 fp32；只用逐元素运算，不走 autocast 的 fp16 路径）。
+        """
+        assert 'pred_density' in outputs, "POINT_DENSITY_HEAD=True 但 outputs 里没有 pred_density"
+        dens = outputs['pred_density']                                # [B, h, w] fp32
+        B, h, w = dens.shape
+        h_pad, w_pad = targets[0]['masks'].shape[-2:]
+        stride = h_pad // h
+        assert stride * h == h_pad and stride * w == w_pad, (dens.shape, (h_pad, w_pad))
+
+        # ---- 稠密项 ----
+        with torch.no_grad():
+            tgt = torch.stack([self.render_density_target(t['density_points'], h, w, stride) for t in targets])
+            keep = torch.ones_like(tgt, dtype=torch.bool)
+            for b, t in enumerate(targets):
+                dm = t['demoted']
+                if bool(dm.any()):
+                    m = t['masks'][dm].float()[:, None]                              # [k, 1, H, W]
+                    m = F.max_pool2d(m, kernel_size=stride, stride=stride)           # 落进格子就算
+                    m = F.max_pool2d(m, kernel_size=3, stride=1, padding=1)          # 外扩 1 格（σ 的溢出）
+                    keep[b] = ~(m.amax(dim=0)[0] > 0)
+        sq = (dens.float() - tgt) ** 2
+        loss_dense = (sq * keep.to(sq.dtype)).sum() / B
+
+        # ---- 实例计数项 ----
+        dev = dens.device
+        src_b, src_q = (x.to(dev) for x in self._get_src_permutation_idx(indices))
+        tgt_j = torch.cat([J for (_, J) in indices]).to(dev)
+        labels = torch.cat([t['labels'][J] for t, (_, J) in zip(targets, indices)]).to(dev)
+        n_gt = torch.cat([t['point_counts'][J] for t, (_, J) in zip(targets, indices)]).float().to(dev)
+        valid = (labels == self.spikelet_class_id) & (n_gt >= 1)
+        if bool(valid.any()):
+            vb, vq, vj = src_b[valid], src_q[valid], tgt_j[valid]
+            logit = outputs['pred_masks'][vb, vq].detach().float()                  # [M, h, w]
+            n_hat = (dens[vb].float() * logit.sigmoid()).sum(dim=(1, 2))            # [M]
+            use = torch.ones_like(n_hat)
+            if self.point_density_count_min_iou > 0:
+                with torch.no_grad():
+                    gm = torch.stack([targets[b]['masks'][j]
+                                      for b, j in zip(vb.tolist(), vj.tolist())]).float()   # [M, H, W]
+                    gm = F.avg_pool2d(gm[:, None], kernel_size=stride, stride=stride)[:, 0] >= 0.5
+                    pm = logit > 0
+                    inter = (pm & gm).flatten(1).sum(1).float()
+                    union = (pm | gm).flatten(1).sum(1).float()
+                    iou = inter / union.clamp(min=1.0)
+                    use = (iou >= self.point_density_count_min_iou).to(n_hat.dtype)
+            err = (n_hat - n_gt[valid]).abs() * use
+            loss_count = err.sum() / self._num_density_count_norm
+        else:
+            loss_count = dens.sum() * 0.0
+        return {'loss_density': loss_dense, 'loss_density_count': loss_count}
+
     def prep_for_dn(self,mask_dict):
         output_known_lbs_bboxes = mask_dict['output_known_lbs_bboxes']
 
@@ -490,6 +594,17 @@ class SetCriterion(nn.Module):
             torch.distributed.all_reduce(num_masks)
         num_masks = torch.clamp(num_masks / get_world_size(), min=1).item()
 
+        # 密度计数损失的归一化分母：GT 里 wheat_2 且 Ni >= 1 的实例数，跨卡做法照 num_masks。
+        if self.point_density:
+            num_cnt = sum(int(((t['labels'] == self.spikelet_class_id) & (t['point_counts'] >= 1)).sum())
+                          for t in targets)
+            num_cnt = torch.as_tensor(
+                [num_cnt], dtype=torch.float, device=next(iter(outputs.values())).device
+            )
+            if is_dist_avail_and_initialized():
+                torch.distributed.all_reduce(num_cnt)
+            self._num_density_count_norm = torch.clamp(num_cnt / get_world_size(), min=1).item()
+
         # debug 可视化：正负样本匹配。此处的 indices 才是最后一层 decoder 的匹配结果
         # （forward 末尾 return 的 indices 已被 aux / interm 分支覆盖，不能用来画图）。
         if maybe_visualize_matching is not None:
@@ -505,6 +620,9 @@ class SetCriterion(nn.Module):
         losses = {}
         for loss in self.losses:
             losses.update(self.get_loss(loss, outputs, targets, indices, num_masks))
+        # 小穗密度头：只在最后一层算（此处的 indices 是最后一层的外层匹配，下面的 aux / interm 循环会覆盖它）
+        if self.point_density:
+            losses.update(self.loss_density(outputs, targets, indices))
 
         if self.dn != "no" and mask_dict is not None:
             l_dict={}

@@ -5,13 +5,14 @@
 # ------------------------------------------------------------------------
 # Modified from Mask2Former https://github.com/facebookresearch/Mask2Former by Feng Li and Hao Zhang.
 import logging
+import math
 import fvcore.nn.weight_init as weight_init
 import torch
 from torch import nn
 from torch.nn import functional as F
 
 from detectron2.config import configurable
-from detectron2.layers import Conv2d
+from detectron2.layers import Conv2d, get_norm
 from detectron2.utils.registry import Registry
 from detectron2.structures import BitMasks
 
@@ -24,6 +25,37 @@ TRANSFORMER_DECODER_REGISTRY = Registry("TRANSFORMER_MODULE")
 TRANSFORMER_DECODER_REGISTRY.__doc__ = """
 Registry for transformer module in MaskDINO.
 """
+
+
+class PointDensityHead(nn.Module):
+    """小穗密度头（mini/density-count）：mask_features [B, C, H/4, W/4] -> 非负密度 D [B, H/4, W/4]（fp32）。
+
+    D 的单位是「每个 1/4 分辨率像素上的小穗数」，某个区域内的小穗数 = D 在该区域内的和。
+    结构：3x3 conv(C->128)+GN+ReLU -> 3x3 conv(128->64)+GN+ReLU -> 1x1 conv(64->1) -> softplus。
+    softplus 在 fp32 里算（AMP 下 conv 输出是 fp16，背景处 D ~ 1e-3，平方后在 fp16 里会掉进次正规数）。
+
+    初值：两层隐层 c2_msra_fill；输出层 weight ~ N(0, 0.01)，bias = softplus 的反函数(prior)，
+    开训时 D 近似为常数 prior（每像素平均小穗数），全图积分约等于一张 LSJ 增广图里的平均 wheat_2 点数。
+    prior 8.75e-4 = mini train 经 LSJ mapper（含截断降级）500 次采样的平均 57.4 点 ÷ 256² 格
+    （output_v2/_smoke-1022-density-count/stats/lsj_stats.json）。
+    """
+
+    def __init__(self, in_channels: int, hidden=(128, 64), prior: float = 8.75e-4):
+        super().__init__()
+        c1, c2 = hidden
+        self.conv1 = Conv2d(in_channels, c1, kernel_size=3, padding=1, bias=False,
+                            norm=get_norm("GN", c1), activation=F.relu)
+        self.conv2 = Conv2d(c1, c2, kernel_size=3, padding=1, bias=False,
+                            norm=get_norm("GN", c2), activation=F.relu)
+        self.out = nn.Conv2d(c2, 1, kernel_size=1)
+        weight_init.c2_msra_fill(self.conv1)
+        weight_init.c2_msra_fill(self.conv2)
+        nn.init.normal_(self.out.weight, std=0.01)
+        nn.init.constant_(self.out.bias, math.log(math.expm1(prior)))
+
+    def forward(self, x):
+        z = self.out(self.conv2(self.conv1(x)))
+        return F.softplus(z.float()).squeeze(1)
 
 
 def build_transformer_decoder(cfg, in_channels, mask_classification=True):
@@ -68,6 +100,8 @@ class MaskDINODecoder(nn.Module):
             query_dim: int = 4,
             dec_layer_share: bool = False,
             semantic_ce_loss: bool = False,
+            point_density_head: bool = False,
+            point_density_detach: bool = False,
     ):
         """
         NOTE: this interface is experimental.
@@ -171,6 +205,20 @@ class MaskDINODecoder(nn.Module):
         self.bbox_embed = nn.ModuleList(box_embed_layerlist)
         self.decoder.bbox_embed = self.bbox_embed
 
+        # ===== 小穗密度头（POINT_DENSITY_HEAD=True 才建，mini/density-count）=====
+        # 读 forward 的 mask_features（pixel decoder 输出，1/4 分辨率、mask_dim 通道，与 mask 预测共用），
+        # 输出 out['pred_density']（[B, H/4, W/4]，fp32）。
+        # - 建在 __init__ 末尾：已有模块的参数初始化顺序不变，打开时已有参数的初值与关闭时逐位相同
+        #   （decoder 是整个模型里最后一个建参数的模块）。
+        # - 用 fork_rng 包住：建完后全局 CPU 随机数状态恢复成没建时的样子，之后的数据增广随机流
+        #   （DataLoader worker 的种子取自全局 CPU RNG）与开关关闭时相同。
+        # - point_density_detach=True 时读 mask_features.detach()，密度损失不回传进 pixel decoder。
+        self.point_density_head = None
+        self.point_density_detach = point_density_detach
+        if point_density_head:
+            with torch.random.fork_rng(devices=[]):
+                self.point_density_head = PointDensityHead(mask_dim)
+
 
     @classmethod
     def from_config(cls, cfg, in_channels, mask_classification):
@@ -198,6 +246,8 @@ class MaskDINODecoder(nn.Module):
         ret["learn_tgt"] = cfg.MODEL.MaskDINO.LEARN_TGT
         ret["total_num_feature_levels"] = cfg.MODEL.SEM_SEG_HEAD.TOTAL_NUM_FEATURE_LEVELS
         ret["semantic_ce_loss"] = cfg.MODEL.MaskDINO.TEST.SEMANTIC_ON and cfg.MODEL.MaskDINO.SEMANTIC_CE_LOSS and ~cfg.MODEL.MaskDINO.TEST.PANOPTIC_ON
+        ret["point_density_head"] = cfg.MODEL.MaskDINO.POINT_DENSITY_HEAD
+        ret["point_density_detach"] = cfg.MODEL.MaskDINO.POINT_DENSITY_DETACH
 
         return ret
 
@@ -611,6 +661,11 @@ class MaskDINODecoder(nn.Module):
         }
         if self.two_stage:
             out['interm_outputs'] = interm_outputs
+        # 小穗密度图 D（[bs, H/4, W/4]，fp32，与 pred_masks 同一网格）：每张图一份，不分层、不分 query。
+        # 密度头关着时不放这个键，下游（criterion / 推理）据此跳过。
+        if self.point_density_head is not None:
+            mf = mask_features.detach() if self.point_density_detach else mask_features
+            out['pred_density'] = self.point_density_head(mf)
         return out, mask_dict
 
     def forward_prediction_heads(self, output, mask_features, pred_mask=True):

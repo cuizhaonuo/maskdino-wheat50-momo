@@ -54,6 +54,9 @@ class MaskDINO(nn.Module):
         transform_eval: bool = False,
         semantic_ce_loss: bool = False,
         point_threshold: float = 0.35,
+        point_density_head: bool = False,
+        point_count_source: str = "points",
+        point_count_line: Tuple[float, float] = (8.924, 0.0345),
     ):
         """
         Args:
@@ -111,6 +114,14 @@ class MaskDINO(nn.Module):
         # 小穗点推理：存在性阈值 + 带小穗的类别（wheat_2 的连续 id=1，只有该类输出点）
         self.point_threshold = point_threshold
         self.spikelet_class_id = 1
+        # 小穗密度头（mini/density-count）：训练时 prepare_targets 给 targets 带上密度监督要用的字段；
+        # 推理时 point_count_source 决定 wheat_2 的 pred_spikelet_counts 怎么来（见 config.py）。
+        self.point_density_head = point_density_head
+        assert point_count_source in ("points", "density"), point_count_source
+        if point_count_source == "density":
+            assert point_density_head, "TEST.POINT_COUNT_SOURCE=density 需要 MODEL.MaskDINO.POINT_DENSITY_HEAD=True"
+        self.point_count_source = point_count_source
+        self.point_count_line = (float(point_count_line[0]), float(point_count_line[1]))
 
         if not self.semantic_on:
             assert self.sem_seg_postprocess_before_inference
@@ -176,6 +187,10 @@ class MaskDINO(nn.Module):
             for i in range(dec_layers):
                 aux_weight_dict.update({k + f"_{i}": v for k, v in weight_dict.items()})
             weight_dict.update(aux_weight_dict)
+        # 小穗密度头的两项损失只在最后一层算一次：在 _interm / _dn / _{i} 扩展之后再加，不产生带后缀的键
+        if cfg.MODEL.MaskDINO.POINT_DENSITY_HEAD:
+            weight_dict.update({"loss_density": cfg.MODEL.MaskDINO.POINT_DENSITY_WEIGHT,
+                                "loss_density_count": cfg.MODEL.MaskDINO.POINT_DENSITY_COUNT_WEIGHT})
         if cfg.MODEL.MaskDINO.BOX_LOSS:
             losses = ["labels", "masks","boxes","points"]
         else:
@@ -199,6 +214,9 @@ class MaskDINO(nn.Module):
             point_cost_class=cfg.MODEL.MaskDINO.COST_POINT_CLASS_WEIGHT,
             point_focal_alpha=cfg.MODEL.MaskDINO.POINT_FOCAL_ALPHA,
             point_empty_cls_weight=cfg.MODEL.MaskDINO.POINT_EMPTY_CLS_WEIGHT,
+            point_density=cfg.MODEL.MaskDINO.POINT_DENSITY_HEAD,
+            point_density_sigma=cfg.MODEL.MaskDINO.POINT_DENSITY_SIGMA,
+            point_density_count_min_iou=cfg.MODEL.MaskDINO.POINT_DENSITY_COUNT_MIN_IOU,
         )
 
         return {
@@ -228,6 +246,9 @@ class MaskDINO(nn.Module):
             "pano_temp": cfg.MODEL.MaskDINO.TEST.PANO_TEMPERATURE,
             "semantic_ce_loss": cfg.MODEL.MaskDINO.TEST.SEMANTIC_ON and cfg.MODEL.MaskDINO.SEMANTIC_CE_LOSS and not cfg.MODEL.MaskDINO.TEST.PANOPTIC_ON,
             "point_threshold": cfg.MODEL.MaskDINO.TEST.POINT_THRESHOLD,
+            "point_density_head": cfg.MODEL.MaskDINO.POINT_DENSITY_HEAD,
+            "point_count_source": cfg.MODEL.MaskDINO.TEST.POINT_COUNT_SOURCE,
+            "point_count_line": tuple(cfg.MODEL.MaskDINO.POINT_COUNT_LINE),
         }
 
     @property
@@ -307,6 +328,16 @@ class MaskDINO(nn.Module):
             # 小穗点预测（框相对归一化 [0,1]）
             point_coord_results = outputs["pred_point_coords"]   # [B, Q, P, 2]
             point_logit_results = outputs["pred_point_logits"]   # [B, Q, P, 1]
+            # 小穗密度图（密度头关着时没有这个键）。每个 query 的密度计数在 1/4 分辨率、mask 上采样之前算：
+            # n̂_q = Σ D ⊙ 1[mask_logit_q > 0]（与 pred_masks 同一网格），再像点预测一样随 topk 选出。
+            density_results = outputs.get("pred_density")
+            if density_results is not None:
+                density_results = density_results.float()                          # [B, h, w]
+                query_count_results = ((mask_pred_results > 0).float()
+                                       * density_results[:, None]).sum(dim=(-2, -1))  # [B, Q]
+            else:
+                density_results = [None] * len(mask_pred_results)
+                query_count_results = [None] * len(mask_pred_results)
             # upsample masks
             mask_pred_results = F.interpolate(
                 mask_pred_results,
@@ -318,13 +349,29 @@ class MaskDINO(nn.Module):
             del outputs
 
             processed_results = []
-            for mask_cls_result, mask_pred_result, mask_box_result, point_coord_result, point_logit_result, input_per_image, image_size in zip(
-                mask_cls_results, mask_pred_results, mask_box_results, point_coord_results, point_logit_results, batched_inputs, images.image_sizes
+            for mask_cls_result, mask_pred_result, mask_box_result, point_coord_result, point_logit_result, density_result, query_count_result, input_per_image, image_size in zip(
+                mask_cls_results, mask_pred_results, mask_box_results, point_coord_results, point_logit_results, density_results, query_count_results, batched_inputs, images.image_sizes
             ):  # image_size is augmented size, not divisible to 32
                 height = input_per_image.get("height", image_size[0])  # real size
                 width = input_per_image.get("width", image_size[1])
                 processed_results.append({})
                 new_size = mask_pred_result.shape[-2:]  # padded size (divisible to 32)
+
+                # 小穗密度图的读数（只给评估器用，不影响实例输出）：
+                #   spikelet_density_sum：有效区域（去掉 padding）内 D 的总和 = 整图预测小穗数；
+                #   spikelet_density：D 映射回原图尺寸 [height, width]（最近邻放大后按总和重新归一，质量守恒），
+                #     评估器用它在 GT mask 内积分（与 compare/DM-Count 的「GT mask 内积分」同口径）。
+                if density_result is not None:
+                    sh = new_size[0] // density_result.shape[-2]
+                    sw = new_size[1] // density_result.shape[-1]
+                    hv = -(-int(image_size[0]) // sh)
+                    wv = -(-int(image_size[1]) // sw)
+                    d_valid = density_result[:hv, :wv]
+                    d_sum = d_valid.sum()
+                    d_img = F.interpolate(d_valid[None, None], size=(int(height), int(width)), mode="nearest")[0, 0]
+                    d_img = d_img * (d_sum / d_img.sum().clamp(min=1e-12))
+                    processed_results[-1]["spikelet_density_sum"] = float(d_sum)
+                    processed_results[-1]["spikelet_density"] = d_img
 
 
                 if self.sem_seg_postprocess_before_inference:
@@ -354,7 +401,7 @@ class MaskDINO(nn.Module):
                     width = new_size[1]/image_size[1]*width
                     mask_box_result = self.box_postprocess(mask_box_result, height, width)
 
-                    instance_r = retry_if_cuda_oom(self.instance_inference)(mask_cls_result, mask_pred_result, mask_box_result, point_coord_result, point_logit_result)
+                    instance_r = retry_if_cuda_oom(self.instance_inference)(mask_cls_result, mask_pred_result, mask_box_result, point_coord_result, point_logit_result, query_count_result)
                     processed_results[-1]["instances"] = instance_r
 
             return processed_results
@@ -381,6 +428,23 @@ class MaskDINO(nn.Module):
                     "points": gt_points,
                 }
             )
+            if self.point_density_head:
+                # 小穗密度头的监督（criterion.loss_density）：
+                #   density_points：该图全部 GT wheat_2 小穗点，增广后图像的像素坐标 [K, 2]（稠密目标）；
+                #   point_counts：每个实例的 Ni（实例计数目标；LSJ 截断降级的穗 Ni 已被清零）；
+                #   demoted：mapper 降级的实例（稠密损失在它们的 mask 内忽略）。没有这个字段时视为全 False。
+                labels = targets_per_image.gt_classes
+                pts_px = [p.to(self.device).float().reshape(-1, 2)
+                          for p, l in zip(targets_per_image.gt_points, labels.tolist())
+                          if int(l) == self.spikelet_class_id]
+                new_targets[-1]["density_points"] = (torch.cat(pts_px) if pts_px
+                                                     else torch.zeros((0, 2), device=self.device))
+                new_targets[-1]["point_counts"] = torch.as_tensor(
+                    [len(p) for p in targets_per_image.gt_points], dtype=torch.float32, device=self.device)
+                new_targets[-1]["demoted"] = (
+                    targets_per_image.gt_demoted.to(self.device).bool()
+                    if targets_per_image.has("gt_demoted")
+                    else torch.zeros(len(labels), dtype=torch.bool, device=self.device))
         return new_targets
 
 
@@ -488,7 +552,8 @@ class MaskDINO(nn.Module):
 
             return panoptic_seg, segments_info
 
-    def instance_inference(self, mask_cls, mask_pred, mask_box_result, point_coords=None, point_logits=None):
+    def instance_inference(self, mask_cls, mask_pred, mask_box_result, point_coords=None, point_logits=None,
+                           query_counts=None):
         # mask_pred is already processed to have the same shape as original input
         image_size = mask_pred.shape[-2:]
         scores = mask_cls.sigmoid()  # [100, 80]
@@ -502,6 +567,9 @@ class MaskDINO(nn.Module):
         if point_coords is not None:
             point_coords = point_coords[topk_indices]   # [K, P, 2] 框相对 [0,1]
             point_logits = point_logits[topk_indices]   # [K, P, 1]
+        # 密度计数（每个 query 一个数，1/4 分辨率硬 mask 内的 D 积分，未取整）同样随 topk 选出；密度头关着时为 None
+        if query_counts is not None:
+            query_counts = query_counts[topk_indices]   # [K]
         # if this is panoptic segmentation, we only keep the "thing" classes
         if self.panoptic_on:
             keep = torch.zeros_like(scores_per_image).bool()
@@ -513,6 +581,8 @@ class MaskDINO(nn.Module):
             if point_coords is not None:
                 point_coords = point_coords[keep]
                 point_logits = point_logits[keep]
+            if query_counts is not None:
+                query_counts = query_counts[keep]
         result = Instances(image_size)
         # mask (before sigmoid)
         result.pred_masks = (mask_pred > 0).float()
@@ -553,6 +623,21 @@ class MaskDINO(nn.Module):
                     spikelet_counts.append(0)
             result.pred_spikelet_points = spikelet_points
             result.pred_spikelet_counts = torch.as_tensor(spikelet_counts, device=self.device, dtype=torch.int64)
+
+        # ===== density 读法：wheat_2 的每穗计数改由密度图在预测 mask 内的积分给出；小穗点本身不变 =====
+        # "points" 读法什么都不改（计数 = 留下的点数，与上面逐位相同）。
+        if self.point_count_source == "density":
+            assert query_counts is not None, "POINT_COUNT_SOURCE=density 但模型没有输出 pred_density"
+            is_spike = labels_per_image == self.spikelet_class_id
+            n_hat = query_counts.float()
+            cnt = torch.round(n_hat).clamp(min=0).long()
+            result.pred_spikelet_counts = torch.where(is_spike, cnt, torch.zeros_like(cnt))
+            # 未取整的密度计数、穗长直线（预测框，原图像素）一并挂出，评估器据此在逐穗明细里加列（同一批穗上比 r）
+            result.pred_spikelet_count_density = torch.where(is_spike, n_hat, torch.zeros_like(n_hat))
+            a, b_line = self.point_count_line
+            bwh = (mask_box_result[:, 2:] - mask_box_result[:, :2]).clamp(min=0).float()
+            line = a + b_line * torch.hypot(bwh[:, 0], bwh[:, 1])
+            result.pred_spikelet_count_line = torch.where(is_spike, line, torch.zeros_like(line))
         return result
 
     def box_postprocess(self, out_bbox, img_h, img_w):

@@ -235,6 +235,9 @@ class COCOInstanceNewBaselineDatasetMapper:
             instances = instances[keep]
             kept_idx = keep.nonzero().squeeze(1).tolist()
             gt_points = [points_per_anno[i] for i in kept_idx]
+            # 哪些实例是下面被降级的 wheat_2（密度头用它在稠密损失里忽略这些穗：点已清空，0 目标不可信）。
+            # 只多挂一个 bool 字段，不消耗随机数；POINT_DENSITY_HEAD=False 时没有任何代码读它。
+            demoted = torch.zeros(len(instances), dtype=torch.bool)
             # Generate masks from polygon
             h, w = instances.image_size
             if hasattr(instances, 'gt_masks'):
@@ -258,6 +261,7 @@ class COCOInstanceNewBaselineDatasetMapper:
                         | mk[:, :, -m:].flatten(1).any(dim=1)
                     )
                     demote = touches & (instances.gt_classes == src)
+                    demoted = demote.clone()
                     if bool(demote.any()):
                         instances.gt_classes[demote] = dst
                         for i in demote.nonzero().squeeze(1).tolist():
@@ -266,6 +270,7 @@ class COCOInstanceNewBaselineDatasetMapper:
             # 把对齐过滤后的小穗点挂为自定义 list 字段（每实例 Tensor[Ni,2]，绝对像素坐标）。
             # wheat（无小穗）实例为 Tensor[0,2]。
             instances.gt_points = gt_points
+            instances.gt_demoted = demoted
 
             dataset_dict["instances"] = instances
 

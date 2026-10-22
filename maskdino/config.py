@@ -100,6 +100,30 @@ def add_maskdino_config(cfg):
     # 【注意】开关会改变参数名（point_class_embed.weight/bias <-> .layers.{0,1,2}.*），
     # 两种设置下训出的 Stage2 checkpoint 不能互相加载（会被静默跳过）。
     cfg.MODEL.MaskDINO.POINT_CLASS_MLP = False
+    # ===== 密度图计数（mini/density-count，预注册见 experiments-bank/ideas/density-count.md）=====
+    # 在 pixel decoder 输出的 mask_features（1/4 分辨率、MASK_DIM 通道，与 mask 预测共用的那张图）上
+    # 接一个小卷积头（point_density_head），输出 1 通道非负密度 D（softplus），含义是「每个 1/4 分辨率像素上的小穗数」。
+    # 每个 wheat_2 实例的计数 = D 在该实例 mask 内的积分。
+    # False 时一个参数都不建、不产生损失、不多消耗随机数，模型与 mini/baseline 逐位相同。
+    cfg.MODEL.MaskDINO.POINT_DENSITY_HEAD = False
+    # 稠密目标：增广后图像里每个 GT wheat_2 小穗点在 1/4 分辨率上放一个归一化高斯，σ 的单位是 1/4 分辨率像素。
+    # 截断到 ±ceil(3σ)，出图的部分截掉后重新归一，每个点的质量恰为 1（目标总质量 = 该图 GT wheat_2 点数）。
+    cfg.MODEL.MaskDINO.POINT_DENSITY_SIGMA = 1.0
+    # loss_density：全图逐像素平方误差，每图求和、对 batch 取平均。
+    # LSJ 截断后降级为 wheat 的穗（点已被清空，0 目标不可信）在其 GT mask 外扩 1 像素的范围内不计损失。
+    cfg.MODEL.MaskDINO.POINT_DENSITY_WEIGHT = 1.0
+    # loss_density_count：最后一层外层匹配上的 wheat_2（Ni >= 1）上 |Σ D·σ(mask_logit) − Ni|，
+    # mask_logit 取同一 query 最后一层的 1/4 分辨率 mask logit 并 detach（只当积分区域，计数损失不改 mask），
+    # 除以 batch 里这类 GT 实例的个数（跨卡做法同 num_masks）。只在最后一层算，interm / aux 层不算。
+    cfg.MODEL.MaskDINO.POINT_DENSITY_COUNT_WEIGHT = 1.0
+    # 计数损失只算「预测 mask（1/4 分辨率、logit > 0）与 GT mask 的 IoU >= 该值」的匹配对，
+    # 与 SpikeletPointEvaluator 的配对线（SPIKELET_EVAL_IOU_THRESH 0.5）一致；mask 还没学好时不拿它当积分区域。0 = 不筛。
+    cfg.MODEL.MaskDINO.POINT_DENSITY_COUNT_MIN_IOU = 0.5
+    # True：密度头读 mask_features.detach()，两项密度损失都不回传进 pixel decoder / backbone（留作后续对照）。
+    cfg.MODEL.MaskDINO.POINT_DENSITY_DETACH = False
+    # 穗长直线 (a, b)：每穗点数 = a + b × hypot(w, h)，mini train 2754 个带点 wheat_2 上最小二乘
+    # （来源：mini/count-residual 的同名键，60d21a3）。本分支只用于 density 读法下逐穗明细的 line_count 列。
+    cfg.MODEL.MaskDINO.POINT_COUNT_LINE = [8.924, 0.0345]
     # FREEZE_EXCEPT_POINT_HEAD=True 时，除点头外额外解冻的参数名子串。
     # 空 = 只训点头（Stage2 原设计）。例：["predictor.decoder"] 解冻 transformer decoder，
     # ["sem_seg_head"] 解冻整个分割头（decoder + pixel decoder + 各预测头），backbone 仍冻结。
@@ -132,6 +156,11 @@ def add_maskdino_config(cfg):
     cfg.MODEL.MaskDINO.TEST.PANO_TEMPERATURE = 0.06
     # 小穗点存在性置信度阈值（sigmoid 后 > 该值的点才输出）
     cfg.MODEL.MaskDINO.TEST.POINT_THRESHOLD = 0.35
+    # 每穗计数 pred_spikelet_counts 的来源，只对 wheat_2 生效（小穗点本身照旧按 POINT_THRESHOLD 输出）：
+    #   "points"  = 现状，留下的小穗点个数；
+    #   "density" = round(Σ D ⊙ 1[mask_logit > 0])，在 1/4 分辨率、mask 上采样之前积分，需要 POINT_DENSITY_HEAD=True。
+    # 结果 clamp 到 >= 0。SpikeletPointEvaluator 的 count_MAE_spike / count_MAE_img 读这个字段。
+    cfg.MODEL.MaskDINO.TEST.POINT_COUNT_SOURCE = "points"
     # 评估时是否额外加挂小穗点评估器（SpikeletPointEvaluator，见 maskdino/evaluation/）
     cfg.MODEL.MaskDINO.TEST.SPIKELET_EVAL = False
     # 点匹配的距离阈值（原图像素，多档一起报）。GT 实测同穗内小穗最近邻间距中位 16px，

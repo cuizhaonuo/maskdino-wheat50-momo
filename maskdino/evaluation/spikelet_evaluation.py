@@ -18,6 +18,19 @@ COCOEvaluator 只评 mask/box AP，看不出点回归头学得怎么样。本评
 坐标系：模型输出的 pred_spikelet_points 已经在原图像素系（maskdino.py 在 instance_inference
 之前就把 mask/box 还原回了原图尺寸，点是纯框相对还原），GT 的 points 也是原图绝对像素，
 两者可直接比对，σ 的像素单位即原图像素。
+
+计数：实例带 pred_spikelet_counts 时，count_MAE_spike / count_MAE_img（含 RMSE）与两份 CSV 的
+pred_points 列读这个字段；点级 P/R/F1、n_pred_points、fp_point_* 仍按实际输出的点算。
+TEST.POINT_COUNT_SOURCE=points（默认）时这个字段与点数恒等，结果与改动前逐位相同。
+density 读法（mini/density-count）下计数来自密度图在预测 mask 内的积分，逐穗明细额外写
+out_points（实际输出的点数）、line_count（穗长直线，预测框）、density_raw（未取整的密度计数）三列。
+
+密度图自身的读数（只在模型输出 spikelet_density 时才有，即 POINT_DENSITY_HEAD=True；只记录）：
+  density_MAE_img           ：每图 |Σ D − 该图 GT wheat_2 点数|（整图积分，与 compare/DM-Count 的 raw-image 同口径）；
+  density_gtmask_MAE_spike  ：count_MAE_spike 的同一批配对穗上 |GT mask 内 Σ D − Ni|（未取整，
+                              与 compare/DM-Count 的「GT mask 内积分」同口径，只作参照）；
+  density_gtmask_MAE_all    ：全部 GT wheat_2 上的同一量（不依赖检测与配对）。
+逐图明细多 density_sum 列，逐穗明细多 gtmask_density 列。
 """
 
 import copy
@@ -109,8 +122,15 @@ class SpikeletPointEvaluator(DatasetEvaluator):
             classes = inst.pred_classes.detach().cpu().numpy()
             scores = inst.scores.detach().cpu().numpy()
             has_points = inst.has("pred_spikelet_points")
+            # 每穗计数：有 pred_spikelet_counts 就读它（density 读法下它不等于点数），否则数点
+            counts_all = (inst.pred_spikelet_counts.detach().cpu().numpy()
+                          if inst.has("pred_spikelet_counts") else None)
+            line_all = (inst.pred_spikelet_count_line.detach().cpu().numpy()
+                        if inst.has("pred_spikelet_count_line") else None)
+            dens_all = (inst.pred_spikelet_count_density.detach().cpu().numpy()
+                        if inst.has("pred_spikelet_count_density") else None)
 
-            points, rles, keep_scores = [], [], []
+            points, rles, keep_scores, counts, line_counts, dens_counts = [], [], [], [], [], []
             for i in range(len(inst)):
                 if int(classes[i]) != self._spikelet_class_id or scores[i] < self._score_thresh:
                     continue
@@ -120,11 +140,35 @@ class SpikeletPointEvaluator(DatasetEvaluator):
                 rles.append(mask_util.encode(np.asfortranarray(m)))
                 points.append(np.asarray(pts, dtype=np.float64).reshape(-1, 2))
                 keep_scores.append(float(scores[i]))
+                counts.append(int(counts_all[i]) if counts_all is not None else len(points[-1]))
+                if line_all is not None:
+                    # 与计数同一取整口径：round 后 clamp 到 >= 0
+                    line_counts.append(int(max(np.round(float(line_all[i])), 0)))
+                if dens_all is not None:
+                    dens_counts.append(float(dens_all[i]))
+
+            # 密度图在每个 GT wheat_2 的 GT mask 内的积分（与 GT 列表同序）；模型没输出密度图时为 None
+            gt_density, density_sum = None, None
+            if "spikelet_density" in out:
+                dmap = out["spikelet_density"].detach().float().cpu().numpy()
+                density_sum = float(out.get("spikelet_density_sum", dmap.sum()))
+                gt = self._gt.get(inp["image_id"])
+                if gt is not None:
+                    gt_density = []
+                    for r in gt["rles"]:
+                        gm = mask_util.decode(r).astype(bool)
+                        assert gm.shape == dmap.shape, (gm.shape, dmap.shape)
+                        gt_density.append(float(dmap[gm].sum()))
 
             # 零预测的图也要保留：它们对 recall 与计数 MAE 有贡献。
             self._predictions.append({
                 "image_id": inp["image_id"], "points": points,
                 "rles": rles, "scores": keep_scores,
+                "counts": counts,
+                "line_counts": line_counts if line_all is not None else None,
+                "dens_counts": dens_counts if dens_all is not None else None,
+                "density_sum": density_sum,
+                "gt_density": gt_density,
             })
 
     def evaluate(self):
@@ -153,6 +197,11 @@ class SpikeletPointEvaluator(DatasetEvaluator):
         img_pred_tot, img_gt_tot = [], []
         n_gt_spike = n_pred_spike = n_matched_spike = 0
         rows = []
+        # density 读法（实例带 pred_spikelet_count_line）时，逐穗明细多写 out_points、line_count、density_raw 三列
+        with_line = any(p.get("line_counts") is not None for p in predictions)
+        # 模型输出了密度图（POINT_DENSITY_HEAD=True）时，多算三项密度读数，两份 CSV 各多一列
+        with_dmap = any(p.get("density_sum") is not None for p in predictions)
+        dens_img_err, dens_gtmask_err_pair, dens_gtmask_err_all = [], [], []
 
         for pred in predictions:
             gt = self._gt.get(pred["image_id"])
@@ -160,14 +209,25 @@ class SpikeletPointEvaluator(DatasetEvaluator):
                 self._logger.warning(f"[SpikeletPointEvaluator] image_id {pred['image_id']} 不在 GT 中，跳过")
                 continue
             gp, pp = gt["points"], pred["points"]
+            # 每穗计数（见 process）；旧格式的预测没有 counts 时退回数点
+            pc = pred.get("counts")
+            if pc is None:
+                pc = [len(x) for x in pp]
+            plc, pdc = pred.get("line_counts"), pred.get("dens_counts")
+            gden = pred.get("gt_density")
             n_gt_spike += len(gp)
             n_pred_spike += len(pp)
             gt_tot = int(sum(len(x) for x in gp))
-            pred_tot = int(sum(len(x) for x in pp))
+            pred_tot = int(sum(len(x) for x in pp))      # 实际输出的点（点级 P/R/F1 用）
+            pred_cnt_tot = int(sum(pc))                  # 计数（count_MAE_img 用）
             n_gt_pts += gt_tot
             n_pred_pts += pred_tot
             img_gt_tot.append(gt_tot)
-            img_pred_tot.append(pred_tot)
+            img_pred_tot.append(pred_cnt_tot)
+            if pred.get("density_sum") is not None:
+                dens_img_err.append(float(pred["density_sum"]) - gt_tot)
+            if gden is not None:
+                dens_gtmask_err_all.extend(float(gden[g]) - len(gp[g]) for g in range(len(gp)))
 
             # --- 实例级：mask IoU + 匈牙利 ---
             pairs = []
@@ -191,10 +251,22 @@ class SpikeletPointEvaluator(DatasetEvaluator):
                     dist_n += int(within.size)
                 n_pred_pts_m += len(pp[pi])
                 n_gt_pts_m += len(gp[gi])
-                spike_count_abs_err.append(abs(len(pp[pi]) - len(gp[gi])))
-                pair_rows.append((gt["file_name"], len(pp[pi]), len(gp[gi]), float(iou[pi, gi])))
+                spike_count_abs_err.append(abs(int(pc[pi]) - len(gp[gi])))
+                row = (gt["file_name"], int(pc[pi]), len(gp[gi]), float(iou[pi, gi]))
+                if with_line:
+                    row = row + (len(pp[pi]),
+                                 int(plc[pi]) if plc is not None else "",
+                                 float(pdc[pi]) if pdc is not None else "")
+                if with_dmap:
+                    row = row + (float(gden[gi]) if gden is not None else "",)
+                    if gden is not None:
+                        dens_gtmask_err_pair.append(float(gden[gi]) - len(gp[gi]))
+                pair_rows.append(row)
 
-            rows.append((gt["file_name"], len(pp), pred_tot, len(gp), gt_tot, len(pairs)))
+            row = (gt["file_name"], len(pp), pred_cnt_tot, len(gp), gt_tot, len(pairs))
+            if with_dmap:
+                row = row + (float(pred["density_sum"]) if pred.get("density_sum") is not None else "",)
+            rows.append(row)
 
         def prf(tp_arr, n_pred, n_gt, k):
             p = tp_arr[k] / n_pred if n_pred else float("nan")
@@ -228,6 +300,13 @@ class SpikeletPointEvaluator(DatasetEvaluator):
         res["fp_point_ratio"] = (n_pred_pts - n_pred_pts_m) / n_pred_pts if n_pred_pts else float("nan")
         res["n_gt_points"] = float(n_gt_pts)
         res["n_pred_points"] = float(n_pred_pts)
+        # ---- 密度图自身的读数（只在模型输出密度图时才有；只记录，不进任何判据）----
+        if with_dmap:
+            def _mae(errs):
+                return float(np.mean(np.abs(errs))) if len(errs) else float("nan")
+            res["density_MAE_img"] = _mae(dens_img_err)
+            res["density_gtmask_MAE_spike"] = _mae(dens_gtmask_err_pair)
+            res["density_gtmask_MAE_all"] = _mae(dens_gtmask_err_all)
 
         self._logger.info(
             f"[SpikeletPointEvaluator] GT {n_gt_spike} 穗/{n_gt_pts} 点 | "
@@ -237,20 +316,33 @@ class SpikeletPointEvaluator(DatasetEvaluator):
 
         if self._output_dir:
             os.makedirs(self._output_dir, exist_ok=True)
+            # 逐图明细：pred_points 是该图各预测穗的计数之和（与 count_MAE_img 同口径）；
+            # 有密度图时多 density_sum 列（整图 Σ D）
             path = os.path.join(self._output_dir, "spikelet_pred_vs_gt.csv")
             with open(path, "w", newline="", encoding="utf-8") as f:
                 wcsv = csv.writer(f)
-                wcsv.writerow(["file_name", "pred_spikes", "pred_points",
-                               "gt_spikes", "gt_points", "matched_spikes"])
+                header = ["file_name", "pred_spikes", "pred_points",
+                          "gt_spikes", "gt_points", "matched_spikes"]
+                if with_dmap:
+                    header += ["density_sum"]
+                wcsv.writerow(header)
                 wcsv.writerows(sorted(rows))
             self._logger.info(f"[SpikeletPointEvaluator] 逐图明细 -> {path}")
 
             # 逐 TP 穗明细：与 count_MAE_spike 完全同一批配对（mask IoU 匈牙利 + IoU>=阈值），
             # count_MAE_spike == mean(|pred_points - gt_points|)。供散点/偏差分析。
+            # pred_points 是每穗计数（pred_spikelet_counts）；density 读法下另有 out_points（实际输出的点数）、
+            # line_count（只用穗长直线、取整）、density_raw（未取整的密度计数），同一批穗可直接比 r；
+            # 有密度图时再多 gtmask_density（该 GT 穗的 GT mask 内 Σ D，未取整）。
             ppath = os.path.join(self._output_dir, "spikelet_pair_counts.csv")
             with open(ppath, "w", newline="", encoding="utf-8") as f:
                 wcsv = csv.writer(f)
-                wcsv.writerow(["file_name", "pred_points", "gt_points", "iou"])
+                header = ["file_name", "pred_points", "gt_points", "iou"]
+                if with_line:
+                    header += ["out_points", "line_count", "density_raw"]
+                if with_dmap:
+                    header += ["gtmask_density"]
+                wcsv.writerow(header)
                 wcsv.writerows(pair_rows)
             self._logger.info(f"[SpikeletPointEvaluator] 逐 TP 穗明细 -> {ppath}")
 
