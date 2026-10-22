@@ -1,5 +1,7 @@
 # 想法（完整集）：两两组合消融臂 coral-exist + kmo-matcher（A+B）· full/coral-kmo
 
+> **结果**（2026-10-22 补记）：[exp-2026-10-14-full-coral-kmo](../experiments/exp-2026-10-14-full-coral-kmo.md) —— 落在预注册没有覆盖的格子，记 **计数保持、点位没有叠加**（count 1.3224 / `matched_F1@8` 0.6256，iter 23999）。另：KMO 匹配项因前缀分支先 return 没有生效，本 run 测的是「A + KMO 辅助损失」。
+
 状态：**预注册**（判定线在跑之前写死）｜ 提出 2026-10-11 ｜ 分支 `full/coral-kmo`（从 `full/combo` 切出，merge base `eff90f5`）｜ 配置
 `wheat_joint_single_stage_full_coral_kmo.yaml`（`_BASE_` 为 `wheat_joint_single_stage_full_coral_exist.yaml`）｜ 输出 `output_v2/exp-1011-full-coral-kmo`
 
