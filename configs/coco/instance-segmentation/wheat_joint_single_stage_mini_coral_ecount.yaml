@@ -1,0 +1,23 @@
+# ============================================================================
+# mini/coral-ecount · CORAL 存在性头 + 计数尺度损失（K 臂，2026-10-22 计数三臂之一）
+#   预注册：experiments-bank/ideas/coral-ecount.md（判否线已在跑之前写死）
+#   父臂：mini/coral-exist（wheat_joint_single_stage_mini_coral_exist.yaml，output_v2/exp-0926-mini-coral-exist）
+#
+# 与父臂配置的差异【只有一项】：
+#   MODEL.MaskDINO.POINT_ECOUNT_WEIGHT: 0.0 -> 1.0
+#     外层匹配上的 wheat_2（Ni >= 1）上，E = sum_k sigmoid(l_k)（25 个 slot 的 CORAL logit，fp32）
+#     是存在性头的期望计数；新损失 loss_point_ecount = mean |E - min(Ni, 25)|，与 CORAL BCE 同一组输出
+#     （主输出、9 份 aux、interm）深监督，共 11 项。wheat（Ni = 0）不进这一项。
+#     CoralHead 的结构与初始化、bias 的学习率、CORAL BCE、前缀内层匹配、推理读法
+#     （K = sum_k 1[sigmoid(l_k) > 0.5]，取前 K 个 slot）全部不变。
+#
+# 用法：
+#   python train_net.py --num-gpus 1 \
+#     --config-file configs/coco/instance-segmentation/wheat_joint_single_stage_mini_coral_ecount.yaml \
+#     OUTPUT_DIR /public/home/zncui/pycharm_project/maskdino-wheat50/output_v2/<run-name>
+# ============================================================================
+_BASE_: wheat_joint_single_stage_mini_coral_exist.yaml
+
+MODEL:
+  MaskDINO:
+    POINT_ECOUNT_WEIGHT: 1.0

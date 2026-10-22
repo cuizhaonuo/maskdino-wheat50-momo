@@ -109,8 +109,11 @@ class SpikeletPointEvaluator(DatasetEvaluator):
             classes = inst.pred_classes.detach().cpu().numpy()
             scores = inst.scores.detach().cpu().numpy()
             has_points = inst.has("pred_spikelet_points")
+            # 诊断字段（POINT_ECOUNT_WEIGHT > 0 时模型才输出）：CORAL 头的期望计数 E，只进逐穗明细的 ecount 列
+            ecount = (inst.pred_spikelet_ecount.detach().cpu().numpy()
+                      if inst.has("pred_spikelet_ecount") else None)
 
-            points, rles, keep_scores = [], [], []
+            points, rles, keep_scores, ecounts = [], [], [], []
             for i in range(len(inst)):
                 if int(classes[i]) != self._spikelet_class_id or scores[i] < self._score_thresh:
                     continue
@@ -120,12 +123,17 @@ class SpikeletPointEvaluator(DatasetEvaluator):
                 rles.append(mask_util.encode(np.asfortranarray(m)))
                 points.append(np.asarray(pts, dtype=np.float64).reshape(-1, 2))
                 keep_scores.append(float(scores[i]))
+                if ecount is not None:
+                    ecounts.append(float(ecount[i]))
 
             # 零预测的图也要保留：它们对 recall 与计数 MAE 有贡献。
-            self._predictions.append({
+            rec = {
                 "image_id": inp["image_id"], "points": points,
                 "rles": rles, "scores": keep_scores,
-            })
+            }
+            if ecount is not None:
+                rec["ecounts"] = ecounts
+            self._predictions.append(rec)
 
     def evaluate(self):
         if self._distributed:
@@ -153,6 +161,8 @@ class SpikeletPointEvaluator(DatasetEvaluator):
         img_pred_tot, img_gt_tot = [], []
         n_gt_spike = n_pred_spike = n_matched_spike = 0
         rows = []
+        # 模型输出了诊断字段 pred_spikelet_ecount 时，逐穗明细多一列 ecount（E，不进任何指标）
+        has_ecount = any("ecounts" in p for p in predictions)
 
         for pred in predictions:
             gt = self._gt.get(pred["image_id"])
@@ -192,7 +202,10 @@ class SpikeletPointEvaluator(DatasetEvaluator):
                 n_pred_pts_m += len(pp[pi])
                 n_gt_pts_m += len(gp[gi])
                 spike_count_abs_err.append(abs(len(pp[pi]) - len(gp[gi])))
-                pair_rows.append((gt["file_name"], len(pp[pi]), len(gp[gi]), float(iou[pi, gi])))
+                row = (gt["file_name"], len(pp[pi]), len(gp[gi]), float(iou[pi, gi]))
+                if has_ecount:
+                    row = row + (round(pred["ecounts"][pi], 4),)
+                pair_rows.append(row)
 
             rows.append((gt["file_name"], len(pp), pred_tot, len(gp), gt_tot, len(pairs)))
 
@@ -250,7 +263,8 @@ class SpikeletPointEvaluator(DatasetEvaluator):
             ppath = os.path.join(self._output_dir, "spikelet_pair_counts.csv")
             with open(ppath, "w", newline="", encoding="utf-8") as f:
                 wcsv = csv.writer(f)
-                wcsv.writerow(["file_name", "pred_points", "gt_points", "iou"])
+                wcsv.writerow(["file_name", "pred_points", "gt_points", "iou"]
+                              + (["ecount"] if has_ecount else []))
                 wcsv.writerows(pair_rows)
             self._logger.info(f"[SpikeletPointEvaluator] 逐 TP 穗明细 -> {ppath}")
 

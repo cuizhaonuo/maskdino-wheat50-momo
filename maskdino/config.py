@@ -107,6 +107,16 @@ def add_maskdino_config(cfg):
     # 打开后 POINT_CLASS_MLP 不起作用（打分固定是 3 层 MLP），POINT_FOCAL_ALPHA / COST_POINT_CLASS_WEIGHT
     # 也不再参与点头。False 时模型与基线逐位相同。预注册见 experiments-bank/ideas/coral-exist.md。
     cfg.MODEL.MaskDINO.POINT_CORAL_EXIST = False
+    # 计数尺度损失 loss_point_ecount 的权重（mini/coral-ecount，预注册见 experiments-bank/ideas/coral-ecount.md）。
+    # 只在 POINT_CORAL_EXIST=True 时可用。外层匹配上的 wheat_2（Ni >= 1）上，E = sum_k sigmoid(l_k)（P 个 slot，
+    # fp32）是 CORAL 头给出的期望计数，损失 = |E - min(Ni, P)| 对这类实例取均值，与 CORAL BCE 同一组输出
+    # （主输出、9 份 aux、interm）一起深监督。动机（本批 brief 的假设，未验证）：CORAL BCE 对 P 个任务取均值，
+    # 共享打分 g 上的梯度只有 (E - y)/P，计数尺度的信号太弱。【注意】父臂 model_final 上实测 E 已经校准
+    # （斜率 1.016），失真在读数 K，见预注册「实施前的新发现」。
+    # 0.0 = 关：不建损失、不进 weight_dict，与 mini/coral-exist 逐位相同。
+    # > 0 时推理多存一个诊断字段 pred_spikelet_ecount（= E），只写进 spikelet_pair_counts.csv 的 ecount 列，
+    # 不改计数读法（仍是 K = sum_k 1[sigmoid(l_k) > POINT_THRESHOLD]、取前 K 个 slot），不进任何指标。
+    cfg.MODEL.MaskDINO.POINT_ECOUNT_WEIGHT = 0.0
     # FREEZE_EXCEPT_POINT_HEAD=True 时，除点头外额外解冻的参数名子串。
     # 空 = 只训点头（Stage2 原设计）。例：["predictor.decoder"] 解冻 transformer decoder，
     # ["sem_seg_head"] 解冻整个分割头（decoder + pixel decoder + 各预测头），backbone 仍冻结。

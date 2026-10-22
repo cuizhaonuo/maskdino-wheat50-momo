@@ -55,6 +55,7 @@ class MaskDINO(nn.Module):
         semantic_ce_loss: bool = False,
         point_threshold: float = 0.35,
         point_coral_exist: bool = False,
+        point_ecount_diag: bool = False,
     ):
         """
         Args:
@@ -114,6 +115,8 @@ class MaskDINO(nn.Module):
         self.spikelet_class_id = 1
         # POINT_CORAL_EXIST：K = 超过阈值的 slot 数（CORAL 的求和规则），输出前 K 个 slot
         self.point_coral_exist = point_coral_exist
+        # POINT_ECOUNT_WEIGHT > 0 时推理多存诊断字段 pred_spikelet_ecount（CORAL 头的期望计数 E），不改读法
+        self.point_ecount_diag = point_ecount_diag
 
         if not self.semantic_on:
             assert self.sem_seg_postprocess_before_inference
@@ -158,6 +161,13 @@ class MaskDINO(nn.Module):
         weight_dict.update({"loss_bbox":box_weight,"loss_giou":giou_weight})
         # 小穗点损失（随 _interm / _{i} 深监督自动带上；dn 不计算点损失，其 _dn 权重存在但不会被产生，无害）
         weight_dict.update({"loss_point_coord": point_coord_weight, "loss_point_cls": point_cls_weight})
+        # 计数尺度损失（mini/coral-ecount）：权重 0 时既不进 weight_dict 也不计算，与 mini/coral-exist 逐位相同。
+        # > 0 时随下面的 _interm / _{i} 展开深监督（_dn 权重会生成但 dn_losses 里没有它，不会被产生，无害）。
+        point_ecount_weight = cfg.MODEL.MaskDINO.POINT_ECOUNT_WEIGHT
+        if point_ecount_weight > 0:
+            if not cfg.MODEL.MaskDINO.POINT_CORAL_EXIST:
+                raise ValueError("POINT_ECOUNT_WEIGHT > 0 需要 POINT_CORAL_EXIST=True（E 是 CORAL 头 P 个 slot 的期望计数）")
+            weight_dict.update({"loss_point_ecount": point_ecount_weight})
         # two stage is the query selection scheme
         if cfg.MODEL.MaskDINO.TWO_STAGE:
             interm_weight_dict = {}
@@ -183,6 +193,8 @@ class MaskDINO(nn.Module):
             losses = ["labels", "masks","boxes","points"]
         else:
             losses = ["labels", "masks","points"]
+        if point_ecount_weight > 0:
+            losses.append("point_ecount")   # 排在 points 之后，与 CORAL BCE 同一组输出 dict
         # building criterion
         criterion = SetCriterion(
             sem_seg_head.num_classes,
@@ -233,6 +245,7 @@ class MaskDINO(nn.Module):
             "semantic_ce_loss": cfg.MODEL.MaskDINO.TEST.SEMANTIC_ON and cfg.MODEL.MaskDINO.SEMANTIC_CE_LOSS and not cfg.MODEL.MaskDINO.TEST.PANOPTIC_ON,
             "point_threshold": cfg.MODEL.MaskDINO.TEST.POINT_THRESHOLD,
             "point_coral_exist": cfg.MODEL.MaskDINO.POINT_CORAL_EXIST,
+            "point_ecount_diag": point_ecount_weight > 0,
         }
 
     @property
@@ -562,6 +575,11 @@ class MaskDINO(nn.Module):
                     spikelet_counts.append(0)
             result.pred_spikelet_points = spikelet_points
             result.pred_spikelet_counts = torch.as_tensor(spikelet_counts, device=self.device, dtype=torch.int64)
+            if self.point_ecount_diag:
+                # 诊断字段：CORAL 头的期望计数 E = sum_k sigmoid(l_k)（fp32），只给 wheat_2，其余置 0。
+                # 上面的计数读法（前 K 个 slot）不变；只被 SpikeletPointEvaluator 写进逐穗明细的 ecount 列。
+                is_spikelet = (labels_per_image == self.spikelet_class_id).float()
+                result.pred_spikelet_ecount = point_logits.float().sigmoid().sum(dim=(1, 2)) * is_spikelet
         return result
 
     def box_postprocess(self, out_bbox, img_h, img_w):
