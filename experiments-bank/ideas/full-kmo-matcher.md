@@ -1,5 +1,7 @@
 # 想法（完整集）：KMO 内层点匹配 · full/kmo-matcher
 
+> **结果**（2026-10-22 补记）：[exp-2026-10-09-full-kmo-matcher](../experiments/exp-2026-10-09-full-kmo-matcher.md) —— 判定 **未决**：`matched_F1@8` 后半程峰值 0.6606（iter 17999），差 0.0021 未到 0.6627；计数不伤，护栏全过。
+
 状态：**预注册**（判定线在跑之前写死）｜ 提出 2026-10-09 ｜ 分支 `full/kmo-matcher`（从 `full/combo`@`3bd2071` 开出）｜ 配置
 `wheat_joint_single_stage_full_kmo.yaml`（`_BASE_` 为 `wheat_joint_single_stage.yaml`）｜ 输出 `output_v2/exp-1009-full-kmo-matcher`
 ｜ mini 对应臂：`mini/kmo-matcher`（[exp-2026-09-24-mini-kmo-matcher-ep100](../experiments/exp-2026-09-24-mini-kmo-matcher-ep100.md)：
