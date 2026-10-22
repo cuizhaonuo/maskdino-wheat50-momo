@@ -1,5 +1,7 @@
 # 想法（完整集）：两两组合消融臂 B+C · kmo-matcher + group-nms-match · full/kmo-gn
 
+> **结果**（2026-10-22 补记）：[exp-2026-10-14-full-kmo-gn](../experiments/exp-2026-10-14-full-kmo-gn.md) —— 判定 **无增益交互**：只到了计数线（2.4060 ≤ 2.49，iter 17999，那次护栏不过）；`matched_F1@8` 全程最高 0.6612，未到 0.6627。
+
 状态：**预注册**（判定线在跑之前写死）｜ 提出 2026-10-11 ｜ 分支 `full/kmo-gn`（从 `full/combo`@`eff90f5` 切出，
 不改任何 `maskdino/` 代码）｜ 配置 `wheat_joint_single_stage_full_kmo_gn.yaml`（`_BASE_` 为
 `wheat_joint_single_stage_full_group_nms_match.yaml`）｜ 输出 `output_v2/exp-1011-full-kmo-gn`
