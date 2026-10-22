@@ -72,6 +72,9 @@ def record(criterion, outputs, targets, indices, batched_inputs=None):
     """累计一次 criterion 调用里所有有小穗点实例的匹配结果。"""
     pred_coords = outputs["pred_point_coords"].detach().float()
     pred_lgts = outputs["pred_point_logits"].detach().float()
+    pred_knns = outputs.get("pred_point_knn")    # [B, Q, P, D]，仅 POINT_KMO=True 时存在（D=1 dist / 2 dir）
+    if pred_knns is not None:
+        pred_knns = pred_knns.detach().float()
     P = pred_coords.shape[2]
     if _S["hits"] is None:
         _S["hits"] = np.zeros(P, dtype=np.int64)
@@ -94,7 +97,8 @@ def record(criterion, outputs, targets, indices, batched_inputs=None):
             cx, cy, bw, bh = boxes[g_j].to(pred_coords.device)
             wh = torch.stack([bw, bh]).clamp(min=1e-6)
             gt_rel = ((gt_pts - torch.stack([cx - bw / 2, cy - bh / 2])) / wh).clamp(0.0, 1.0)
-            row_ind, _ = criterion._inner_point_match(pred_coords[b, q_i], pred_lgts[b, q_i], gt_rel)
+            pred_knn = pred_knns[b, q_i] if pred_knns is not None else None
+            row_ind, _ = criterion._inner_point_match(pred_coords[b, q_i], pred_lgts[b, q_i], gt_rel, pred_knn)
 
             slots = frozenset(row_ind.cpu().numpy().tolist())
             _S["hits"][list(slots)] += 1

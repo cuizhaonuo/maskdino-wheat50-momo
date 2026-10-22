@@ -84,6 +84,40 @@ def add_maskdino_config(cfg):
     # 内层匈牙利匹配的代价权重
     cfg.MODEL.MaskDINO.COST_POINT_COORD_WEIGHT = 5.0
     cfg.MODEL.MaskDINO.COST_POINT_CLASS_WEIGHT = 2.0
+    # ===== KMO-based 内层匹配（CLTR, ECCV 2022, Eq.3）=====
+    # 内层代价在 L1 坐标 + 存在性之外再加一项近邻上下文 |y^k - ŷ^k|：
+    #   y^k = GT 小穗到其 K 个最近邻（不含自身）的平均欧氏距离，在框相对 [0,1] 空间里算，
+    #         与 L1 坐标项同一空间、同一量纲；Ni<=K 时对仅有的 Ni-1 个邻居取均值，Ni=1 时为 0。
+    #   ŷ^k = 独立头 point_knn_embed 逐槽预测（sigmoid），只在匹配上的槽用 L1 监督。
+    # 只作用于训练期的内层匹配，推理不用。False 时不建头、不加代价、不产生损失，与现状逐位一致。
+    # （上面是 POINT_KMO_DESC="dist" 的描述子；"dir" 见下方 POINT_KMO_DESC。）
+    cfg.MODEL.MaskDINO.POINT_KMO = False
+    # 近邻数（不含点自身）。论文正文写 k=4，对应官方代码 num_knn=4，但 cKDTree 查询结果的
+    # 第 0 列是点自身、随后被删掉，实际只平均 3 个邻居；3 与官方实现逐值一致。
+    cfg.MODEL.MaskDINO.POINT_KMO_K = 3
+    # 内层匹配中 KMO 项的权重。官方把 (x, y, d) 放进同一个 cdist(p=1)，即与坐标项同权。
+    cfg.MODEL.MaskDINO.COST_POINT_KNN_WEIGHT = 5.0
+    # ŷ^k 的 L1 回归损失权重。官方 (x, y, d) 共用一个 L1 损失，即与 POINT_COORD_WEIGHT 同权。
+    cfg.MODEL.MaskDINO.POINT_KNN_WEIGHT = 5.0
+    # 近邻描述子的形式。默认 "dist" 即上面的平均近邻距离（1 维，sigmoid），与 mini/kmo-matcher 逐位一致。
+    # "dir" = 近邻方向描述子（2 维，tanh）：c_i = 指向 k_eff=min(K, Ni-1) 个最近邻（不含自身）的
+    #   单位向量的平均，c_i = (1/k_eff)·Σ_j (p_j - p_i)/max(‖p_j - p_i‖, 1e-12)，在框相对坐标里算；Ni<=1 时为 0。
+    #   模长 ∈ [0,1]：两侧都有近邻（穗中段）时趋近 0，近邻都在一侧（穗端、单侧）时趋近 1。
+    # 为什么加 "dir"：KMO 只能靠同一穗内各槽之间描述子的差异改变配对，而 dist 的 y^k 在穗内变化小
+    #   （mini train 诊断：实例内 std 约 0.024，框相对），又混着疏密 / 计数信息；方向描述子尺度无关、
+    #   不含疏密 / 计数信息，编码的是「这个点的近邻在哪一侧」，穗端与中段差别大。
+    # 头输出 [B, Q, P, D]，D = 1（dist）/ 2（dir）。代价与损失见 POINT_KMO_DIR_SCALE。
+    cfg.MODEL.MaskDINO.POINT_KMO_DESC = "dist"
+    # "dir" 的尺度 s：KMO 代价改为 COST_POINT_KNN_WEIGHT·s·|ĉ - c|₁，损失改为 s·L1(ĉ, c)（分母不变）；
+    # "dist" 时不使用（不乘 1.0，保持原代码路径）。
+    # 取值来历：mini train 全部 wheat_2（Ni>=2）GT 小穗，到其 2 个最近邻的平均距离（框相对）的中位数，
+    # 离线算得 0.13044。作用：把单位方向换算成与坐标同一量纲的长度，近邻都在一侧时 s·c 约等于
+    # 指向近邻的平均偏移，与 L1 坐标项可比。
+    cfg.MODEL.MaskDINO.POINT_KMO_DIR_SCALE = 0.13044
+    # True = point_knn_embed 读 decoder_output.detach()：KMO 头仍由 loss_point_knn 训练，但这个损失
+    # 不再回传到共享的 decoder / 主干，KMO 对模型其余部分只通过内层匹配起作用（两种描述子都适用）。
+    # 为什么加：把「匹配代价」与「辅助回归损失对共享特征的塑形」拆开。默认 False 与 mini/kmo-matcher 逐位一致。
+    cfg.MODEL.MaskDINO.POINT_KMO_DETACH = False
     # 点存在性 focal 的 alpha。与 loss_labels 的 self.focal_alpha 解耦：
     # 检测头是 300 query 配约 39 个正样本，点头是 P 个 slot 配约 14 个正样本，
     # 正负比温和得多，0.25（来自 RetinaNet 稠密检测）在这里把正样本压得过狠。
@@ -106,6 +140,9 @@ def add_maskdino_config(cfg):
     # 推理时 K = sum_k 1[sigmoid(l_k) > POINT_THRESHOLD]、取前 K 个 slot。
     # 打开后 POINT_CLASS_MLP 不起作用（打分固定是 3 层 MLP），POINT_FOCAL_ALPHA / COST_POINT_CLASS_WEIGHT
     # 也不再参与点头。False 时模型与基线逐位相同。预注册见 experiments-bank/ideas/coral-exist.md。
+    # 与 POINT_KMO 同开时（mini/coral-kmo-dir）：前缀内的代价改为 L1 + (COST_POINT_KNN_WEIGHT /
+    # COST_POINT_COORD_WEIGHT)·KMO 项（与单独用 KMO 时 KMO 对坐标的相对权重相同），行仍只有前 min(Ni, P)
+    # 个 slot，KMO 只改变前缀内的排列；ŷ^k 的损失照常只算配上的槽。
     cfg.MODEL.MaskDINO.POINT_CORAL_EXIST = False
     # FREEZE_EXCEPT_POINT_HEAD=True 时，除点头外额外解冻的参数名子串。
     # 空 = 只训点头（Stage2 原设计）。例：["predictor.decoder"] 解冻 transformer decoder，

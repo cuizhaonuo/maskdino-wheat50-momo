@@ -49,6 +49,9 @@ class MaskDINODecoder(nn.Module):
             num_points: int,
             point_class_mlp: bool = False,
             point_coral_exist: bool = False,
+            point_kmo: bool = False,
+            point_kmo_desc: str = "dist",
+            point_kmo_detach: bool = False,
             nheads: int,
             dim_feedforward: int,
             dec_layers: int,
@@ -178,6 +181,20 @@ class MaskDINODecoder(nn.Module):
         self.bbox_embed = nn.ModuleList(box_embed_layerlist)
         self.decoder.bbox_embed = self.bbox_embed
 
+        # KMO（CLTR Eq.3）：每个点槽再预测一个近邻描述子 ŷ^k，只用于训练期内层匹配。
+        #   POINT_KMO_DESC="dist"：近邻平均距离（框相对 [0,1]），D=1，过 sigmoid（现状）；
+        #   POINT_KMO_DESC="dir" ：近邻方向描述子，D=2，过 tanh（分量 ∈ [-1,1]）。
+        # 放在 __init__ 末尾，不打乱已有模块的随机初始化顺序；关闭时不建，参数表与现状一致。
+        # dist 时输出维 num_points*1 == num_points，与 mini/kmo-matcher 的头同形、同初始化。
+        self.point_kmo = point_kmo
+        assert point_kmo_desc in ("dist", "dir"), f"POINT_KMO_DESC 只支持 'dist' / 'dir'，收到 {point_kmo_desc!r}"
+        self.point_kmo_desc = point_kmo_desc
+        self.point_kmo_dim = 2 if point_kmo_desc == "dir" else 1
+        # POINT_KMO_DETACH：头读 decoder_output.detach()，loss_point_knn 不回传到共享的 decoder / 主干
+        self.point_kmo_detach = point_kmo_detach
+        if point_kmo:
+            self.point_knn_embed = MLP(hidden_dim, hidden_dim, num_points * self.point_kmo_dim, 3)
+
 
     @classmethod
     def from_config(cls, cfg, in_channels, mask_classification):
@@ -191,6 +208,9 @@ class MaskDINODecoder(nn.Module):
         ret["num_points"] = cfg.MODEL.MaskDINO.NUM_POINTS
         ret["point_class_mlp"] = cfg.MODEL.MaskDINO.POINT_CLASS_MLP
         ret["point_coral_exist"] = cfg.MODEL.MaskDINO.POINT_CORAL_EXIST
+        ret["point_kmo"] = cfg.MODEL.MaskDINO.POINT_KMO
+        ret["point_kmo_desc"] = cfg.MODEL.MaskDINO.POINT_KMO_DESC
+        ret["point_kmo_detach"] = cfg.MODEL.MaskDINO.POINT_KMO_DETACH
         # Transformer parameters:
         ret["nheads"] = cfg.MODEL.MaskDINO.NHEADS
         ret["dim_feedforward"] = cfg.MODEL.MaskDINO.DIM_FEEDFORWARD
@@ -334,7 +354,7 @@ class MaskDINODecoder(nn.Module):
         return input_query_label,input_query_bbox,attn_mask,mask_dict
 
     def dn_post_process(self,outputs_class,outputs_coord,mask_dict,outputs_mask,
-                        outputs_point_coord=None,outputs_point_logit=None):
+                        outputs_point_coord=None,outputs_point_logit=None,outputs_point_knn=None):
         """
             post process of dn after output from the transformer
             put the dn part in the mask_dict
@@ -352,11 +372,13 @@ class MaskDINODecoder(nn.Module):
         if outputs_point_coord is not None:
             outputs_point_coord = outputs_point_coord[:, :, pad_size:]
             outputs_point_logit = outputs_point_logit[:, :, pad_size:]
+        if outputs_point_knn is not None:
+            outputs_point_knn = outputs_point_knn[:, :, pad_size:]
         out = {'pred_logits': output_known_class[-1], 'pred_boxes': output_known_coord[-1],'pred_masks': output_known_mask[-1]}
 
         out['aux_outputs'] = self._set_aux_loss(output_known_class, output_known_mask,output_known_coord)
         mask_dict['output_known_lbs_bboxes']=out
-        return outputs_class, outputs_coord, outputs_mask, outputs_point_coord, outputs_point_logit
+        return outputs_class, outputs_coord, outputs_mask, outputs_point_coord, outputs_point_logit, outputs_point_knn
 
     def get_valid_ratio(self, mask):
         _, H, W = mask.shape
@@ -430,6 +452,7 @@ class MaskDINODecoder(nn.Module):
         predictions_mask = []
         predictions_point_coord = []
         predictions_point_logit = []
+        predictions_point_knn = []
         if self.two_stage:
             output_memory, output_proposals = gen_encoder_output_proposals(src_flatten, mask_flatten, spatial_shapes)
             output_memory = self.enc_output_norm(self.enc_output(output_memory))
@@ -445,7 +468,7 @@ class MaskDINODecoder(nn.Module):
             tgt_undetach = torch.gather(output_memory, 1,
                                   topk_proposals.unsqueeze(-1).repeat(1, 1, self.hidden_dim))  # unsigmoid
 
-            outputs_class, outputs_mask, interm_point_coord, interm_point_logit = \
+            outputs_class, outputs_mask, interm_point_coord, interm_point_logit, interm_point_knn = \
                 self.forward_prediction_heads(tgt_undetach.transpose(0, 1), mask_features)
             tgt = tgt_undetach.detach()
             if self.learn_tgt:
@@ -456,6 +479,8 @@ class MaskDINODecoder(nn.Module):
             interm_outputs['pred_masks'] = outputs_mask
             interm_outputs['pred_point_coords'] = interm_point_coord
             interm_outputs['pred_point_logits'] = interm_point_logit
+            if interm_point_knn is not None:
+                interm_outputs['pred_point_knn'] = interm_point_knn
 
             if self.initialize_box_type != 'no':
                 # convert masks into boxes to better initialize box in the decoder
@@ -496,7 +521,7 @@ class MaskDINODecoder(nn.Module):
         # direct prediction from the matching and denoising part in the begining
         if self.initial_pred:
             # 暂时注释
-            outputs_class, outputs_mask, outputs_point_coord, outputs_point_logit = \
+            outputs_class, outputs_mask, outputs_point_coord, outputs_point_logit, outputs_point_knn = \
                 self.forward_prediction_heads(tgt.transpose(0, 1), mask_features, self.training)
 
             # debug: 查看推理时每一层的预测结果
@@ -506,6 +531,7 @@ class MaskDINODecoder(nn.Module):
             predictions_mask.append(outputs_mask)
             predictions_point_coord.append(outputs_point_coord)
             predictions_point_logit.append(outputs_point_logit)
+            predictions_point_knn.append(outputs_point_knn)
         if self.dn != "no" and self.training and mask_dict is not None:
             refpoint_embed=torch.cat([input_query_bbox,refpoint_embed],dim=1)
         # 此处 refpoint_embed 变成了 (bs, dn_pad + num_queries, 4)，position query + denoising query
@@ -550,7 +576,7 @@ class MaskDINODecoder(nn.Module):
             # 这样做的目的是减少计算量，因为掩码预测比较耗时
 
             # 暂时注释
-            outputs_class, outputs_mask, outputs_point_coord, outputs_point_logit = \
+            outputs_class, outputs_mask, outputs_point_coord, outputs_point_logit, outputs_point_knn = \
                 self.forward_prediction_heads(output.transpose(0, 1), mask_features, self.training or (i == len(hs)-1))
 
             # debug: 查看推理时每一层的预测结果
@@ -560,6 +586,7 @@ class MaskDINODecoder(nn.Module):
             predictions_mask.append(outputs_mask)
             predictions_point_coord.append(outputs_point_coord)
             predictions_point_logit.append(outputs_point_logit)
+            predictions_point_knn.append(outputs_point_knn)
 
         # iteratively box prediction
         '''
@@ -588,17 +615,23 @@ class MaskDINODecoder(nn.Module):
             predictions_class=torch.stack(predictions_class)
             predictions_point_coord=torch.stack(predictions_point_coord)
             predictions_point_logit=torch.stack(predictions_point_logit)
+            # KMO 关闭时各层都是 None，不 stack，原样透传
+            predictions_point_knn=torch.stack(predictions_point_knn) if self.point_kmo else None
             # 包含中间的所有结果
             # predictions_mask: (num_layers + 1, bs, dn_pad + num_queries, h, w)
             # predictions_class: (num_layers + 1, bs, dn_pad + num_queries, num_classes)
             # out_boxes: (num_layers + 1, bs, dn_pad + num_queries, 4)
             # predictions_point_coord: (num_layers + 1, bs, dn_pad + num_queries, P, 2)
             # predictions_point_logit: (num_layers + 1, bs, dn_pad + num_queries, P, 1)
-            predictions_class, out_boxes,predictions_mask,predictions_point_coord,predictions_point_logit=\
+            # predictions_point_knn:   (num_layers + 1, bs, dn_pad + num_queries, P, D)，仅 KMO 开启时；
+            #                          D=1（POINT_KMO_DESC="dist"）/ 2（"dir"）
+            predictions_class, out_boxes,predictions_mask,predictions_point_coord,predictions_point_logit,predictions_point_knn=\
                 self.dn_post_process(predictions_class,out_boxes,mask_dict,predictions_mask,
-                                     predictions_point_coord,predictions_point_logit)
+                                     predictions_point_coord,predictions_point_logit,predictions_point_knn)
             predictions_class,predictions_mask=list(predictions_class),list(predictions_mask)
             predictions_point_coord,predictions_point_logit=list(predictions_point_coord),list(predictions_point_logit)
+            if predictions_point_knn is not None:
+                predictions_point_knn=list(predictions_point_knn)
         elif self.training:  # this is to insure self.label_enc participate in the model
             predictions_class[-1] += 0.0*self.label_enc.weight.sum()
 
@@ -614,9 +647,12 @@ class MaskDINODecoder(nn.Module):
             'pred_point_logits': predictions_point_logit[-1],
             'aux_outputs': self._set_aux_loss(
                 predictions_class if self.mask_classification else None, predictions_mask, out_boxes,
-                predictions_point_coord, predictions_point_logit
+                predictions_point_coord, predictions_point_logit,
+                predictions_point_knn if self.point_kmo else None
             )
         }
+        if self.point_kmo:
+            out['pred_point_knn'] = predictions_point_knn[-1]
         if self.two_stage:
             out['interm_outputs'] = interm_outputs
         return out, mask_dict
@@ -635,12 +671,19 @@ class MaskDINODecoder(nn.Module):
         b, q = decoder_output.shape[:2]
         outputs_point_coord = self.point_coord_embed(decoder_output).reshape(b, q, self.num_points, 2).sigmoid()
         outputs_point_logit = self.point_class_embed(decoder_output).reshape(b, q, self.num_points, 1)
+        # KMO：逐槽的近邻描述子 ŷ^k，[b, q, P, D]。dist：平均近邻距离（框相对 [0,1]，与坐标同样过 sigmoid）；
+        # dir：方向描述子（过 tanh）。DETACH 时头读 detach 后的特征，前向数值不变，只切断回传。
+        outputs_point_knn = None
+        if self.point_kmo:
+            knn_in = decoder_output.detach() if self.point_kmo_detach else decoder_output
+            outputs_point_knn = self.point_knn_embed(knn_in).reshape(b, q, self.num_points, self.point_kmo_dim)
+            outputs_point_knn = outputs_point_knn.tanh() if self.point_kmo_desc == "dir" else outputs_point_knn.sigmoid()
 
-        return outputs_class, outputs_mask, outputs_point_coord, outputs_point_logit
+        return outputs_class, outputs_mask, outputs_point_coord, outputs_point_logit, outputs_point_knn
 
     @torch.jit.unused
     def _set_aux_loss(self, outputs_class, outputs_seg_masks, out_boxes=None,
-                      out_point_coords=None, out_point_logits=None):
+                      out_point_coords=None, out_point_logits=None, out_point_knn=None):
         # this is a workaround to make torchscript happy, as torchscript
         # doesn't support dictionary with non-homogeneous values, such
         # as a dict having both a Tensor and a list.
@@ -656,9 +699,13 @@ class MaskDINODecoder(nn.Module):
                 for a, b, c in zip(outputs_class[:-1], outputs_seg_masks[:-1], out_boxes[:-1])
             ]
         else:
-            return [
+            aux = [
                 {"pred_logits": a, "pred_masks": b, "pred_boxes": c,
                  "pred_point_coords": d, "pred_point_logits": e}
                 for a, b, c, d, e in zip(outputs_class[:-1], outputs_seg_masks[:-1], out_boxes[:-1],
                                          out_point_coords[:-1], out_point_logits[:-1])
             ]
+            if out_point_knn is not None:
+                for a, f in zip(aux, out_point_knn[:-1]):
+                    a["pred_point_knn"] = f
+            return aux

@@ -1,0 +1,34 @@
+# ============================================================================
+# 单阶段联合训练 · 500 图小集 · KMO 内层点匹配（mini/kmo-matcher）
+#   来源：Liang et al., "An End-to-End Transformer Model for Crowd Localization"（CLTR, ECCV 2022）§3.3
+#   对照：wheat_joint_single_stage_mini.yaml（mini/baseline，output_v2/exp-0922-single-stage-mini）
+#
+# 与父配置的差异【只有 POINT_KMO 一处】：内层匹配（P 个点槽 <-> Ni 个 GT 小穗）从论文 Eq.2
+#     C = 5·|p - p̂|₁ + 2·focal(ĉ)
+# 换成 Eq.3（KMO-based Hungarian）：
+#     C = 5·|p - p̂|₁ + 5·|y^k - ŷ^k| + 2·focal(ĉ)
+# y^k 是 GT 小穗到其 K 个最近邻的平均距离（框相对 [0,1] 空间），ŷ^k 由新增的 point_knn_embed 头
+# 逐槽预测，并在匹配上的槽用 L1 监督（loss_point_knn）。外层 query <-> 实例匹配、数据、schedule、
+# 其余全部旋钮一律继承不动，与 mini/baseline 对比时「内层匹配是否带 KMO」是唯一变量。
+#
+# 注意 KMO = 新的匹配代价 + ŷ^k 辅助回归损失，两者绑在一起。若要拆开，
+# 把 COST_POINT_KNN_WEIGHT 置 0（只留辅助损失）即是消融臂。
+#
+# 论文 Table 8 的效果量：F1 80.02 -> 80.97、计数 MAE 91.3 -> 85.8（UCF-QNRF），约 1 个 F1 点。
+#
+# 用法：
+#   python train_net.py --num-gpus 1 \
+#     --config-file configs/coco/instance-segmentation/wheat_joint_single_stage_mini_kmo.yaml \
+#     OUTPUT_DIR output_v2/<run-name>
+# ============================================================================
+_BASE_: wheat_joint_single_stage_mini.yaml
+
+MODEL:
+  MaskDINO:
+    POINT_KMO: True
+    # 以下三项与 config.py 默认值相同，显式写出以便对照官方实现：
+    # 近邻数不含自身。官方 num_knn=4 把点自身算在内、随后删掉，实际平均 3 个邻居（论文写作 k=4）。
+    POINT_KMO_K: 3
+    # 官方把 (x, y, d) 放进同一个 cdist(p=1) 与同一个 L1 损失，即 KMO 项与坐标项同权。
+    COST_POINT_KNN_WEIGHT: 5.0
+    POINT_KNN_WEIGHT: 5.0
