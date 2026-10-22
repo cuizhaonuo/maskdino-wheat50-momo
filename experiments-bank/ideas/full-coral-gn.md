@@ -1,5 +1,7 @@
 # 想法（完整集）：两两组合消融臂 coral-exist + group-nms-match（A+C）· full/coral-gn
 
+> **结果**（2026-10-22 补记）：[exp-2026-10-14-full-coral-gn](../experiments/exp-2026-10-14-full-coral-gn.md) —— 主判据落在「C 对 A 无害」（count 1.3207 / `matched_F1@8` 0.6177，iter 23999），但 `spike_precision` 末值 0.7507 < 0.753，护栏未过，**不记成立**。
+
 状态：**预注册**（判定线在跑之前写死）｜ 提出 2026-10-11 ｜ 分支 `full/coral-gn`（从 `full/combo`@`eff90f5` 切出）｜ 配置
 `wheat_joint_single_stage_full_coral_gn.yaml`（`_BASE_` 为 `wheat_joint_single_stage_full_group_nms_match.yaml`）｜ 输出 `output_v2/exp-1011-full-coral-gn`
 
