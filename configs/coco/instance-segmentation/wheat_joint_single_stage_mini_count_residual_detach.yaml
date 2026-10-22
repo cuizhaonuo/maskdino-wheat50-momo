@@ -1,0 +1,22 @@
+# ============================================================================
+# mini/count-residual-detach · 残差计数头的输入 detach，计数损失不回传共享网络
+#   预注册：experiments-bank/ideas/count-residual-detach.md（判定线已在跑之前写死）
+#
+# 与 wheat_joint_single_stage_mini_count_residual.yaml（父臂 mini/count-residual）的差异【只有一项】：
+#   MODEL.MaskDINO.POINT_COUNT_DETACH: True
+#     point_count_embed 读 decoder 输出的 detach 副本（interm、initial_pred、9 层共 11 份 Δ 都改）。
+#     loss_point_count 只训练 point_count_embed 自己，不再回传到 decoder_norm / decoder / pixel decoder / backbone。
+#     前向数值不变：Δ、全部损失值与父臂同一份权重下逐位相同，推理与评估不受影响。
+#   直线系数、损失形式与权重（POINT_COUNT_WEIGHT 1.0，深监督 11 项）、推理读法（POINT_COUNT_SOURCE head）、
+#   评估器、schedule（ep100：12500 iter，每 500 iter 评估一次）全部继承父臂，一项不动。
+#
+# 用法：
+#   python train_net.py --num-gpus 1 \
+#     --config-file configs/coco/instance-segmentation/wheat_joint_single_stage_mini_count_residual_detach.yaml \
+#     OUTPUT_DIR /public/home/zncui/pycharm_project/maskdino-wheat50/output_v2/<run-name>
+# ============================================================================
+_BASE_: wheat_joint_single_stage_mini_count_residual.yaml
+
+MODEL:
+  MaskDINO:
+    POINT_COUNT_DETACH: True

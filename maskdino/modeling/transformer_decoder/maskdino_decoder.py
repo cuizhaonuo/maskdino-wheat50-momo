@@ -48,6 +48,7 @@ class MaskDINODecoder(nn.Module):
             num_points: int,
             point_class_mlp: bool = False,
             point_count_head: bool = False,
+            point_count_detach: bool = False,
             nheads: int,
             dim_feedforward: int,
             dec_layers: int,
@@ -182,6 +183,10 @@ class MaskDINODecoder(nn.Module):
             self.point_count_embed = MLP(hidden_dim, hidden_dim, 1, 2)
             nn.init.constant_(self.point_count_embed.layers[-1].weight.data, 0)
             nn.init.constant_(self.point_count_embed.layers[-1].bias.data, 0)
+        # POINT_COUNT_DETACH=True（mini/count-residual-detach）：Δ 的输入取 decoder 输出的 detach 副本，
+        # loss_point_count 只训练 point_count_embed。只是一个 bool 属性：不建参数、不消耗随机数。
+        assert point_count_head or not point_count_detach, "POINT_COUNT_DETACH=True 需要 POINT_COUNT_HEAD=True"
+        self.point_count_detach = bool(point_count_detach)
 
 
     @classmethod
@@ -196,6 +201,7 @@ class MaskDINODecoder(nn.Module):
         ret["num_points"] = cfg.MODEL.MaskDINO.NUM_POINTS
         ret["point_class_mlp"] = cfg.MODEL.MaskDINO.POINT_CLASS_MLP
         ret["point_count_head"] = cfg.MODEL.MaskDINO.POINT_COUNT_HEAD
+        ret["point_count_detach"] = cfg.MODEL.MaskDINO.POINT_COUNT_DETACH
         # Transformer parameters:
         ret["nheads"] = cfg.MODEL.MaskDINO.NHEADS
         ret["dim_feedforward"] = cfg.MODEL.MaskDINO.DIM_FEEDFORWARD
@@ -657,9 +663,15 @@ class MaskDINODecoder(nn.Module):
         b, q = decoder_output.shape[:2]
         outputs_point_coord = self.point_coord_embed(decoder_output).reshape(b, q, self.num_points, 2).sigmoid()
         outputs_point_logit = self.point_class_embed(decoder_output).reshape(b, q, self.num_points, 1)
-        # 残差计数头：每个 query 一个标量 Δ，[B, Q]；关着时为 None
-        outputs_point_count = (self.point_count_embed(decoder_output).squeeze(-1)
-                               if self.point_count_embed is not None else None)
+        # 残差计数头：每个 query 一个标量 Δ，[B, Q]；关着时为 None。
+        # POINT_COUNT_DETACH=True 时读 decoder_output.detach()：前向数值不变，loss_point_count 不再回传到
+        # decoder_norm 及其上游（decoder / pixel decoder / backbone），只训练 point_count_embed。
+        # interm、initial_pred、9 层都经这里输出 Δ，这一处覆盖全部 11 份。
+        if self.point_count_embed is not None:
+            count_in = decoder_output.detach() if self.point_count_detach else decoder_output
+            outputs_point_count = self.point_count_embed(count_in).squeeze(-1)
+        else:
+            outputs_point_count = None
 
         return outputs_class, outputs_mask, outputs_point_coord, outputs_point_logit, outputs_point_count
 

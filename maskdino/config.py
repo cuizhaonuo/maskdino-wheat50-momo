@@ -111,6 +111,12 @@ def add_maskdino_config(cfg):
     # （GT 框，原生 1024² 像素）。训练时 diag 用匹配到的 GT 框（按 LSJ 缩放系数换回原生尺度），
     # 推理时用该实例的预测框（原图像素）。
     cfg.MODEL.MaskDINO.POINT_COUNT_LINE = [8.924, 0.0345]
+    # ===== 计数头输入 detach（mini/count-residual-detach，预注册见 experiments-bank/ideas/count-residual-detach.md）=====
+    # True 时 point_count_embed 读 decoder 输出的 detach 副本（interm、initial_pred、9 层都改）：
+    # loss_point_count 只训练 point_count_embed 自己，不再回传到 decoder_norm / decoder / pixel decoder / backbone。
+    # 前向数值不变（Δ 与 False 时逐位相同），只切断反向；推理不受影响。需要 POINT_COUNT_HEAD=True。
+    # False 时与 mini/count-residual（60d21a3）逐位相同。
+    cfg.MODEL.MaskDINO.POINT_COUNT_DETACH = False
     # FREEZE_EXCEPT_POINT_HEAD=True 时，除点头外额外解冻的参数名子串。
     # 空 = 只训点头（Stage2 原设计）。例：["predictor.decoder"] 解冻 transformer decoder，
     # ["sem_seg_head"] 解冻整个分割头（decoder + pixel decoder + 各预测头），backbone 仍冻结。
