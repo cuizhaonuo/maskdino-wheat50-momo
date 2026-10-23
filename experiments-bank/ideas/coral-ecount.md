@@ -1,5 +1,7 @@
 # 想法：CORAL 存在性头 + E 损失 + E 读数（K 臂）
 
+> **结果**（2026-10-24）：[exp-2026-10-23-mini-coral-ecount](../experiments/exp-2026-10-23-mini-coral-ecount.md) —— 计数过线、护栏未过（不记成立）：主读数 iter 11999 `count_MAE_spike` 1.1897 ≤ 1.28，归因「有效」（≤ 1.1958，余量 0.006），机制启动（r 0.748 ≥ 0.7016）；segm AP 峰值 76.03 < 77.80、读数那次 `matched_F1@8` 0.6033 < 0.6078。
+
 状态：**预注册（跑之前写死），未启动** ｜ **2026-10-23 启动前修订**：每穗计数由 K 改为 round(E)，E 的 L1 损失保留（用户 2026-10-22 批准）；原设计（`47072eb`）的判定线作废 ｜ **2026-10-23 第二次启动前修订**：小穗点仍按 K 输出，只有计数读 round(E)（用户 2026-10-23 批准）；两次修订见「启动前修订」｜ 提出 2026-10-22 ｜ 分支 `mini/coral-ecount`（从 `mini/coral-exist`@`f029805` 开出，100 epoch）｜ 配置 `wheat_joint_single_stage_mini_coral_ecount.yaml`（`_BASE_` 为 `wheat_joint_single_stage_mini_coral_exist.yaml`）｜ 输出 `output_v2/exp-<启动日>-mini-coral-ecount`（占位，主 agent 定）
 
 ## 来源
