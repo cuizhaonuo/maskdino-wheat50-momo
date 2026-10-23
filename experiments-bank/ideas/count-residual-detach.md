@@ -1,6 +1,6 @@
 # 想法：残差计数头的输入 detach —— 计数损失只训练计数头
 
-状态：**预注册，待跑** ｜ 提出 2026-10-22 ｜ 分支 `mini/count-residual-detach`（从 `mini/count-residual`@`222d864` 开出；代码即父臂启动时的 `60d21a3`，父臂之后只有文档提交；100 epoch）｜ 配置 `wheat_joint_single_stage_mini_count_residual_detach.yaml`（`_BASE_` 为 `wheat_joint_single_stage_mini_count_residual.yaml`）｜ 输出 `output_v2/exp-<启动日>-mini-count-residual-detach`（启动日由主 agent 排卡时定）
+状态：**不成立：主判据歧义（1.3104），护栏三条都过 → 护栏恢复、计数退化**；机制启动 ｜ 验证于 [exp-2026-10-22-mini-count-residual-detach](../experiments/exp-2026-10-22-mini-count-residual-detach.md) ｜ 2026-10-22 15:17:35 启动于 `902225c`，baiju A100 GPU0（本批次用户临时放开；由主 agent 排卡脚本启动，全程与别人共卡）｜ 预注册提交于 `902225c`（跑之前）｜ 提出 2026-10-22 ｜ 分支 `mini/count-residual-detach`（从 `mini/count-residual`@`222d864` 开出；代码即父臂启动时的 `60d21a3`，父臂之后只有文档提交；100 epoch）｜ 配置 `wheat_joint_single_stage_mini_count_residual_detach.yaml`（`_BASE_` 为 `wheat_joint_single_stage_mini_count_residual.yaml`）｜ 输出 `output_v2/exp-1022-mini-count-residual-detach`
 
 > 本批「计数改进三臂」（2026-10-22，mini）之一：L `mini/count-residual-detach`（本臂）、D `mini/density-count`、K `mini/coral-ecount`。
 > 三臂共用一组判定线：下文的读数规则、主判据、护栏、次口径、噪声地板照抄批次说明第 4 节（`output_v2/_batch-1022-count/AGENT_BRIEF.md`）。
@@ -268,3 +268,25 @@
   - 冒烟 `max_mem` 22,989 MB，与父臂冒烟相同；父臂正式 run 24,701 MB（E0 24,195 MB）；
   - 本臂预计与父臂相同，约 24.7 GB（torch 口径）。nvidia-smi 口径约 27 GB，排卡按空闲显存 ≥ 28 GB 算。
 - 卡由主 agent 排（本批用户临时放开 qiuhao、baiju、xuyu GPU0/1；4090 放不下 bs4）。
+
+## 结论（2026-10-23）
+
+**不成立：主判据歧义、护栏三条都过，按结果分类表记「护栏恢复、计数退化」；机制启动。**
+详见 [exp-2026-10-22-mini-count-residual-detach](../experiments/exp-2026-10-22-mini-count-residual-detach.md)。
+
+| 判据 | 要求 | 实测 | |
+|:--|:--|:--|:--:|
+| 主判据：读数那次（iter 10999）`count_MAE_spike` | ≤ 1.28 成立；≥ 1.42 判否 | **1.3104**（E0 iter 8999 为 2.4648，父臂 iter 9499 为 1.1459） | 歧义 |
+| 护栏：segm AP 全程峰值 | ≥ 77.80 | 78.00 | ✅ |
+| 护栏：`spike_recall` 全程峰值 | ≥ 0.9311 | 0.9478 | ✅ |
+| 护栏：读数那次 `matched_F1@8` | ≥ 0.6078 | 0.6354 | ✅ |
+| 机制门：r(头) − r(直线)，最终评估 578 穗 | ≥ +0.03 | **+0.070**（0.682 vs 0.612；父臂 +0.127） | ✅ |
+
+- 归因记录量（只记录）：后半程 segm AP 与 E0 同 iter 的平均差 −0.73（父臂 −2.05）；主读数计数相对父臂 +0.165（1.3104 vs 1.1459）。
+- 护栏回到 E0 水平：后半程 `matched_F1@8` +0.002、`spike_recall` −0.003；七项原有训练损失末段回到 E0 水平。
+  这支持「父臂的护栏代价来自计数损失回传」。
+- 计数退回去一截：训练集上的计数损失只从 1.46 降到 1.35（父臂降到 0.77），读数 1.31，落在歧义区间。
+  它仍比同批穗的直线低 0.11，扣掉各自偏差后差距不变，收益来自 r。
+- 父臂的计数收益与护栏代价是同一件事的两面：计数信息要靠计数损失塑造共享特征。
+- 未验证的后续方向：只挡住进 backbone 的计数梯度；或不 detach、只降 `POINT_COUNT_WEIGHT`。
+- 读数一律是默认读数，没有做阈值扫描。单种子。
