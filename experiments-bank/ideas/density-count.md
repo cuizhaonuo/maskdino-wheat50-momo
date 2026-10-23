@@ -1,5 +1,7 @@
 # 想法：每穗计数交给「密度图在预测 mask 内的积分」
 
+> **结果**（2026-10-23）：[exp-2026-10-23-mini-density-count](../experiments/exp-2026-10-23-mini-density-count.md) —— 不成立：主判据歧义（1.3239），segm AP 护栏未过（峰值 77.06 < 77.80）；机制启动（+0.057）
+
 状态：**预注册，待跑** ｜ 提出 2026-10-22 ｜ 分支 `mini/density-count`（从 `mini/baseline`@`0f71161` 开出，100 epoch）｜ 配置 `wheat_joint_single_stage_mini_density_count.yaml`（`_BASE_` 为 `wheat_joint_single_stage_mini_ep100.yaml`）｜ 输出 `output_v2/exp-<启动日>-mini-density-count`（启动日由主 agent 排卡时定）
 
 > 本批「计数改进三臂」（2026-10-22，mini）之一：L `mini/count-residual-detach`、D `mini/density-count`（本臂）、K `mini/coral-ecount`。
