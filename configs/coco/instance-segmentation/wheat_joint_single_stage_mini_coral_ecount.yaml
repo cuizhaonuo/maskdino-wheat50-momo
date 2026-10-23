@@ -2,7 +2,8 @@
 # mini/coral-ecount · CORAL 存在性头 + E 损失 + E 读数（K 臂，2026-10-22 计数三臂之一）
 #   预注册：experiments-bank/ideas/coral-ecount.md（判否线已在跑之前写死）
 #   父臂：mini/coral-exist（wheat_joint_single_stage_mini_coral_exist.yaml，output_v2/exp-0926-mini-coral-exist）
-#   【启动前修订，用户 2026-10-22 批准】默认读数由 K（阈值计数）改为 round(E)，E 的 L1 损失保留。
+#   【启动前修订，用户 2026-10-22 批准】每穗计数由 K（阈值计数）改为 round(E)，E 的 L1 损失保留。
+#   【第二次启动前修订，用户 2026-10-23 批准】小穗点仍按 K 输出（与父臂相同），只有计数读 round(E)。
 #
 # 与父臂配置的差异【两项】：
 #   MODEL.MaskDINO.POINT_ECOUNT_WEIGHT: 0.0 -> 1.0
@@ -10,8 +11,9 @@
 #     是存在性头的期望计数；新损失 loss_point_ecount = mean |E - min(Ni, 25)|，与 CORAL BCE 同一组输出
 #     （主输出、9 份 aux、interm）深监督，共 11 项。wheat（Ni = 0）不进这一项。
 #   MODEL.MaskDINO.TEST.POINT_CORAL_READOUT: threshold -> expect
-#     每穗输出前 n = clamp(round(E), 0, 25) 个 slot，点数即计数（无参数，POINT_THRESHOLD 不参与计数）。
-#     训练期内置评估也用这个读数。逐穗明细另记 ecount（E）与 kcount（阈值读数 K）两列，不进任何指标。
+#     每穗计数 = clamp(round(E), 0, 25)（无参数），写进 pred_spikelet_counts，count_MAE_spike / count_MAE_img 读它；
+#     小穗点仍输出前 K 个 slot（K = sum_k 1[sigmoid(l_k) > 0.5]，与父臂相同），点级 P/R/F1 按实际输出的点算。
+#     训练期内置评估也用这个读数。逐穗明细另记 ecount（E）、kcount（K）、out_points（输出点数）三列，不进任何指标。
 #   CoralHead 的结构与初始化、bias 的学习率、CORAL BCE、前缀内层匹配全部不变。
 #
 # 用法：

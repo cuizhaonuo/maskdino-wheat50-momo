@@ -149,11 +149,13 @@ def add_maskdino_config(cfg):
     cfg.MODEL.MaskDINO.TEST.PANO_TEMPERATURE = 0.06
     # 小穗点存在性置信度阈值（sigmoid 后 > 该值的点才输出）
     cfg.MODEL.MaskDINO.TEST.POINT_THRESHOLD = 0.35
-    # POINT_CORAL_EXIST=True 时每穗输出几个 slot（mini/coral-ecount 启动前修订，用户 2026-10-22 批准；
-    # 预注册见 experiments-bank/ideas/coral-ecount.md）。总是输出前 n 个 slot（前缀顺序），点数即计数：
-    #   "threshold" = 现状，n = K = sum_k 1[sigmoid(l_k) > POINT_THRESHOLD]，与 mini/coral-exist 逐位相同；
-    #   "expect"    = n = clamp(round(E), 0, P)，E = sum_k sigmoid(l_k)（fp32），无参数（POINT_THRESHOLD 不参与计数）。
-    #                 另存诊断字段 pred_spikelet_ecount（E）与 pred_spikelet_kcount（threshold 读数的 K），
+    # POINT_CORAL_EXIST=True 时每穗计数的读法（mini/coral-ecount 两次启动前修订，用户 2026-10-22 / 10-23 批准；
+    # 预注册见 experiments-bank/ideas/coral-ecount.md）。小穗点两种读法下都输出前 K 个 slot，
+    # K = sum_k 1[sigmoid(l_k) > POINT_THRESHOLD]（前缀顺序）；只有写进 pred_spikelet_counts 的每穗计数不同：
+    #   "threshold" = 现状，计数 = K（= 点数），与 mini/coral-exist 逐位相同；
+    #   "expect"    = 计数 = clamp(round(E), 0, P)，E = sum_k sigmoid(l_k)（fp32），无参数。
+    #                 SpikeletPointEvaluator 的计数指标读 pred_spikelet_counts，点级指标仍按实际输出的点算。
+    #                 另存诊断字段 pred_spikelet_ecount（E）与 pred_spikelet_kcount（K），
     #                 只写进 spikelet_pair_counts.csv 的 ecount / kcount 列，不进任何指标。
     cfg.MODEL.MaskDINO.TEST.POINT_CORAL_READOUT = "threshold"
     # 评估时是否额外加挂小穗点评估器（SpikeletPointEvaluator，见 maskdino/evaluation/）

@@ -118,7 +118,8 @@ class MaskDINO(nn.Module):
         self.point_coral_exist = point_coral_exist
         # POINT_ECOUNT_WEIGHT > 0 或 expect 读法时推理多存诊断字段 pred_spikelet_ecount（CORAL 头的期望计数 E）
         self.point_ecount_diag = point_ecount_diag
-        # CORAL 头每穗输出几个 slot："threshold"（K，现状）或 "expect"（round(E)），见 config.py
+        # CORAL 头的每穗计数读法："threshold"（计数 = K，现状）或 "expect"（计数 = round(E)）；
+        # 两者都输出前 K 个 slot 的小穗点，见 config.py
         self.point_coral_readout = point_coral_readout
 
         if not self.semantic_on:
@@ -579,15 +580,16 @@ class MaskDINO(nn.Module):
                     if self.point_coral_exist:
                         # 按求和计数、取前缀，不要求 bias 已经排好序（定理 1 只保证最优点有序）
                         n_k = int(keep_pt.sum().item())
-                        if expect_readout:
-                            # E 读数：n = clamp(round(E), 0, P)，无参数；仍输出前 n 个 slot
-                            spikelet_kcounts.append(n_k)
-                            n_k = int(ecount_all[k].round().clamp(0, score_k.numel()).item())
                         keep_pt = torch.arange(score_k.numel(), device=score_k.device) < n_k
                     rel = point_coords[k][keep_pt]                    # [Ki, 2] 框相对
                     xy = torch.stack([x0, y0]) + rel * torch.stack([bw, bh])  # [Ki, 2] 像素
                     spikelet_points.append(xy)
-                    spikelet_counts.append(int(keep_pt.sum().item()))
+                    if expect_readout:
+                        # E 读数：每穗计数 = clamp(round(E), 0, P)，无参数；小穗点仍是前 K 个 slot（与父臂相同）
+                        spikelet_kcounts.append(n_k)
+                        spikelet_counts.append(int(ecount_all[k].round().clamp(0, score_k.numel()).item()))
+                    else:
+                        spikelet_counts.append(int(keep_pt.sum().item()))
                 else:
                     # wheat 实例不输出任何小穗点
                     spikelet_points.append(point_coords.new_zeros((0, 2)))
