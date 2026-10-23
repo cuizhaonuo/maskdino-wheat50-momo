@@ -251,6 +251,8 @@ iter 1999 的 `count_MAE_spike` 是 0.70，但 `spike_recall` 只有 0.033（约
 
 ## 下一步（需要用户决定）
 
-1. 计数的收益与分割的代价都来自同一条路径：E 损失经共享 decoder 回传。L 臂 `mini/count-residual-detach` 要回答的就是「计数损失不回传共享 decoder」行不行，可以对照它的结果再决定。
+1. 计数的收益与分割的代价都来自同一条路径：E 损失经共享 decoder 回传。
+   同批 L 臂 `mini/count-residual-detach`（该分支 `exp-2026-10-22-mini-count-residual-detach.md`）已经回答了同类问题：计数头输入 detach 后三条护栏都过，但计数退到 1.31（歧义）。
+   本臂若同样切断回传，很可能是同样的取舍（未验证）。
 2. 点输出的膨胀来自窄刻度尺。刻度尺被学习率卡住（`coral-bias-lr-ceiling`）。完整集 `full/coral-exist` 的 bias ×10 学习率把跨度拉到 7.78。
    若要让 K 与 E 一致，需要另开 arm 处理 bias（先验初始化或单独的学习率），本臂按 brief 没有动它。
