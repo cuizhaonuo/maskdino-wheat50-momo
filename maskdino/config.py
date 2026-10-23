@@ -115,7 +115,7 @@ def add_maskdino_config(cfg):
     # （斜率 1.016），失真在读数 K，见预注册「实施前的新发现」。
     # 0.0 = 关：不建损失、不进 weight_dict，与 mini/coral-exist 逐位相同。
     # > 0 时推理多存一个诊断字段 pred_spikelet_ecount（= E），只写进 spikelet_pair_counts.csv 的 ecount 列，
-    # 不改计数读法（仍是 K = sum_k 1[sigmoid(l_k) > POINT_THRESHOLD]、取前 K 个 slot），不进任何指标。
+    # 不进任何指标。这个键不改计数读法；读法由 TEST.POINT_CORAL_READOUT 决定（本臂启动前修订为 expect）。
     cfg.MODEL.MaskDINO.POINT_ECOUNT_WEIGHT = 0.0
     # FREEZE_EXCEPT_POINT_HEAD=True 时，除点头外额外解冻的参数名子串。
     # 空 = 只训点头（Stage2 原设计）。例：["predictor.decoder"] 解冻 transformer decoder，
@@ -149,6 +149,13 @@ def add_maskdino_config(cfg):
     cfg.MODEL.MaskDINO.TEST.PANO_TEMPERATURE = 0.06
     # 小穗点存在性置信度阈值（sigmoid 后 > 该值的点才输出）
     cfg.MODEL.MaskDINO.TEST.POINT_THRESHOLD = 0.35
+    # POINT_CORAL_EXIST=True 时每穗输出几个 slot（mini/coral-ecount 启动前修订，用户 2026-10-22 批准；
+    # 预注册见 experiments-bank/ideas/coral-ecount.md）。总是输出前 n 个 slot（前缀顺序），点数即计数：
+    #   "threshold" = 现状，n = K = sum_k 1[sigmoid(l_k) > POINT_THRESHOLD]，与 mini/coral-exist 逐位相同；
+    #   "expect"    = n = clamp(round(E), 0, P)，E = sum_k sigmoid(l_k)（fp32），无参数（POINT_THRESHOLD 不参与计数）。
+    #                 另存诊断字段 pred_spikelet_ecount（E）与 pred_spikelet_kcount（threshold 读数的 K），
+    #                 只写进 spikelet_pair_counts.csv 的 ecount / kcount 列，不进任何指标。
+    cfg.MODEL.MaskDINO.TEST.POINT_CORAL_READOUT = "threshold"
     # 评估时是否额外加挂小穗点评估器（SpikeletPointEvaluator，见 maskdino/evaluation/）
     cfg.MODEL.MaskDINO.TEST.SPIKELET_EVAL = False
     # 点匹配的距离阈值（原图像素，多档一起报）。GT 实测同穗内小穗最近邻间距中位 16px，

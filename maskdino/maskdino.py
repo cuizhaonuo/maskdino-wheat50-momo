@@ -56,6 +56,7 @@ class MaskDINO(nn.Module):
         point_threshold: float = 0.35,
         point_coral_exist: bool = False,
         point_ecount_diag: bool = False,
+        point_coral_readout: str = "threshold",
     ):
         """
         Args:
@@ -115,8 +116,10 @@ class MaskDINO(nn.Module):
         self.spikelet_class_id = 1
         # POINT_CORAL_EXIST：K = 超过阈值的 slot 数（CORAL 的求和规则），输出前 K 个 slot
         self.point_coral_exist = point_coral_exist
-        # POINT_ECOUNT_WEIGHT > 0 时推理多存诊断字段 pred_spikelet_ecount（CORAL 头的期望计数 E），不改读法
+        # POINT_ECOUNT_WEIGHT > 0 或 expect 读法时推理多存诊断字段 pred_spikelet_ecount（CORAL 头的期望计数 E）
         self.point_ecount_diag = point_ecount_diag
+        # CORAL 头每穗输出几个 slot："threshold"（K，现状）或 "expect"（round(E)），见 config.py
+        self.point_coral_readout = point_coral_readout
 
         if not self.semantic_on:
             assert self.sem_seg_postprocess_before_inference
@@ -168,6 +171,12 @@ class MaskDINO(nn.Module):
             if not cfg.MODEL.MaskDINO.POINT_CORAL_EXIST:
                 raise ValueError("POINT_ECOUNT_WEIGHT > 0 需要 POINT_CORAL_EXIST=True（E 是 CORAL 头 P 个 slot 的期望计数）")
             weight_dict.update({"loss_point_ecount": point_ecount_weight})
+        # CORAL 存在性头的推理读法（见 config.py 的 TEST.POINT_CORAL_READOUT）
+        point_coral_readout = cfg.MODEL.MaskDINO.TEST.POINT_CORAL_READOUT
+        if point_coral_readout not in ("threshold", "expect"):
+            raise ValueError(f"TEST.POINT_CORAL_READOUT 只能是 threshold / expect，收到 {point_coral_readout!r}")
+        if point_coral_readout == "expect" and not cfg.MODEL.MaskDINO.POINT_CORAL_EXIST:
+            raise ValueError("TEST.POINT_CORAL_READOUT=expect 需要 POINT_CORAL_EXIST=True（E 是 CORAL 头的期望计数）")
         # two stage is the query selection scheme
         if cfg.MODEL.MaskDINO.TWO_STAGE:
             interm_weight_dict = {}
@@ -245,7 +254,8 @@ class MaskDINO(nn.Module):
             "semantic_ce_loss": cfg.MODEL.MaskDINO.TEST.SEMANTIC_ON and cfg.MODEL.MaskDINO.SEMANTIC_CE_LOSS and not cfg.MODEL.MaskDINO.TEST.PANOPTIC_ON,
             "point_threshold": cfg.MODEL.MaskDINO.TEST.POINT_THRESHOLD,
             "point_coral_exist": cfg.MODEL.MaskDINO.POINT_CORAL_EXIST,
-            "point_ecount_diag": point_ecount_weight > 0,
+            "point_ecount_diag": point_ecount_weight > 0 or point_coral_readout == "expect",
+            "point_coral_readout": point_coral_readout,
         }
 
     @property
@@ -553,6 +563,11 @@ class MaskDINO(nn.Module):
         if point_coords is not None:
             spikelet_points = []
             spikelet_counts = []
+            expect_readout = self.point_coral_exist and self.point_coral_readout == "expect"
+            spikelet_kcounts = []   # expect 读法下记录 threshold 读数的 K（诊断）
+            # CORAL 头的期望计数 E = sum_k sigmoid(l_k)（fp32）。expect 读数与诊断字段用同一份，保证一致
+            ecount_all = (point_logits.float().sigmoid().sum(dim=(1, 2))
+                          if self.point_coral_exist and (self.point_ecount_diag or expect_readout) else None)
             boxes_xyxy = mask_box_result  # [K, 4] 像素 xyxy
             for k in range(len(result)):
                 if int(labels_per_image[k].item()) == self.spikelet_class_id:
@@ -564,6 +579,10 @@ class MaskDINO(nn.Module):
                     if self.point_coral_exist:
                         # 按求和计数、取前缀，不要求 bias 已经排好序（定理 1 只保证最优点有序）
                         n_k = int(keep_pt.sum().item())
+                        if expect_readout:
+                            # E 读数：n = clamp(round(E), 0, P)，无参数；仍输出前 n 个 slot
+                            spikelet_kcounts.append(n_k)
+                            n_k = int(ecount_all[k].round().clamp(0, score_k.numel()).item())
                         keep_pt = torch.arange(score_k.numel(), device=score_k.device) < n_k
                     rel = point_coords[k][keep_pt]                    # [Ki, 2] 框相对
                     xy = torch.stack([x0, y0]) + rel * torch.stack([bw, bh])  # [Ki, 2] 像素
@@ -573,13 +592,17 @@ class MaskDINO(nn.Module):
                     # wheat 实例不输出任何小穗点
                     spikelet_points.append(point_coords.new_zeros((0, 2)))
                     spikelet_counts.append(0)
+                    if expect_readout:
+                        spikelet_kcounts.append(0)
             result.pred_spikelet_points = spikelet_points
             result.pred_spikelet_counts = torch.as_tensor(spikelet_counts, device=self.device, dtype=torch.int64)
-            if self.point_ecount_diag:
-                # 诊断字段：CORAL 头的期望计数 E = sum_k sigmoid(l_k)（fp32），只给 wheat_2，其余置 0。
-                # 上面的计数读法（前 K 个 slot）不变；只被 SpikeletPointEvaluator 写进逐穗明细的 ecount 列。
+            if ecount_all is not None and self.point_ecount_diag:
+                # 诊断字段：E，只给 wheat_2，其余置 0。只被 SpikeletPointEvaluator 写进逐穗明细的 ecount 列。
                 is_spikelet = (labels_per_image == self.spikelet_class_id).float()
-                result.pred_spikelet_ecount = point_logits.float().sigmoid().sum(dim=(1, 2)) * is_spikelet
+                result.pred_spikelet_ecount = ecount_all * is_spikelet
+            if expect_readout:
+                # 诊断字段：threshold 读数的 K（wheat_2 之外为 0），只写进逐穗明细的 kcount 列
+                result.pred_spikelet_kcount = torch.as_tensor(spikelet_kcounts, device=self.device, dtype=torch.int64)
         return result
 
     def box_postprocess(self, out_bbox, img_h, img_w):

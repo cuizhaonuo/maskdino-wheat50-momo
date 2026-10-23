@@ -109,11 +109,15 @@ class SpikeletPointEvaluator(DatasetEvaluator):
             classes = inst.pred_classes.detach().cpu().numpy()
             scores = inst.scores.detach().cpu().numpy()
             has_points = inst.has("pred_spikelet_points")
-            # 诊断字段（POINT_ECOUNT_WEIGHT > 0 时模型才输出）：CORAL 头的期望计数 E，只进逐穗明细的 ecount 列
+            # 诊断字段（POINT_ECOUNT_WEIGHT > 0 或 POINT_CORAL_READOUT=expect 时模型才输出）：CORAL 头的期望计数 E，
+            # 只进逐穗明细的 ecount 列
             ecount = (inst.pred_spikelet_ecount.detach().cpu().numpy()
                       if inst.has("pred_spikelet_ecount") else None)
+            # 诊断字段（TEST.POINT_CORAL_READOUT=expect 时才有）：threshold 读数的 K，只进逐穗明细的 kcount 列
+            kcount = (inst.pred_spikelet_kcount.detach().cpu().numpy()
+                      if inst.has("pred_spikelet_kcount") else None)
 
-            points, rles, keep_scores, ecounts = [], [], [], []
+            points, rles, keep_scores, ecounts, kcounts = [], [], [], [], []
             for i in range(len(inst)):
                 if int(classes[i]) != self._spikelet_class_id or scores[i] < self._score_thresh:
                     continue
@@ -125,6 +129,8 @@ class SpikeletPointEvaluator(DatasetEvaluator):
                 keep_scores.append(float(scores[i]))
                 if ecount is not None:
                     ecounts.append(float(ecount[i]))
+                if kcount is not None:
+                    kcounts.append(int(kcount[i]))
 
             # 零预测的图也要保留：它们对 recall 与计数 MAE 有贡献。
             rec = {
@@ -133,6 +139,8 @@ class SpikeletPointEvaluator(DatasetEvaluator):
             }
             if ecount is not None:
                 rec["ecounts"] = ecounts
+            if kcount is not None:
+                rec["kcounts"] = kcounts
             self._predictions.append(rec)
 
     def evaluate(self):
@@ -161,8 +169,9 @@ class SpikeletPointEvaluator(DatasetEvaluator):
         img_pred_tot, img_gt_tot = [], []
         n_gt_spike = n_pred_spike = n_matched_spike = 0
         rows = []
-        # 模型输出了诊断字段 pred_spikelet_ecount 时，逐穗明细多一列 ecount（E，不进任何指标）
+        # 模型输出了诊断字段时，逐穗明细多 ecount（E）/ kcount（threshold 读数的 K）列，不进任何指标
         has_ecount = any("ecounts" in p for p in predictions)
+        has_kcount = any("kcounts" in p for p in predictions)
 
         for pred in predictions:
             gt = self._gt.get(pred["image_id"])
@@ -205,6 +214,8 @@ class SpikeletPointEvaluator(DatasetEvaluator):
                 row = (gt["file_name"], len(pp[pi]), len(gp[gi]), float(iou[pi, gi]))
                 if has_ecount:
                     row = row + (round(pred["ecounts"][pi], 4),)
+                if has_kcount:
+                    row = row + (pred["kcounts"][pi],)
                 pair_rows.append(row)
 
             rows.append((gt["file_name"], len(pp), pred_tot, len(gp), gt_tot, len(pairs)))
@@ -264,7 +275,7 @@ class SpikeletPointEvaluator(DatasetEvaluator):
             with open(ppath, "w", newline="", encoding="utf-8") as f:
                 wcsv = csv.writer(f)
                 wcsv.writerow(["file_name", "pred_points", "gt_points", "iou"]
-                              + (["ecount"] if has_ecount else []))
+                              + (["ecount"] if has_ecount else []) + (["kcount"] if has_kcount else []))
                 wcsv.writerows(pair_rows)
             self._logger.info(f"[SpikeletPointEvaluator] 逐 TP 穗明细 -> {ppath}")
 

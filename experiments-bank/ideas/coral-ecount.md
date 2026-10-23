@@ -1,6 +1,6 @@
-# 想法：CORAL 存在性头 + 计数尺度损失（K 臂）
+# 想法：CORAL 存在性头 + E 损失 + E 读数（K 臂）
 
-状态：**预注册（跑之前写死），未启动**，等主 agent 审核 ｜ 提出 2026-10-22 ｜ 分支 `mini/coral-ecount`（从 `mini/coral-exist`@`f029805` 开出，100 epoch）｜ 配置 `wheat_joint_single_stage_mini_coral_ecount.yaml`（`_BASE_` 为 `wheat_joint_single_stage_mini_coral_exist.yaml`）｜ 输出 `output_v2/exp-<启动日>-mini-coral-ecount`（占位，主 agent 定）
+状态：**预注册（跑之前写死），未启动** ｜ **2026-10-23 启动前修订**：默认读数由 K 改为 round(E)，E 的 L1 损失保留（用户 2026-10-22 批准）；原设计（`47072eb`）的判定线作废，见「启动前修订」｜ 提出 2026-10-22 ｜ 分支 `mini/coral-ecount`（从 `mini/coral-exist`@`f029805` 开出，100 epoch）｜ 配置 `wheat_joint_single_stage_mini_coral_ecount.yaml`（`_BASE_` 为 `wheat_joint_single_stage_mini_coral_exist.yaml`）｜ 输出 `output_v2/exp-<启动日>-mini-coral-ecount`（占位，主 agent 定）
 
 ## 来源
 
@@ -11,6 +11,33 @@
 - 完整集 `full/coral-exist`：同一个头，另给 `CoralHead.bias` ×10 学习率。
   见该分支的 `experiments-bank/experiments/exp-2026-10-09-full-coral-exist.md`。只读参照，没有合并任何代码。
 
+## 启动前修订（2026-10-23；用户 2026-10-22 批准）
+
+**改了什么**
+
+- 本臂的默认读数由 K = Σ_k 1[σ(l_k) > 0.5] 改为 **round(E)**，E = Σ_k σ(l_k)：
+  每穗输出前 n = clamp(round(E), 0, 25) 个 slot（沿用前缀顺序），点数即计数。
+  无参数，不扫阈值。训练期内置评估就用这个读数。
+- E 的 L1 损失 `loss_point_ecount`（权重 1.0）保留。
+- 主判据与护栏照批次统一线，不变。
+- 归因对照改为父臂在同一读法（round(E)）下的读数；机制门改为看 round(E) 的 r。
+- 只对本臂生效。其余臂和已有 run 的读数一律不变。
+
+**用户原话**（2026-10-22，对两个问题的回答）：
+
+1. K 臂选「改成 E 读数 + E 损失」：启动前在预注册里写死，本臂默认读数为 round(E)（无参数，不扫阈值），保留 E 的 L1 损失。主判据与护栏不变；归因对照改为父臂同口径的 round(E) 读数。
+2. round(E) 的总体地位选「只作诊断记录」：维持现状，对比一律用各自的默认读数；round(E) 在别处只在诊断文件和「零训练诊断」段落里出现。
+
+**原设计的判定线为什么作废**
+
+- 原设计（`47072eb`）的读数是 K。归因线是主读数 ≤ 1.50（父臂 K 读数 1.6655 × 0.9），机制门是 K 的 E[GT | 预测] 斜率落在 [0.85, 1.15]。
+- 下文「实施前的新发现」表明：父臂的 E 已经校准，K 的失真来自被学习率卡住的窄刻度尺。
+  本臂不动刻度尺（brief 规定），新损失又只作用于 E。
+  所以原判定线量的是「K 读法与窄刻度尺的相互作用」，回答不了「E 损失有没有用」。
+- 修订在任何 run 启动之前完成，没有用到本臂的任何训练结果。
+- 新归因线要用父臂在 round(E) 读法下的后半程轨迹。它是启动前用父臂已有的 13 个 checkpoint 做 `--eval_only` 测的，见「实施前已完成的验证」第 5 条。
+  这是同一读法下的父臂轨迹，不是扫阈值：round(E) 没有可调参数。
+
 ## 现象（brief 给出的出发点）
 
 1. 父臂 mini/coral-exist（`output_v2/exp-0926-mini-coral-exist`）：
@@ -20,13 +47,21 @@
 2. 完整集上同一个头加了 bias ×10 学习率：bias 跨度到 7.78，读数反过来被**压缩**（标准差 1.25 vs GT 2.39，斜率 1.36）。
 3. 两种情况都没有得到校准的计数尺度。
 
-## 假设（brief 给出，未验证）
+## 假设
+
+**brief 的原假设**（未验证，已被下文「实施前的新发现」否定，留作记录）：
 
 - 记 E = Σ_k σ(l_k)（25 个 slot 的存在性概率之和）、y = min(Ni, 25)。
 - CORAL 损失对 25 个任务取均值。对一个实例，共享打分 g 上的梯度是 Σ_k (σ(l_k) − y_k) / 25 = (E − y) / 25。
   计数尺度的信号太弱，头学不出校准的尺度。
 - 直接加 |E − y|：g 上的梯度变成 sign(E − y) · Σ_k σ'(l_k)，与误差大小无关，强得多。
 - 假设成立时：默认读数 K 的尺度被校准（斜率接近 1），计数误差下降。
+
+**修订后的假设**：
+
+- 读数直接取 E 的整数，与新损失的对象一致，不再经过窄刻度尺的阈值穿越。
+- 父臂的 E 在均值上已经校准（斜率 1.016），但逐穗还不准（r 0.672）：BCE 在 g 上只给 (E − y)/25 的梯度。
+- L1 损失直接压每穗的 |E − y|，梯度大小与误差无关。若特征里有更多计数信息，round(E) 应当更准：r 更高、MAE 更低。
 
 ## 实施前的新发现：父臂的 E 已经校准，失真在读数 K
 
@@ -49,42 +84,44 @@
 - 对单个实例，CORAL BCE 在 g 上的梯度 (E − y)/25 恰好在 E = y 处为零。
   父臂的 BCE 本来就在把 E 推向 y，只是推得慢，而它已经推到了（斜率 1.016）。
 - **结论**：父臂的计数尺度在 E 上已经校准。过度分散与 +1.44 的多报来自读数 K 与窄刻度尺的组合，不是 g 上的信号太弱。
-- **对本臂的含义**：
+- **对原设计（读数 K，已作废）的含义**：
   - 新损失作用于 E，默认读数 K 不变。
   - 在父臂的最终状态上（用上表这 576 个 val 配对穗估计），新损失对 25 个 bias 的平均梯度同号，只把刻度尺整体平移，不拉开它。
     拉开刻度尺只靠 CORAL BCE：它的下降方向是 k ≤ 15 往上、k ≥ 16 往下。而 bias 仍被学习率卡住。
   - 同一状态下，每个穗上新损失对 g 的梯度大小平均是 CORAL BCE（×2）的 47 倍。
     第 0 步打分 MLP 参数上的梯度范数比是 7.9 倍（见下文）。训练后 |E − y| 变小，BCE 的梯度跟着变小，而新损失的梯度大小与误差无关。
-  - 所以预计 K 的失真不会因为新损失而消失，见下文「实施者的预测」。
-- 按 brief，这一发现**不改**本臂的设计与判定线。是否仍按原设计启动，交主 agent 决定。
-- 这只是父臂已有 checkpoint 上的一个诊断读数：没有选阈值，不进任何判定，也不拿来给任何臂挑读法。
+  - 所以 K 的失真不会因为新损失而消失。这正是改读数的理由。
+- 这一发现促成了上文的「启动前修订」（用户 2026-10-22 批准）。
+- 它只是父臂已有 checkpoint 上的一个诊断读数：没有选阈值。按用户的第 2 条回答，round(E) 在本臂之外只作诊断记录。
 
 ## 修法
 
-所有改动都由一个新键控制，默认关闭。关着时与 `mini/coral-exist` 逐位等价（见「实施前已完成的验证」）。
+所有改动都由两个新键控制，默认都是父臂的行为。默认值下与 `mini/coral-exist` 逐位等价（见「实施前已完成的验证」）。
 
 | 位置 | 改动 |
 |:--|:--|
-| `maskdino/config.py` | 新增 `MODEL.MaskDINO.POINT_ECOUNT_WEIGHT`，默认 0.0 = 关 |
+| `maskdino/config.py` | 新增 `MODEL.MaskDINO.POINT_ECOUNT_WEIGHT`（默认 0.0 = 关）与 `MODEL.MaskDINO.TEST.POINT_CORAL_READOUT`（默认 `threshold`，另一档 `expect`） |
 | `maskdino/modeling/criterion.py` | 新的 loss 类型 `point_ecount`，产出 `loss_point_ecount`。对象是外层匹配上、标签为 wheat_2 且 Ni ≥ 1 的实例。E = Σ_k σ(l_k)，取 25 个 slot，logit 先转 fp32。损失 = Σ \|E − min(Ni, 25)\| ÷ 这类实例数，没有这类实例时为 0 且保持计算图。不做内层匹配，不消耗随机数。`loss_points`（CORAL BCE、前缀内层匹配、坐标 L1）一行不动 |
 | `maskdino/maskdino.py` `from_config` | 权重 > 0 时才把 `loss_point_ecount` 放进 weight_dict，并把 `point_ecount` 接在 `points` 之后放进 losses。它随 `_interm` / `_{i}` 展开，共 11 项（主输出、9 份 aux、interm），与 CORAL BCE 用同一组输出 dict、同一份外层匹配。`_dn` 权重会生成，但 dn_losses 里没有它，不会被产生。权重 > 0 而 `POINT_CORAL_EXIST` 关着时直接报错 |
-| `maskdino/maskdino.py` `instance_inference` | 权重 > 0 时给每个实例多存诊断字段 `pred_spikelet_ecount`：wheat_2 是 E，其余为 0。计数读法与点输出都不变 |
-| `maskdino/evaluation/spikelet_evaluation.py` | 模型输出了这个字段时，`spikelet_pair_counts.csv` 末尾多一列 `ecount`，不进任何指标 |
-| 配置 | `wheat_joint_single_stage_mini_coral_ecount.yaml`，`_BASE_` 为父臂 yaml，只加 `POINT_ECOUNT_WEIGHT: 1.0` |
+| `maskdino/maskdino.py` `from_config` | `POINT_CORAL_READOUT` 只接受 `threshold` / `expect`；`expect` 而 `POINT_CORAL_EXIST` 关着时直接报错 |
+| `maskdino/maskdino.py` `instance_inference` | 每穗总是输出前 n 个 slot：`threshold` 时 n = K（与父臂相同）；`expect` 时 n = clamp(round(E), 0, 25)，E 在 fp32 下只算一次，读数与诊断字段共用。另存诊断字段：`pred_spikelet_ecount`（E，wheat_2 之外为 0；权重 > 0 或 `expect` 时）、`pred_spikelet_kcount`（threshold 读数的 K；`expect` 时） |
+| `maskdino/evaluation/spikelet_evaluation.py` | 模型输出了这两个字段时，`spikelet_pair_counts.csv` 末尾多 `ecount` / `kcount` 列，不进任何指标。计数口径不用改：`expect` 下点数就是 round(E) |
+| 配置 | `wheat_joint_single_stage_mini_coral_ecount.yaml`，`_BASE_` 为父臂 yaml，只加 `POINT_ECOUNT_WEIGHT: 1.0` 与 `TEST.POINT_CORAL_READOUT: expect` |
 
 不变的部分：
 - CoralHead 的结构与初始化（bias 降序 1.00 → 0.04）；
 - bias 的学习率（**没有** ×10）；
 - CORAL BCE 及其权重 2.0、前缀内层匹配；
 - 坐标头与 `POINT_COORD_WEIGHT` 5.0、外层匹配、DN；
-- `TEST.POINT_THRESHOLD` 0.5 与推理读法：K = Σ_k 1[σ(l_k) > 0.5]，输出前 K 个 slot。
+- 输出前 n 个 slot 的前缀顺序。`TEST.POINT_THRESHOLD` 仍是 0.5，在 `expect` 下只用于诊断列 `kcount`，不参与计数。
 
 ## 与父臂的差异
 
-- 解析后的 cfg 与父臂 yaml 逐项比对，**只差一个键**：`POINT_ECOUNT_WEIGHT` 0.0 → 1.0。
+- 解析后的 cfg 与父臂 yaml 逐项比对，**只差两个键**：`POINT_ECOUNT_WEIGHT` 0.0 → 1.0，`TEST.POINT_CORAL_READOUT` threshold → expect。
 - 一个参数都不加，仍是 52,294,290 个。state_dict 的 733 个键与父臂相同。
 - 训练损失多 11 项 `loss_point_ecount*`，原有 127 项不变。
-- 内置评估的指标与父臂同一口径、同一读法。逐穗明细多一列 `ecount`。
+- 内置评估换了读法：`count_MAE_spike` 与点指标（`matched_F1@σ` 等）都按 round(E) 输出的点算。
+  segm / bbox AP、spike_recall、spike_precision 与读法无关。逐穗明细多 `ecount`、`kcount` 两列。
 
 ## 权重为什么取 1.0
 
@@ -103,6 +140,7 @@ brief 指定先取 1.0。量级上看不出明显不合适，保留。
 
 脚本与产物都在 `output_v2/_smoke-1022-coral-ecount/`：`scripts/`、`equiv/`、`eval-off/`、`eval-diag/`、`smoke40/`。
 父臂一侧用 `git archive f029805` 的快照（`parent_f029805/`）运行，没有在父臂的 worktree 里执行任何东西。
+第 1~4 条在修订前的代码（`47072eb`）上做。修订只动了推理读法、评估器的诊断列和配置，训练路径没变；修订后的核对见第 5 条。
 
 **1. 权重为 0 时与父臂逐位等价**
 
@@ -175,6 +213,7 @@ xuyu GPU0，15:01~15:04。脚本 `scripts/run_evals.sh` 与 `compare_evals.py`�
 baiju GPU0，15:04~15:14。脚本 `scripts/smoke_train.py`，输出 `smoke40/`、`smoke40.json`、`smoke40_summary.txt`。
 
 - 正式配置加 CLI 覆盖 `SOLVER.MAX_ITER 40`、`TEST.EVAL_PERIOD 0`，bs4。
+  用的是修订前的配置（读数 threshold）。训练路径与修订后相同；expect 读数的评估路径由第 5 条在父臂 13 个 checkpoint 上验过。
 - 走 `train_net.setup` / `train_net.Trainer` 的完整训练循环：AMPTrainer、优化器、LR 调度、日志、训练末评估。
   只去掉 PeriodicCheckpointer，不存 `model_final.pth`。这不是一次训练 run。
 - 40 iter 与训练末的一次完整 val 评估都跑通，无报错，损失全部有限。
@@ -196,7 +235,34 @@ baiju GPU0，15:04~15:14。脚本 `scripts/smoke_train.py`，输出 `smoke40/`�
   - 未训练的 CORAL 头 25 个概率都在 0.56~0.77，K 全是 25。
   - `spikelet_pair_counts.csv` 表头带上了 `ecount` 列。有配对穗时诊断列的输出，已由第 3 条的 eval-diag 验过。
 
-## 预期与判否线（跑之前写死）
+**5. 启动前修订后的核对**
+
+2026-10-23，xuyu GPU0。脚本 `scripts/run_parent_expect.sh` 与 `compare_expect.py`，结果在 `compare_expect.txt`，各次评估在 `pexp/`。
+
+- **训练路径**：整套等价性重跑（`equiv/compare.txt`），结果与修订前逐位相同。
+  权重 0 时 127 项 loss（fp32 / AMP）与父臂逐位相同；权重 1.0 的手算与有梯度的张量集合都不变。
+- **threshold 读法仍与父臂等价**：父臂 `model_final.pth` 配它自己的 `config.yaml`（readout 取默认 threshold、E 权重 0），
+  40 项指标与训练日志末次评估完整精度逐项相同，`coco_instances_results.json`、`instances_predictions.pth` 与两份 CSV 逐字节相同。
+- **expect 读法在父臂 `model_final.pth` 上**：
+  - `count_MAE_spike` 1.3316（576 穗），复现了「实施前的新发现」的诊断；配对穗与父臂最终评估完全相同；
+  - `kcount` 列与父臂 threshold 读数逐穗相同；`pred_points` 与 clamp(round(`ecount`)) 逐穗相同；
+  - 点数随读法变了，全部点指标如下（括号里是同一 checkpoint 的 threshold 读数）：
+
+    | 指标 | expect | threshold |
+    |:--|--:|--:|
+    | `count_MAE_spike` | 1.3316 | 2.0243 |
+    | `matched_F1@8` / `@5` / `@3` | 0.6044 / 0.3284 / 0.1427 | 0.6215 / 0.3395 / 0.1467 |
+    | `F1@8`（端到端） | 0.4848 | 0.4959 |
+    | `count_MAE_img` | 19.94 | 24.70 |
+    | `n_pred_points`（GT 9747） | 12992 | 14304 |
+    | `dist_mean_px` | 4.62 | 4.62 |
+
+    segm / bbox AP、spike_recall、spike_precision 与读法无关，两者相同（78.59 / 77.24 / 0.9396 / 0.6817）。
+- **父臂后半程 13 个 checkpoint 的 expect 读数**（判定线一节的表）：
+  与读法无关的指标在 13 个 checkpoint 上都与父臂训练日志同 iter 的值相同（checkpoint 与 iter 对得上，评估可复现）；
+  每个 checkpoint 上 `pred_points` 都与 clamp(round(E)) 逐穗相同。
+
+## 预期与判否线（跑之前写死；2026-10-23 启动前修订版）
 
 ### 本批统一判定线（L、D、K 三臂相同，照 brief 第 4 节原样抄）
 
@@ -216,69 +282,91 @@ baiju GPU0，15:04~15:14。脚本 `scripts/smoke_train.py`，输出 `smoke40/`�
   - 最终评估逐穗 CSV 的有符号偏差、Pearson r、预测计数标准差、E[GT | 预测] 斜率（= r × sd_GT / sd_pred），以及同批穗上的穗长直线 MAE。
 - **噪声地板**：`matched_F1@8` 0.015。单种子，噪声内的差异记「歧义」。
 
-本臂的默认读数就是父臂的 K（`POINT_THRESHOLD` 0.5，前 K 个 slot），内置评估里的 `count_MAE_spike` 直接读它。
+本臂的默认读数是 **round(E)**：每穗输出前 n = clamp(round(E), 0, 25) 个 slot。
+内置评估的 `count_MAE_spike` 与 `matched_F1@σ` 等点指标都按它算。
+上面的统一线全部按这个读数判，线本身不变（用户 2026-10-22：主判据与护栏不变）。
 
-### 父臂在同一组线下的读数（参照，不是判据）
+### 父臂同口径读数（round(E) 读法，后半程 13 个 checkpoint；参照，不是判据）
 
-| | iter | `count_MAE_spike` | `matched_F1@8` | spike_recall | segm AP |
-|:--|--:|--:|--:|--:|--:|
-| 主读数（后半程计数最低） | 9999 | 1.6655 | 0.6107 | 0.9266 | 78.28 |
-| 全程峰值 | — | — | — | 0.9478（iter 9499） | 78.71（iter 11499） |
+父臂 `exp-0926-mini-coral-exist` 已有的 checkpoint 配它自己的 `config.yaml`，加 `TEST.POINT_CORAL_READOUT expect` 做 `--eval_only`（2026-10-23，启动前）。
+逐穗统计取各自的逐穗明细；最后一列是同一 checkpoint 上父臂默认读数（threshold）的训练期评估。
 
-- 父臂按统一主判据是「判否」（1.6655 ≥ 1.42），三条护栏都过。
-- 父臂最终 checkpoint 的配对穗上，穗长直线（预测框）是 1.424。来源：`mini/count-residual` 预注册的表，10-07 主 agent 离线算的。
+| iter | `count_MAE_spike` | 偏差 | r | sd（GT 2.40） | E[GT \| 预测] 斜率 | `matched_F1@8` | `count_MAE_img` | segm AP | spike_recall | threshold 读数 count / F1@8 |
+|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| 6499 | 1.5131 | −0.41 | 0.567 | 1.31 | 1.041 | 0.5984 | 24.27 | 72.69 | 0.9347 | 2.1379 / 0.6114 |
+| 6999 | 1.4575 | −0.20 | 0.593 | 1.35 | 1.048 | 0.6144 | 21.57 | 76.31 | 0.9413 | 2.2998 / 0.6254 |
+| 7499 | 1.4815 | +0.09 | 0.592 | 1.32 | 1.075 | 0.5994 | 21.56 | 74.84 | 0.9250 | 2.5450 / 0.6141 |
+| 7999 | 1.4165 | +0.07 | 0.636 | 1.35 | 1.136 | 0.6057 | 24.30 | 74.39 | 0.9478 | 2.4389 / 0.6200 |
+| 8499 | 1.4575 | +0.36 | 0.619 | 1.44 | 1.024 | 0.6162 | 23.84 | 75.84 | 0.9413 | 3.0069 / 0.6301 |
+| 8999 | 1.3503 | −0.27 | 0.660 | 1.47 | 1.069 | 0.5940 | 16.64 | 78.01 | 0.8989 | 1.9800 / 0.6063 |
+| 9499 | 1.3855 | +0.32 | 0.666 | 1.50 | 1.062 | 0.6062 | 24.75 | 76.54 | 0.9478 | 2.7298 / 0.6234 |
+| 9999 | 1.4067 | −0.58 | 0.667 | 1.51 | 1.048 | 0.6018 | 17.55 | 78.28 | 0.9266 | 1.6655 / 0.6107 |
+| 10499 | 1.3310 | −0.12 | 0.675 | 1.54 | 1.055 | 0.6055 | 20.39 | 77.91 | 0.9462 | 2.0931 / 0.6196 |
+| 10999 | 1.3374 | −0.27 | 0.674 | 1.58 | 1.025 | 0.6015 | 20.70 | 78.57 | 0.9429 | 1.9671 / 0.6177 |
+| **11499** | **1.3287** | −0.06 | 0.679 | 1.58 | 1.030 | 0.6069 | 20.33 | 78.71 | 0.9429 | 2.1713 / 0.6226 |
+| 11999 | 1.3461 | −0.25 | 0.666 | 1.60 | 1.003 | 0.6042 | 19.48 | 78.67 | 0.9380 | 1.9861 / 0.6233 |
+| 12500（final） | 1.3316 | −0.22 | 0.672 | 1.59 | 1.016 | 0.6044 | 19.93 | 78.59 | 0.9396 | 2.0243 / 0.6215 |
 
-### 归因线（对父臂）
+- **父臂同口径读数**：后半程 `count_MAE_spike` 最低在 iter 11499，**1.3287**（578 穗）。
+  同一 checkpoint：`matched_F1@8` 0.6069、spike_recall 0.9429、segm AP 78.71、bbox AP 77.42、`count_MAE_img` 20.33、`n_pred_points` 13109。
+- 按统一线读父臂（参照）：
+  - 主判据 1.3287 落在 (1.28, 1.42) → 歧义；
+  - 护栏：segm AP 峰值 78.71、spike_recall 峰值 0.9478 都过；**主读数那次 `matched_F1@8` 0.6069 < 0.6078，不过**。
+- round(E) 读法下，父臂 13 个 checkpoint 的斜率都在 1.00~1.14，都是校准的；计数误差主要来自 r（0.57~0.68）。
+- 读法本身让 `matched_F1@8` 降 0.012~0.017：round(E) 输出的点比 K 少（E ≤ K），召回降得比精度升得多。
+  13 个 checkpoint 里只有 6999、8499 两次 ≥ 0.6078。
 
-- 主读数 `count_MAE_spike` ≤ **1.50**（父臂主读数 1.6655 × 0.9）→「计数尺度损失有效」；否则记「无效」。
+### 归因线（对父臂同口径读数）
 
-### 机制门（本臂的机制有没有启动）
+- 本臂主读数 `count_MAE_spike` ≤ **1.1958**（父臂同口径读数 1.3287 × 0.9）→「E 损失在 E 读法上有效」；否则记「无效」。
 
-- 取最终评估的逐穗明细（`inference/spikelet_pair_counts.csv`），按默认读数（`pred_points` 列，即 K）算
-  E[GT | 预测] 斜率 = r × sd_GT / sd_pred。
-- 斜率落在 **[0.85, 1.15]**（父臂 0.551）→「尺度被校准」，机制启动；否则记「机制未启动」。
-- 同时记录预测计数标准差与 r（父臂 2.70 / 0.620）。
+### 机制门（E 损失有没有让 E 更准）
 
-### 诊断读数（只记录，不进任何判定，不用来挑读法或阈值）
+- 取最终评估的逐穗明细（`inference/spikelet_pair_counts.csv`），`pred_points` 列即 round(E)。
+- r(round(E), GT) ≥ **0.7016**（父臂最终评估 576 穗上 0.6716，+0.03）→「E 损失让 E 更准」，机制启动；否则记「机制未启动」。
+- 同时记录 E[GT | 预测] 斜率与预测计数标准差（父臂最终评估：1.016 / 1.59）。
 
-- 最终评估 `spikelet_pair_counts.csv` 的 `ecount` 列就是 E。在同一批穗上报 round(E) 的 MAE、偏差、r、预测 sd 与斜率。
-- 父臂最终 checkpoint 上的同一读数：1.332 / −0.22 / 0.672 / 1.59 / 1.016。
-- 用途：区分「新损失没有校准 E」与「E 校准了，但 K 读数没有跟上」。
+### 诊断记录（只记录，不进任何判定，不用来挑读法或阈值）
+
+- 逐穗明细的 `ecount` 列是 E（不取整），`kcount` 列是 threshold 读数的 K（`POINT_THRESHOLD` 0.5）。
+- 最终评估上报同一批穗的 K 读数 MAE、偏差、r、斜率（父臂最终评估：2.024 / +1.44 / 0.620 / 0.551），以及 E − K 的均值（父臂 −1.65）。
+- 按用户第 2 条回答，这些只出现在诊断文件与本文里。
 
 ### 观察量（只记录）
 
 - 最终 25 个 bias：数值、跨度（父臂 1.94，初值 0.96）、相邻不增的对数、相对初值的位移。
-- 最终评估：K ≥ 24 的配对穗数；E − K 的均值（父臂 −1.65）。
 - `loss_point_ecount` 与 `loss_point_cls` 的训练曲线（分段均值）。
-- 后半程 13 轮与父臂同 iter 的 segm AP、`matched_F1@8`、spike_recall 之差。
-  新损失经共享 decoder 回传，`mini/count-residual` 在这里付过代价。
+- 后半程 13 轮与父臂同 iter、同读法（上表）的 `count_MAE_spike`、r、`matched_F1@8` 之差，以及 segm AP、spike_recall 之差。
+  新损失经共享 decoder 回传，`mini/count-residual` 在 segm AP 上付过代价。
 
-### 实施者的预测（写于启动前，不是判定线）
+### 实施者的预测（写于启动前，不是判定线；2026-10-23 按修订后的设计重写）
 
-依据上文「实施前的新发现」：
-
-- **机制门**：大概率不过，K 的斜率仍明显低于 0.85。
-  - 父臂的 E 已经校准，K 的失真来自窄刻度尺。
-  - 新损失只作用于 E，对 bias 只给同号的整体平移，而刻度尺仍被学习率卡住。
-- **主判据**：倾向「判否」（≥ 1.42）。**归因线**：倾向「无效」。
-  - K 读数的失真不会被新损失修好。
-  - 新损失把 E 拉得更贴 y，g 的散度会变大；在窄刻度尺上，K 的散度跟着变大，读数可能更分散。
-- **诊断读数** round(E)：应保持在 1.3 左右或略好，因为新损失直接拉 E。
-- 若机制门反而通过，说明刻度尺被拉开了，最终 bias 跨度应明显大于父臂的 1.94。那时要回头查本节的推理哪里错了。
+- **机制门**：倾向通过（r ≥ 0.7016）。
+  - 新损失直接压逐穗的 |E − y|，与读数是同一个量。
+  - 参照：`mini/count-residual` 用 L1 直接监督计数，r 从直线的 0.62 升到 0.747。
+- **主判据**：倾向「歧义」，有机会「成立」。
+  - 父臂同口径在 1.33~1.51。按父臂轨迹（r 0.57 → 0.68 时 MAE 1.51 → 1.33）粗估，r 每升 0.05，MAE 降 0.05~0.1。
+- **归因线**（≤ 1.1958）：没有把握，倾向「无效」。要比父臂同口径好 10%，大约需要 r 升到 0.75 左右。
+- **护栏**：大概率不过，整体不成立。
+  - `matched_F1@8` ≥ 0.6078：round(E) 读法本身就让父臂在 13 次里只有 2 次过线（上表）。新损失只管计数、不管定位，没有理由把 F1@8 拉回来。
+  - segm AP 峰值 ≥ 77.80：新损失第 0 步在 decoder 上的梯度就是其余损失的 6%，`mini/count-residual` 的同类损失让 segm AP 平均降 2.05。父臂峰值 78.71，余量只有 0.91。
+- 最可能的结果：「计数歧义或过线、护栏未过（不记成立）」，机制启动。
 
 ## 已知限制
 
-- **bias 仍被学习率卡住。**
-  - mini schedule 全程累积 lr 0.613，AdamW 下每个标量 bias 最多走约 0.6。
-  - 本臂不改 bias 学习率、不改初始化，只验证这一项损失。
-  - 完整集版本 `full/coral-exist` 给了 `CoralHead.bias` ×10 学习率，跨度到 7.78。
-- **新损失作用于 E，读数却是 K。**
-  K 与 E 的关系由刻度尺决定，刻度尺不拉开，E 校准不等于 K 校准（见「实施前的新发现」）。
+- **读法本身改变点数，`matched_F1@8` 随之变。**
+  - 父臂同一 checkpoint 上，round(E) 比 K 少输出约 9% 的点（12992 vs 14304），`matched_F1@8` 低 0.012~0.017。
+  - 统一护栏 `matched_F1@8` ≥ 0.6078 是对 E0（threshold 0.35）定的，按用户决定不变。它对本臂偏紧，见上文父臂同口径表。
+  - 要把读法的效应与 E 损失的效应分开，看本臂与父臂同口径表在同 iter 上的差。
 - **新损失经共享 decoder 回传。**
   - 第 0 步它在 decoder 上的梯度是其余全部损失的 6%。
   - `mini/count-residual` 的 L1 计数损失与它同一量级，经共享 decoder 回传后 segm AP 平均 −2.05，三条护栏都没过。
   - 本臂不 detach；detach 是 L 臂 `mini/count-residual-detach` 要回答的问题。
-- 训练时 E 取配上的 query 的全部 25 个 slot，与读数无关；推理时 K 只看 0.5 这一档阈值。
+- **bias 仍被学习率卡住。**
+  - mini schedule 全程累积 lr 0.613，AdamW 下每个标量 bias 最多走约 0.6。本臂不改 bias 学习率与初始化。
+  - round(E) 不经过阈值穿越，窄刻度尺不再直接扭曲计数。但它仍决定 25 个概率怎样分摊 E。
+- round(E) 输出前 n 个 slot，靠的是前缀内层匹配给出的 slot 顺序（与父臂相同）。
+- 父臂同口径读数来自父臂已有的 checkpoint（13 次 `--eval_only`）：与本臂同数据、同 schedule、同种子，但不是同一次训练。
 - 单种子（SEED 42），不补种子。噪声内的差异记「歧义」。
 
 ## 成本
