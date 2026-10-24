@@ -170,7 +170,8 @@ class SetCriterion(nn.Module):
                  point_focal_alpha=0.25, point_empty_cls_weight=1.0, point_coord_norm="box_axis",
                  point_coord_robust_c=0.0, point_nms_mode="none", point_nms_kappa=0.07,
                  point_coral_exist=False,
-                 point_kmo=False, point_kmo_k=3, point_cost_knn=5.0):
+                 point_kmo=False, point_kmo_k=3, point_cost_knn=5.0,
+                 spikelet_class_id=1):
         """Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
@@ -226,6 +227,8 @@ class SetCriterion(nn.Module):
         self.point_kmo = point_kmo
         self.point_kmo_k = point_kmo_k            # 近邻数 K（不含自身）
         self.point_cost_knn = point_cost_knn      # 内层匹配中 KMO 项的权重
+        # 带小穗的类别（wheat_2 的连续 id）。只有 loss_point_ecount 用到（losses 里有 "point_ecount" 时）
+        self.spikelet_class_id = int(spikelet_class_id)
 
     def loss_labels_ce(self, outputs, targets, indices, num_masks):
         """Classification loss (NLL)
@@ -698,6 +701,39 @@ class SetCriterion(nn.Module):
                 losses['loss_point_coral'] = pred_coral.sum() * 0.0
         return losses
 
+    def loss_point_ecount(self, outputs, targets, indices, num_masks):
+        """计数尺度损失（POINT_ECOUNT_WEIGHT > 0 时 losses 里才有 "point_ecount"；要求 POINT_CORAL_EXIST=True）。
+        移植自 mini/coral-ecount 的 47072eb（本分支按完整集代码重写，没有 cherry-pick）。
+
+        只作用于 slot 语义的输出（pred_point_abs 为假：pred_point_logits 是 CoralHead 的 P 个 slot logit）。
+        外层匹配上的 wheat_2 且 Ni >= 1 的实例：E = sum_k sigmoid(l_k) 是 CORAL 头给出的期望计数，
+        目标是 CORAL levels 之和 min(Ni, P)，损失 = sum |E - min(Ni, P)| / 这类实例数。
+        - wheat（Ni = 0）不进这一项，它们仍由 loss_points 里的 CORAL BCE 监督；
+        - 与 loss_points 用同一份外层匹配 indices、同一组输出 dict（A：主输出 / 9 份 aux / interm），
+          不做内层匹配（E 是全部 P 个 slot 之和，与 slot 配给哪个 GT 无关），不消耗随机数；
+        - logit 先转 fp32 再 sigmoid（AMP 下输出头是 fp16）；
+        - 没有这类实例时损失为 0 且保持计算图。
+        group 层（分组 decoder 的小穗 token，pred_point_abs 为真）没有 slot 语义的 E，
+        它的 CORAL 计数头是 pred_point_coral（[B, Q, T]）。本分支不接那一层，直接跳过、不产生这个键；
+        from_config 已拦住「权重 > 0 且 POINT_GROUP_DECODER」，这里只是兜底。扩展见 full/combo-ecount。
+        """
+        if outputs.get('pred_point_abs', False):
+            return {}
+        assert self.point_coral_exist and 'pred_point_logits' in outputs
+        pred_logits = outputs['pred_point_logits']                 # [B, Q, P, 1]
+        P = pred_logits.shape[2]
+        idx = self._get_src_permutation_idx(indices)
+        logits = pred_logits[idx][..., 0].float()                   # [M, P]，M = 本输出外层匹配上的实例数
+        labels = torch.cat([t['labels'][J] for t, (_, J) in zip(targets, indices)])
+        n_gt = torch.as_tensor(
+            [t['points'][j].shape[0] for t, (_, J) in zip(targets, indices) for j in J.tolist()],
+            dtype=torch.float32, device=logits.device)              # [M] 各实例的 Ni
+        valid = ((labels == self.spikelet_class_id) & (n_gt >= 1)).to(logits.dtype)
+        e = logits.sigmoid().sum(dim=-1)                            # [M] 期望计数 E
+        err = (e - n_gt.clamp(max=P)).abs() * valid
+        # 没有这类实例时 err 全 0、分母取 1：损失为 0 且保持计算图
+        return {'loss_point_ecount': err.sum() / valid.sum().clamp(min=1.0)}
+
     def prep_for_dn(self,mask_dict):
         output_known_lbs_bboxes = mask_dict['output_known_lbs_bboxes']
 
@@ -727,6 +763,7 @@ class SetCriterion(nn.Module):
             'masks': self.loss_masks,
             'boxes': self.loss_boxes_panoptic if self.panoptic_on else self.loss_boxes,
             'points': self.loss_points,
+            'point_ecount': self.loss_point_ecount,
         }
         assert loss in loss_map, f"do you really want to compute {loss} loss?"
         return loss_map[loss](outputs, targets, indices, num_masks)

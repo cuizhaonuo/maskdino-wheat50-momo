@@ -58,6 +58,8 @@ class MaskDINO(nn.Module):
         point_abs_coords: bool = False,
         point_nms_kappa: float = 0.0,
         point_coral_exist: bool = False,
+        point_ecount_diag: bool = False,
+        point_coral_readout: str = "threshold",
     ):
         """
         Args:
@@ -122,6 +124,11 @@ class MaskDINO(nn.Module):
         self.point_nms_kappa = point_nms_kappa
         # POINT_CORAL_EXIST：K = 超过阈值的 slot 数（CORAL 的求和规则），输出前 K 个 slot
         self.point_coral_exist = point_coral_exist
+        # POINT_ECOUNT_WEIGHT > 0 或 expect 读法时推理多存诊断字段 pred_spikelet_ecount（CORAL 头的期望计数 E）
+        self.point_ecount_diag = point_ecount_diag
+        # slot 语义 CORAL 头的每穗计数读法："threshold"（计数 = K，现状）或 "expect"（计数 = round(E)）；
+        # 两者都输出前 K 个 slot 的小穗点，见 config.py 的 TEST.POINT_CORAL_READOUT
+        self.point_coral_readout = point_coral_readout
 
         if not self.semantic_on:
             assert self.sem_seg_postprocess_before_inference
@@ -173,6 +180,28 @@ class MaskDINO(nn.Module):
         # combo：group 层 CoralHead 计数损失（挂实例 query，无需匹配；深监督展开同理）
         if cfg.MODEL.MaskDINO.POINT_CORAL_EXIST and cfg.MODEL.MaskDINO.POINT_GROUP_DECODER:
             weight_dict.update({"loss_point_coral": cfg.MODEL.MaskDINO.POINT_CLASS_WEIGHT})
+        # 计数尺度损失（full/coral-ecount，移植自 mini/coral-ecount 的 47072eb）：权重 0 时既不进 weight_dict
+        # 也不计算，与 3bd2071 逐位相同。> 0 时随下面的 _interm / _{i} 展开深监督
+        # （_dn 权重会生成，但 dn_losses 里没有它，不会被产生，无害）。必须在展开之前加入。
+        point_ecount_weight = cfg.MODEL.MaskDINO.POINT_ECOUNT_WEIGHT
+        if point_ecount_weight > 0:
+            if not cfg.MODEL.MaskDINO.POINT_CORAL_EXIST:
+                raise ValueError("POINT_ECOUNT_WEIGHT > 0 需要 POINT_CORAL_EXIST=True（E 是 CORAL 头 P 个 slot 的期望计数）")
+            if cfg.MODEL.MaskDINO.POINT_GROUP_DECODER:
+                # group 层的计数头是 pred_point_coral，本分支没有接；只作用于 layer-0 / interm 会被误当成全层生效
+                raise NotImplementedError("POINT_ECOUNT_WEIGHT > 0 暂不支持 POINT_GROUP_DECODER=True"
+                                          "（group 层的 E 损失留给 full/combo-ecount 扩展）")
+            weight_dict.update({"loss_point_ecount": point_ecount_weight})
+        # slot 语义 CORAL 头的推理读法（见 config.py 的 TEST.POINT_CORAL_READOUT）
+        point_coral_readout = cfg.MODEL.MaskDINO.TEST.POINT_CORAL_READOUT
+        if point_coral_readout not in ("threshold", "expect"):
+            raise ValueError(f"TEST.POINT_CORAL_READOUT 只能是 threshold / expect，收到 {point_coral_readout!r}")
+        if point_coral_readout == "expect":
+            if not cfg.MODEL.MaskDINO.POINT_CORAL_EXIST:
+                raise ValueError("TEST.POINT_CORAL_READOUT=expect 需要 POINT_CORAL_EXIST=True（E 是 CORAL 头的期望计数）")
+            if cfg.MODEL.MaskDINO.POINT_GROUP_DECODER:
+                raise NotImplementedError("TEST.POINT_CORAL_READOUT=expect 暂不支持 POINT_GROUP_DECODER=True"
+                                          "（combo 的计数来自 pred_point_coral，留给 full/combo-ecount 扩展）")
         # two stage is the query selection scheme
         if cfg.MODEL.MaskDINO.TWO_STAGE:
             interm_weight_dict = {}
@@ -198,6 +227,8 @@ class MaskDINO(nn.Module):
             losses = ["labels", "masks","boxes","points"]
         else:
             losses = ["labels", "masks","points"]
+        if point_ecount_weight > 0:
+            losses.append("point_ecount")   # 排在 points 之后，与 CORAL BCE 同一组输出 dict
         # building criterion
         criterion = SetCriterion(
             sem_seg_head.num_classes,
@@ -257,6 +288,8 @@ class MaskDINO(nn.Module):
             "point_abs_coords": cfg.MODEL.MaskDINO.POINT_GROUP_DECODER,
             "point_nms_kappa": cfg.MODEL.MaskDINO.TEST.POINT_NMS_KAPPA,
             "point_coral_exist": cfg.MODEL.MaskDINO.POINT_CORAL_EXIST,
+            "point_ecount_diag": point_ecount_weight > 0 or point_coral_readout == "expect",
+            "point_coral_readout": point_coral_readout,
         }
 
     @property
@@ -591,6 +624,13 @@ class MaskDINO(nn.Module):
         if point_coords is not None:
             spikelet_points = []
             spikelet_counts = []
+            # slot 语义 CORAL 头（A 的路径）的 E 读法（TEST.POINT_CORAL_READOUT=expect；分组 decoder 下 from_config 已报错）
+            coral_slot = self.point_coral_exist and not self.point_abs_coords
+            expect_readout = coral_slot and self.point_coral_readout == "expect"
+            spikelet_kcounts = []   # expect 读法下记录 threshold 读数的 K（诊断）
+            # CORAL 头的期望计数 E = sum_k sigmoid(l_k)（fp32）。expect 读数与诊断字段用同一份，保证一致
+            ecount_all = (point_logits.float().sigmoid().sum(dim=(1, 2))
+                          if coral_slot and (self.point_ecount_diag or expect_readout) else None)
             boxes_xyxy = mask_box_result  # [K, 4] 像素 xyxy
             # 推理侧点 NMS（TEST.POINT_NMS_KAPPA > 0）或带存活掩码时走下面的新分支；都没有时走原路径（逐位不变）
             point_select = self.point_nms_kappa > 0 or point_keep is not None
@@ -654,13 +694,28 @@ class MaskDINO(nn.Module):
                         rel = point_coords[k][keep_pt]                # [Ki, 2] 框相对
                         xy = torch.stack([x0, y0]) + rel * torch.stack([bw, bh])  # [Ki, 2] 像素
                     spikelet_points.append(xy)
-                    spikelet_counts.append(int(keep_pt.sum().item()))
+                    if expect_readout:
+                        # E 读数（移植自 mini/coral-ecount 的 709059d）：每穗计数 = clamp(round(E), 0, P)，无参数；
+                        # 小穗点仍是上面 CE 原路径给出的前 K 个 slot（与 threshold 读法相同）
+                        spikelet_kcounts.append(int(keep_pt.sum().item()))
+                        spikelet_counts.append(int(ecount_all[k].round().clamp(0, score_k.numel()).item()))
+                    else:
+                        spikelet_counts.append(int(keep_pt.sum().item()))
                 else:
                     # wheat 实例不输出任何小穗点
                     spikelet_points.append(point_coords.new_zeros((0, 2)))
                     spikelet_counts.append(0)
+                    if expect_readout:
+                        spikelet_kcounts.append(0)
             result.pred_spikelet_points = spikelet_points
             result.pred_spikelet_counts = torch.as_tensor(spikelet_counts, device=self.device, dtype=torch.int64)
+            if ecount_all is not None and self.point_ecount_diag:
+                # 诊断字段：E，只给 wheat_2，其余置 0。只被 SpikeletPointEvaluator 写进逐穗明细的 ecount 列。
+                is_spikelet = (labels_per_image == self.spikelet_class_id).float()
+                result.pred_spikelet_ecount = ecount_all * is_spikelet
+            if expect_readout:
+                # 诊断字段：threshold 读数的 K（wheat_2 之外为 0），只写进逐穗明细的 kcount 列
+                result.pred_spikelet_kcount = torch.as_tensor(spikelet_kcounts, device=self.device, dtype=torch.int64)
         return result
 
     def box_postprocess(self, out_bbox, img_h, img_w):

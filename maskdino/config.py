@@ -168,6 +168,18 @@ def add_maskdino_config(cfg):
     # 打开后 POINT_CLASS_MLP 不起作用（打分固定是 3 层 MLP），POINT_FOCAL_ALPHA / COST_POINT_CLASS_WEIGHT
     # 也不再参与点头。False 时模型与基线逐位相同。预注册见 experiments-bank/ideas/coral-exist.md。
     cfg.MODEL.MaskDINO.POINT_CORAL_EXIST = False
+    # 计数尺度损失 loss_point_ecount 的权重（full/coral-ecount；移植自 mini/coral-ecount 的 47072eb，
+    # 本分支按完整集代码重写，没有 cherry-pick。预注册见 experiments-bank/ideas/full-coral-ecount.md）。
+    # 只在 POINT_CORAL_EXIST=True 时可用，只作用于 slot 语义的输出（pred_point_abs 为假：A 的全部 11 份，
+    # 即主输出、9 份 aux、interm）。外层匹配上的 wheat_2（Ni >= 1）上，E = sum_k sigmoid(l_k)（P 个 slot 的
+    # CORAL logit，fp32）是存在性头给出的期望计数，损失 = |E - min(Ni, P)| 对这类实例取均值，
+    # 与 CORAL BCE 同一组输出、同一份外层匹配一起深监督。
+    # 0.0 = 关：不建损失、不进 weight_dict，与 full/combo 的合并代码（3bd2071）逐位相同。
+    # > 0 时推理多存一个诊断字段 pred_spikelet_ecount（= E），只写进逐穗明细的 ecount 列，不进任何指标。
+    # 这个键不改计数读法；读法由 TEST.POINT_CORAL_READOUT 决定。
+    # 分组 decoder（POINT_GROUP_DECODER=True，combo）的 group 层没有 slot 语义的 E，它的计数头是
+    # pred_point_coral。本分支没有接那一层：权重 > 0 与 POINT_GROUP_DECODER 同开时直接报错（留给 full/combo-ecount）。
+    cfg.MODEL.MaskDINO.POINT_ECOUNT_WEIGHT = 0.0
     # FREEZE_EXCEPT_POINT_HEAD=True 时，除点头外额外解冻的参数名子串。
     # 空 = 只训点头（Stage2 原设计）。例：["predictor.decoder"] 解冻 transformer decoder，
     # ["sem_seg_head"] 解冻整个分割头（decoder + pixel decoder + 各预测头），backbone 仍冻结。
@@ -200,6 +212,18 @@ def add_maskdino_config(cfg):
     cfg.MODEL.MaskDINO.TEST.PANO_TEMPERATURE = 0.06
     # 小穗点存在性置信度阈值（sigmoid 后 > 该值的点才输出）
     cfg.MODEL.MaskDINO.TEST.POINT_THRESHOLD = 0.35
+    # POINT_CORAL_EXIST=True（slot 语义的 CORAL 头，即 A 的路径）时每穗计数的读法
+    # （full/coral-ecount；移植自 mini/coral-ecount 的 709059d，本分支重写）。
+    # 小穗点两种读法下都输出前 K 个 slot，K = sum_k 1[sigmoid(l_k) > POINT_THRESHOLD]（前缀顺序）；
+    # 只有写进 pred_spikelet_counts 的每穗计数不同：
+    #   "threshold" = 现状，计数 = K（= 点数），与 3bd2071 逐位相同；
+    #   "expect"    = 计数 = clamp(round(E), 0, P)，E = sum_k sigmoid(l_k)（fp32），无参数。
+    #                 SpikeletPointEvaluator 的计数指标读 pred_spikelet_counts，点级指标仍按实际输出的点算。
+    #                 另存诊断字段 pred_spikelet_ecount（E）与 pred_spikelet_kcount（K），
+    #                 只写进 spikelet_pair_counts.csv 的 ecount / kcount 列，不进任何指标。
+    # expect 需要 POINT_CORAL_EXIST=True。分组 decoder（combo）的计数来自 pred_point_coral，本分支没有接，
+    # expect 与 POINT_GROUP_DECODER 同开时直接报错（留给 full/combo-ecount）。
+    cfg.MODEL.MaskDINO.TEST.POINT_CORAL_READOUT = "threshold"
     # 推理侧小穗点 NMS 的半径 κ（含义与数据依据见 POINT_NMS_KAPPA）。> 0 时 instance_inference 在最后一层
     # 对每个 wheat_2 实例的全部 K 个点做贪心 NMS（分数降序，中心距 < κ·sqrt(w·h) 算重复，w、h 为预测框的
     # 像素宽高），再按 POINT_THRESHOLD 过滤；先 NMS 后过滤与先过滤后 NMS 结果相同。

@@ -14,6 +14,9 @@ COCOEvaluator 只评 mask/box AP，看不出点回归头学得怎么样。本评
   - 端到端（P@σ / R@σ / F1@σ）：未配对预测穗内的点全记 FP，未配对 GT 穗内的点全记 FN，
     因此包含了检测误差，是部署时真正关心的数。
   - 仅配对实例（matched_*）：把检测误差剥离，单看点头本身。
+  - 计数（count_MAE_spike / count_MAE_img / count_RMSE_img）读模型给的每穗计数 pred_spikelet_counts
+    （没有时数点）。现有读法下它就是输出的点数；TEST.POINT_CORAL_READOUT=expect 时是 round(E)，
+    点级指标仍按实际输出的点算。
 
 坐标系：模型输出的 pred_spikelet_points 已经在原图像素系（maskdino.py 在 instance_inference
 之前就把 mask/box 还原回了原图尺寸，点是纯框相对还原），GT 的 points 也是原图绝对像素，
@@ -109,8 +112,19 @@ class SpikeletPointEvaluator(DatasetEvaluator):
             classes = inst.pred_classes.detach().cpu().numpy()
             scores = inst.scores.detach().cpu().numpy()
             has_points = inst.has("pred_spikelet_points")
+            # 每穗计数：有 pred_spikelet_counts 就读它，否则数点（full/coral-ecount，移植自 mini/coral-ecount 的 709059d）。
+            # 现有各路径（A 的 CE 前缀、combo 的 top-n_k、阈值 / NMS）里它都等于输出的点数，指标与改动前逐位相同；
+            # TEST.POINT_CORAL_READOUT=expect 下它是 round(E)，小穗点仍是前 K 个 slot。
+            counts_all = (inst.pred_spikelet_counts.detach().cpu().numpy()
+                          if inst.has("pred_spikelet_counts") else None)
+            # 诊断字段（POINT_ECOUNT_WEIGHT > 0 或 expect 读法时模型才输出）：CORAL 头的期望计数 E，只进逐穗明细的 ecount 列
+            ecount = (inst.pred_spikelet_ecount.detach().cpu().numpy()
+                      if inst.has("pred_spikelet_ecount") else None)
+            # 诊断字段（expect 读法时才有）：threshold 读数的 K，只进逐穗明细的 kcount 列
+            kcount = (inst.pred_spikelet_kcount.detach().cpu().numpy()
+                      if inst.has("pred_spikelet_kcount") else None)
 
-            points, rles, keep_scores = [], [], []
+            points, rles, keep_scores, counts, ecounts, kcounts = [], [], [], [], [], []
             for i in range(len(inst)):
                 if int(classes[i]) != self._spikelet_class_id or scores[i] < self._score_thresh:
                     continue
@@ -120,12 +134,22 @@ class SpikeletPointEvaluator(DatasetEvaluator):
                 rles.append(mask_util.encode(np.asfortranarray(m)))
                 points.append(np.asarray(pts, dtype=np.float64).reshape(-1, 2))
                 keep_scores.append(float(scores[i]))
+                counts.append(int(counts_all[i]) if counts_all is not None else len(points[-1]))
+                if ecount is not None:
+                    ecounts.append(float(ecount[i]))
+                if kcount is not None:
+                    kcounts.append(int(kcount[i]))
 
             # 零预测的图也要保留：它们对 recall 与计数 MAE 有贡献。
-            self._predictions.append({
+            rec = {
                 "image_id": inp["image_id"], "points": points,
-                "rles": rles, "scores": keep_scores,
-            })
+                "rles": rles, "scores": keep_scores, "counts": counts,
+            }
+            if ecount is not None:
+                rec["ecounts"] = ecounts
+            if kcount is not None:
+                rec["kcounts"] = kcounts
+            self._predictions.append(rec)
 
     def evaluate(self):
         if self._distributed:
@@ -153,6 +177,9 @@ class SpikeletPointEvaluator(DatasetEvaluator):
         img_pred_tot, img_gt_tot = [], []
         n_gt_spike = n_pred_spike = n_matched_spike = 0
         rows = []
+        # 模型输出了诊断字段时，逐穗明细多 ecount（E）/ kcount（threshold 读数的 K）、out_points 列，不进任何指标
+        has_ecount = any("ecounts" in p for p in predictions)
+        has_kcount = any("kcounts" in p for p in predictions)
 
         for pred in predictions:
             gt = self._gt.get(pred["image_id"])
@@ -160,14 +187,19 @@ class SpikeletPointEvaluator(DatasetEvaluator):
                 self._logger.warning(f"[SpikeletPointEvaluator] image_id {pred['image_id']} 不在 GT 中，跳过")
                 continue
             gp, pp = gt["points"], pred["points"]
+            # 每穗计数（见 process）；没有 counts 的旧格式预测退回数点
+            pc = pred.get("counts")
+            if pc is None:
+                pc = [len(x) for x in pp]
             n_gt_spike += len(gp)
             n_pred_spike += len(pp)
             gt_tot = int(sum(len(x) for x in gp))
-            pred_tot = int(sum(len(x) for x in pp))
+            pred_tot = int(sum(len(x) for x in pp))      # 实际输出的点：点级 P/R/F1、n_pred_points 用
+            pred_cnt_tot = int(sum(pc))                  # 计数：count_MAE_img / RMSE 与逐图明细用
             n_gt_pts += gt_tot
             n_pred_pts += pred_tot
             img_gt_tot.append(gt_tot)
-            img_pred_tot.append(pred_tot)
+            img_pred_tot.append(pred_cnt_tot)
 
             # --- 实例级：mask IoU + 匈牙利 ---
             pairs = []
@@ -191,10 +223,16 @@ class SpikeletPointEvaluator(DatasetEvaluator):
                     dist_n += int(within.size)
                 n_pred_pts_m += len(pp[pi])
                 n_gt_pts_m += len(gp[gi])
-                spike_count_abs_err.append(abs(len(pp[pi]) - len(gp[gi])))
-                pair_rows.append((gt["file_name"], len(pp[pi]), len(gp[gi]), float(iou[pi, gi])))
+                spike_count_abs_err.append(abs(int(pc[pi]) - len(gp[gi])))
+                row = (gt["file_name"], int(pc[pi]), len(gp[gi]), float(iou[pi, gi]))
+                if has_ecount:
+                    row = row + (round(pred["ecounts"][pi], 4),)
+                if has_kcount:
+                    # kcount：threshold 读数的 K；out_points：实际输出的点数（expect 下两者相同，后者是自检）
+                    row = row + (pred["kcounts"][pi], len(pp[pi]))
+                pair_rows.append(row)
 
-            rows.append((gt["file_name"], len(pp), pred_tot, len(gp), gt_tot, len(pairs)))
+            rows.append((gt["file_name"], len(pp), pred_cnt_tot, len(gp), gt_tot, len(pairs)))
 
         def prf(tp_arr, n_pred, n_gt, k):
             p = tp_arr[k] / n_pred if n_pred else float("nan")
@@ -237,6 +275,7 @@ class SpikeletPointEvaluator(DatasetEvaluator):
 
         if self._output_dir:
             os.makedirs(self._output_dir, exist_ok=True)
+            # 逐图明细：pred_points 是该图各预测穗的计数之和（与 count_MAE_img 同口径；threshold 读法下就是点数）
             path = os.path.join(self._output_dir, "spikelet_pred_vs_gt.csv")
             with open(path, "w", newline="", encoding="utf-8") as f:
                 wcsv = csv.writer(f)
@@ -247,10 +286,13 @@ class SpikeletPointEvaluator(DatasetEvaluator):
 
             # 逐 TP 穗明细：与 count_MAE_spike 完全同一批配对（mask IoU 匈牙利 + IoU>=阈值），
             # count_MAE_spike == mean(|pred_points - gt_points|)。供散点/偏差分析。
+            # pred_points 是每穗计数（pred_spikelet_counts）；expect 读法下它是 round(E)，
+            # 另有 ecount（E）、kcount（threshold 读数的 K）、out_points（实际输出的点数）三列。
             ppath = os.path.join(self._output_dir, "spikelet_pair_counts.csv")
             with open(ppath, "w", newline="", encoding="utf-8") as f:
                 wcsv = csv.writer(f)
-                wcsv.writerow(["file_name", "pred_points", "gt_points", "iou"])
+                wcsv.writerow(["file_name", "pred_points", "gt_points", "iou"]
+                              + (["ecount"] if has_ecount else []) + (["kcount", "out_points"] if has_kcount else []))
                 wcsv.writerows(pair_rows)
             self._logger.info(f"[SpikeletPointEvaluator] 逐 TP 穗明细 -> {ppath}")
 
