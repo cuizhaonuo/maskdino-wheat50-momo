@@ -115,18 +115,27 @@ coral-exist 的前缀内层匹配把正样本槽固定为前 Ni 个，「哪些�
 
 | 条件 | 判定 |
 |:--|:--|
-| ΔF1@8 ≥ **+0.015**（即 ≥ 0.6257），且机制门、计数护栏都过 | **成立**：KMO 的匹配项在前缀里有独立贡献 |
+| ΔF1@8 ≥ **+0.015**（即 ≥ 0.6257），且机制门、全部护栏（下文三条）都过 | **成立**：KMO 的匹配项在前缀里有独立贡献 |
 | ΔF1@8 ≥ +0.015，但机制门不过 | **主判据过线、机制未启动**（不记成立） |
-| ΔF1@8 ≥ +0.015，机制门过、计数护栏不过 | **主判据过线、护栏未过**（不记成立） |
+| ΔF1@8 ≥ +0.015，机制门过、任一护栏不过 | **主判据过线、护栏未过**（不记成立） |
 | \|ΔF1@8\| < 0.015 | **未决** |
 | ΔF1@8 ≤ **−0.015**（即 ≤ 0.5957） | **判否** |
 
 同时报 `matched_F1@3` / `@5` 对 coral-exist 的增量（基准 0.1478 / 0.3315）。
+〔修订第 1 条：「护栏」由只有计数改为下文三条〕
 
-### 对 E0 的通用线（照报，不作主判据）
+### 对 E0 的通用线
 
 沿用 10-07 那批的预注册：`matched_F1@8` ≥ **0.6428**（+0.02）、segm AP 峰值 ≥ **77.80**、`spike_recall` 峰值 ≥ **0.9311**。
-三条都照报是否过线，不进上表的判定。
+`matched_F1@8` 这条照报是否过线，不进上表的判定；segm AP、`spike_recall` 两条是护栏，进判定，见下。〔修订第 1 条〕
+
+### 护栏（三条都要过）〔修订第 1 条〕
+
+- **计数**：KMO 不能伤 coral-exist 的计数，见下一小节。
+- **segm AP 峰值** ≥ **77.80**（E0 78.80 − 1.0）。
+- **`spike_recall` 峰值** ≥ **0.9311**。
+
+后两条与 KMO v2 三臂（A、C、D）的护栏一致（coral-exist 当时只设了 segm AP 一条）；峰值取全程 25 次评估。
 
 ### 计数护栏：KMO 不能伤 coral-exist 的计数
 
@@ -153,10 +162,50 @@ coral-exist 的前缀内层匹配把正样本槽固定为前 Ni 个，「哪些�
 - 对 A 的差（单独用 vs 放进前缀）：`matched_F1@3 / @5 / @8`、`count_MAE_spike`、M1 的三个数、M2 改判率。
 - 训练结束后只写内置评估的结果，不跑任何阈值扫描。
 
-## 实施前已完成的验证（CPU，2026-10-22）
+## 预注册修订（2026-10-24，启动前）
 
-脚本与产物在 `output_v2/_smoke-1022-coral-kmo-dir/`（`scripts/`、`dumps/`），不提交。全部在 CPU 上跑（`CUDA_VISIBLE_DEVICES=""`），
-参照分支的 worktree 只读（`python -B`，不写字节码）。
+修订时正式训练还没有启动，没有任何正式结果。判据线的数值一条没动；上文受影响处加了〔修订第 N 条〕的注。
+
+**1. segm AP、`spike_recall` 两条进入判定，作为护栏。**
+原文把 segm AP 峰值 ≥ 77.80、`spike_recall` 峰值 ≥ 0.9311 放在「对 E0 的通用线（照报，不作主判据）」里，判定只看计数护栏。
+现改为三条护栏（计数、segm AP 峰值、`spike_recall` 峰值）都过才记「成立」，任一不过记「主判据过线、护栏未过（不记成立）」。
+`matched_F1@8` ≥ 0.6428 仍只对 E0 照报，不进判定。
+理由：与 KMO v2 三臂的护栏一致；本臂要能进组合模型，就不能以分割或召回为代价，只看计数会漏掉这两种退步。
+
+**2. 实现核对的后果保留。** 被选行集合变化率不为 0 → 实现错误，先查实现，不按判定表判定。
+冒烟 checkpoint 上已核对为恰好 0（见下节 GPU 第 3 项）。
+
+**3. 前缀内代价的写法保留**：C = L1 + (COST_POINT_KNN_WEIGHT / COST_POINT_COORD_WEIGHT)·s·‖ĉ − c‖₁。理由：
+- 最优分配与 A 臂的代价（5·L1 + 2·focal + 5·s·KMO）限制到前缀后相同：存在性项在前缀内是常数；CPU 上 12,000 例在独立 float64 代价上都是最优；
+- 权重 0 时与 coral-exist 逐位一致（CPU 上 0 处不同）。坐标项若整体乘回 5，L1 平局的打破方式会变，权重 0 时最多约 49% 的实例与 coral-exist 配对不同；
+- GPU 上同一 batch KMO 开 / 关只有 11 份 `loss_point_coord*` 不同，CORAL 的 `loss_point_cls*` 逐位相同（见下节 GPU 第 1 项）。
+
+**4. 「实施前已完成的验证」补上 GPU 三项**：逐位等价、40 iter 冒烟、冒烟 checkpoint 上的诊断与行集合核对。
+
+**5. 用卡与显存封顶。**
+- **卡不写死**：正式训练的卡由主 agent 在启动时按空闲显存选定。用户 2026-10-24 放开了用卡，原话「baiju 和 qiuhao 全部,以及 xuyu 的 gpu 0 和 1 都可以用」。
+  冒烟与 GPU 验证都在 qiuhao A100（GPU1）上做，卡上常驻别人的两个训练进程（约 27.7 GB、利用率约 100%）。
+- **显存封顶**：候选的卡上常有别人的进程（10-24 时 qiuhao A100、xuyu GPU0 上都有别人利用率 100% 的进程），正式训练与冒烟一样用 `train_capped.py` 包装：
+
+```bash
+ssh <机器> "cd <本 worktree> && CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=<卡号> PYTHONPATH=. \
+  CUDA_MEM_FRACTION=0.40 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  <MaskDINO-310 python> <主仓库>/output_v2/_smoke-1020-kmo-v2/scripts/train_capped.py --num-gpus 1 \
+  --config-file configs/coco/instance-segmentation/wheat_joint_single_stage_mini_coral_kmo_dir.yaml \
+  OUTPUT_DIR <主仓库>/output_v2/exp-<启动日期>-mini-coral-kmo-dir"
+```
+
+  `OUTPUT_DIR` 必须用绝对路径指向主仓库的 `output_v2/`，不能落在 worktree 里。`train_capped.py` 在进程开头调
+  `torch.cuda.set_per_process_memory_fraction(0.40)`（80 GB 的卡上限 31.7 GiB），再用 `runpy` 原样执行 `train_net.py`，
+  只改显存分配方式，不改训练逻辑和数值。
+- **耗时**按冒烟的 s/iter 重估，并注明共卡会变慢，见「成本」。
+
+## 实施前已完成的验证
+
+脚本与产物在 `output_v2/_smoke-1022-coral-kmo-dir/`（`scripts/`、`dumps/`、`equiv/`、`smoke40/`、`diag/`），不提交。
+参照分支的 worktree 一律只读（`python -B`、`PYTHONDONTWRITEBYTECODE=1`，跑完 `git status` 无改动）。
+
+### CPU（2026-10-22，`CUDA_VISIBLE_DEVICES=""`）
 
 - **KMO 关时与 `mini/coral-exist` 逐位一致**：两个 worktree 各 dump 一次后比对。
   - 内层匹配：前缀 / 非前缀各 3000 个随机实例（Ni ∈ 0..30，含 Ni > 25，三分之一坐标量化制造 L1 平局），42,894 / 43,478 个配对，下标逐项相同。
@@ -179,8 +228,47 @@ coral-exist 的前缀内层匹配把正样本槽固定为前 Ni 个，「哪些�
   其余 733 个张量与 KMO 关逐位相同，KMO 头没有打乱 coral-exist 已有模块的初始化。按新配置建的模型与「coral-exist 配置 + KMO 各键」完全相同。
 - **cfg 核对**：见上文「与对照的差异」。
 
-**待做（GPU，等主 agent 定卡后再做，结果补在本节）**：KMO 关时整模型前向的 loss 与 coral-exist 逐位等价；
-本配置原样 40 iter 冒烟（速度、显存、11 个 `loss_point_knn*` 是否齐全）；诊断脚本与行集合核对在冒烟 checkpoint 上跑通。
+### GPU（2026-10-24，qiuhao A100 GPU1，与别人的进程共卡）〔修订第 4 条〕
+
+一律 `ssh qiuhao`，`CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1`。卡上常驻别人的两个训练进程，合计约 27.7 GB、利用率约 100%。
+
+**1. 逐位等价**（`scripts/equiv_test.py`、`compare_equiv.py`，照 `_smoke-1020-kmo-v2` 的 equiv 做法）：
+固定种子建模型并载入 ImageNet R-50，mini train 前 2 张图过同一个 LSJ mapper（同种子），训练态 fp32 前向一次。
+batch 两边相同：2 张图，6 个 wheat_2，Ni = 17 / 19 / 18 / 17 / 23 / 17。
+
+| 比较 | 结果 |
+|:--|:--|
+| KMO 关（`wheat_joint_single_stage_mini_coral_exist.yaml`）：本分支 vs `mini/coral-exist` 的 worktree | **127 项 loss 逐位相等**（float 比特），含 11 份 CORAL 的 `loss_point_cls*`；state_dict **733 个张量哈希全同**；参数 52,294,290；前向峰值显存都是 11,767 MiB |
+| 本分支 + 新配置（KMO 开）| 138 项 loss 全部有限，比 KMO 关多出的恰好是 11 份 `loss_point_knn*`（主层、`_0`~`_8`、`_interm`），`loss_point_knn`（×5 后）0.2845；`pred_point_knn` 在主层 / interm / 9 份 aux 都是 [2, 300, 25, 2]（DN 的 63 个 query 已切掉），主层与 interm 的取值在 [−0.29, 0.36] ⊂ [−1, 1]；参数 +144,434，只多 `point_knn_embed.*` 6 个张量，其余张量哈希与 KMO 关相同 |
+| 同一 batch 上 KMO 开 vs 关 | 127 项共有的 loss 里，比特不同的**只有 11 份 `loss_point_coord*`**（前缀内的配对变了，如主层 1.7820 → 1.7893）；**11 份 `loss_point_cls*` 逐位相同**，其余 105 项也逐位相同。这是「KMO 只改变前缀内的排列、不动存在性监督」在真实前向上的直接体现 |
+
+**2. 冒烟**（`scripts/run_smoke40.sh`）：2026-10-24 14:55 启动，新配置原样（`IMS_PER_BATCH` 4），CLI 只加
+`SOLVER.MAX_ITER 40 TEST.EVAL_PERIOD 0 SOLVER.CHECKPOINT_PERIOD 40`，用显存封顶包装
+（`CUDA_MEM_FRACTION=0.40 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True train_capped.py`，上限 31.7 GiB），
+输出 `output_v2/_smoke-1022-coral-kmo-dir/smoke40`：
+
+| 项 | 结果 |
+|:--|:--|
+| 报错 | 0（训练 rc 0；detectron2 每 iter 检查 total_loss 有限） |
+| 损失 | iter 19 / 39 两次记录各 138 项，**全部有限**；11 份 `loss_point_knn*` 与 11 份 CORAL 的 `loss_point_cls*`（主层、`_0`~`_8`、`_interm`）都在。主层 `loss_point_knn`（×5 后）0.282 / 0.273，`loss_point_cls`（×2 后）1.574 / 1.581，`loss_point_coord` 1.797 / 1.781 |
+| 速度 | **7.01 s/iter**（38 iter 总均，log 的 Overall training speed）；metrics.json 里 iter 39 的 `time`（iter 20~39 的中位数）6.86 s/iter |
+| 峰值显存（log.txt 的 max_mem） | **22,943 MiB**（iter 19 时 22,339 MiB），在封顶之内 |
+| 进程显存（nvidia-smi，含 CUDA 上下文与缓存） | 本进程峰值 26,902 MiB；整卡峰值 54,576 / 81,920 MiB（别人的进程约 27.7 GB） |
+| 评估 | 训练结束后的 val 评估（200 图）完整跑通，用时 5:45。40 iter 全在 warmup 里，未训练模型 segm AP 0、点指标 0 / nan；CORAL 头的 bias 初始化全为正，100 个 wheat_2 预测（都在同一张图上）各读出 K = 25（`n_pred_points` 2500 = 100 × 25，K 的上限就是 25），`count_MAE_img` 60.725。未训练的值，不作判读 |
+
+**3. 冒烟 checkpoint 上的诊断与行集合核对**（`scripts/run_diag_smoke.sh`，同样封顶；train 集 `--batches 5`）：
+
+| 项 | 结果 |
+|:--|:--|
+| `kmo_match_diag.py` 字段 | 34 个，与 `mini/kmo-dir` 冒烟诊断的字段逐项相同，没有缺项、没有 None；`kmo_desc` dir、`kmo_k` 2、`kmo_dir_scale` 0.13044 |
+| 实例 / 点 | 67 / 1,090（Ni ≥ 2 的最后一层实例；全部 Ni < 25） |
+| e_head / e_proxy / e_const | 0.0679 / 0.1313 / 0.0600；e_head < e_proxy 的实例 100% |
+| 改判率 / 平局互换率 / 穗内 r | 85.1% / 14.9% / −0.056 |
+| **行集合核对**（`rowset_diag.py`） | 67 个实例，**被选行集合变化率恰为 0**（0 / 67，`n_swapped_in_slots` 0）；67 个实例全是「行相同、排列不同」，没有一例配对完全相同 |
+| 一致性 | 行集合脚本内部顺带跑的那份诊断，与单独跑的诊断 33 个字段逐项相同（同 seed、同数据，可复现） |
+
+40 iter 时 LR 不到 1e-7，KMO 头没开始学，坐标预测也几乎是常数，前缀内的 L1 代价近乎平局，于是 KMO 项决定了全部排列
+（改判 + 平局互换 = 100%，与 A 冒烟时的 98.7% + 1.3% 是同一现象）。这些数只说明管线跑通、前缀守住了，不作机制判读。
 
 ## 已知限制
 
@@ -191,9 +279,17 @@ coral-exist 的前缀内层匹配把正样本槽固定为前 Ni 个，「哪些�
 - **能起作用的空间小**：单独用时 KMO 改变的配对里只有约 15% 是排列变化，放进前缀后只剩这一类可做，效应可能落在噪声内。
 - 前缀内 L1 平局常见，KMO 打破平局的那部分不算改判（计入平局互换率），M2 只看严格改判。
 - 全量数据上「叠 coral-exist 只有 +0.003」的那个 run 里 KMO 的匹配项没有生效（见动机），不能用来预测本臂。
+- **与别人共卡**〔修订第 5 条〕：速度取决于对方任务的负载（冒烟 7.0 s/iter，约为 A 臂的 2 倍）。本进程的显存封顶在 31.7 GiB，
+  但对方若再涨显存，整卡仍可能被挤满，届时任何一方都可能 OOM。
 
-## 成本
+## 成本〔修订第 5 条〕
 
-12500 iter，约 **11.5 h**。A 臂实测 12:26（3.29 s/iter），coral-exist 实测 9:31（2.48 s/iter，与 `mini/coral-count` 并发）。
-前缀匹配比 A 便宜，KMO 头与 `loss_point_knn` 比 coral-exist 多一些，估计介于两者之间、偏 A。
-另加结束后的机制门诊断与行集合核对（各 100 batch），约 10 min。用卡按 CLAUDE.md，由主 agent 决定。
+- **卡**：正式训练的卡由主 agent 在启动时按空闲显存选定，用显存封顶包装（`train_capped.py`，见修订第 5 条）。
+- **训练**：12500 iter。按冒烟的 **7.0 s/iter**（qiuhao A100，与别人两个利用率约 100% 的训练进程共卡）估算，约 **24 h**。
+  共卡会变慢，实际速度取决于所选卡上别人的负载。同类 run 在负载较轻时：A 臂 3.29 s/iter（12:26）、coral-exist 2.48 s/iter（9:31），
+  按这个量级训练约 9 ~ 12 h。修订前「约 11.5 h」是按不共卡估的。
+- **评估**：25 次内置评估。冒烟的最终评估 5:45（未训练模型，每个 wheat_2 读出 25 个点，偏慢）；以往 mini run 每次约 2 ~ 2.5 min，
+  共卡会更慢，估计合计 1 ~ 2.5 h。
+- **合计**：共卡负载如冒烟时约 **25 ~ 27 h**；卡上负载轻时约 10 ~ 14 h。
+- **显存**：max_mem 约 23 GB（冒烟 22,943 MiB；A 臂全程 24.2 GB），在 31.7 GiB 的封顶之内；nvidia-smi 口径本进程约 27 GB。
+- 另加结束后的机制门诊断与行集合核对（各 100 batch）：冒烟上 5 batch 各约 45 s（含建模型），估计合计 10 ~ 15 min。
