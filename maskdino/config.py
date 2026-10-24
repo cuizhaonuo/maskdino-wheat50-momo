@@ -117,6 +117,14 @@ def add_maskdino_config(cfg):
     # > 0 时推理多存一个诊断字段 pred_spikelet_ecount（= E），只写进 spikelet_pair_counts.csv 的 ecount 列，
     # 不进任何指标。这个键不改计数读法；读法由 TEST.POINT_CORAL_READOUT 决定（本臂启动前修订为 expect）。
     cfg.MODEL.MaskDINO.POINT_ECOUNT_WEIGHT = 0.0
+    # E 损失的梯度不进 backbone（mini/coral-ecount-bbstop，预注册见 experiments-bank/ideas/coral-ecount-bbstop.md）。
+    # True = loss_point_ecount*（主输出、9 份 aux、interm 共 11 项）的梯度只进非 backbone 的可训练参数
+    # （pixel decoder、decoder、各输出头），backbone.* 只拿其余损失的梯度；其余损失的梯度完全不变。
+    # 只改训练循环，不改模型结构、前向、损失与推理：实现在 train_net.py 的 EcountBackboneStopAMPTrainer
+    # （每步把 backward 拆成两次，GradScaler 的 inf 检查与全模型梯度裁剪作用在合并后的梯度上）。
+    # 需要 POINT_ECOUNT_WEIGHT > 0、SOLVER.AMP.ENABLED=True、单卡。
+    # False = 照旧用 detectron2 的 AMPTrainer，与 mini/coral-ecount 逐位相同。
+    cfg.MODEL.MaskDINO.POINT_ECOUNT_STOP_BACKBONE = False
     # FREEZE_EXCEPT_POINT_HEAD=True 时，除点头外额外解冻的参数名子串。
     # 空 = 只训点头（Stage2 原设计）。例：["predictor.decoder"] 解冻 transformer decoder，
     # ["sem_seg_head"] 解冻整个分割头（decoder + pixel decoder + 各预测头），backbone 仍冻结。

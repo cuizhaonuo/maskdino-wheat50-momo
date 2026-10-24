@@ -1,0 +1,24 @@
+# ============================================================================
+# mini/coral-ecount-bbstop · K 臂 + E 损失的梯度不进 backbone（2026-10-24，用户 10-24 决定开这一臂）
+#   预注册：experiments-bank/ideas/coral-ecount-bbstop.md（判定线已在跑之前写死）
+#   父臂：mini/coral-ecount（K 臂，wheat_joint_single_stage_mini_coral_ecount.yaml，
+#         output_v2/exp-1023-mini-coral-ecount）
+#
+# 与父臂配置的差异【一项】：
+#   MODEL.MaskDINO.POINT_ECOUNT_STOP_BACKBONE: False -> True
+#     loss_point_ecount*（主输出、9 份 aux、interm 共 11 项）的梯度只进非 backbone 的可训练参数
+#     （pixel decoder、decoder、各输出头），backbone.* 只拿其余损失的梯度；其余损失的梯度完全不变。
+#     实现在 train_net.py 的 EcountBackboneStopAMPTrainer：每步先只对非 backbone 参数反传 E 损失
+#     （保留计算图），再照常反传其余损失；GradScaler 的 inf 检查与全模型梯度裁剪作用在合并后的梯度上。
+#   模型结构、前向、损失与权重、读数（计数 round(E)、小穗点按 K 输出）、schedule 全部与父臂相同。
+#
+# 用法：
+#   python train_net.py --num-gpus 1 \
+#     --config-file configs/coco/instance-segmentation/wheat_joint_single_stage_mini_coral_ecount_bbstop.yaml \
+#     OUTPUT_DIR /public/home/zncui/pycharm_project/maskdino-wheat50/output_v2/<run-name>
+# ============================================================================
+_BASE_: wheat_joint_single_stage_mini_coral_ecount.yaml
+
+MODEL:
+  MaskDINO:
+    POINT_ECOUNT_STOP_BACKBONE: True

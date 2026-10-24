@@ -19,6 +19,7 @@ import copy
 import itertools
 import logging
 import os
+import time
 
 from collections import OrderedDict
 from typing import Any, Dict, List, Set
@@ -42,6 +43,7 @@ from detectron2.evaluation import (
 )
 from detectron2.projects.deeplab import add_deeplab_config, build_lr_scheduler
 from detectron2.solver.build import maybe_add_gradient_clipping
+from detectron2.utils.events import get_event_storage
 from detectron2.utils.logger import setup_logger
 
 # MaskDINO
@@ -111,6 +113,111 @@ def freeze_all_but_point_head(model, extra_keys=()):
         )
     return model
 
+
+# ---------------------------------------------------------------------------------------------
+# mini/coral-ecount-bbstop：E 损失（loss_point_ecount*）的梯度不进 backbone。
+# 开关 MODEL.MaskDINO.POINT_ECOUNT_STOP_BACKBONE（默认 False），预注册见 experiments-bank/ideas/coral-ecount-bbstop.md。
+# ---------------------------------------------------------------------------------------------
+_ECOUNT_LOSS_PREFIX = "loss_point_ecount"   # 主输出、_0~_8、_interm 共 11 项（_dn 不会被产生）
+_BACKBONE_PARAM_PREFIX = "backbone."
+
+
+def ecount_backbone_stop_backward(loss_dict, scale, pass_params, accum_steps=1, stop_prefix=_ECOUNT_LOSS_PREFIX):
+    """把 AMPTrainer 的一次 `scale(sum(loss_dict) / accum).backward()` 拆成两次，梯度累加进 .grad：
+
+      1. E 损失（键以 stop_prefix 开头）：只对 pass_params（非 backbone 的可训练参数）反传，保留计算图；
+      2. 其余损失：照常反传到全部参数（含 backbone），释放计算图。
+
+    两份都乘同一个 scale（GradScaler.scale；fp32 验证时传恒等函数）、都除以 accum_steps。
+    合并后：backbone 参数的 .grad = 只有其余损失的梯度；非 backbone 参数的 .grad = 全部损失的梯度
+    （与一次整体反传只差浮点求和顺序）。先做 E 损失这一遍：它只经过 decoder / pixel decoder，
+    保留计算图期间多占的显存比先做整网反传少；两份梯度相加的结果与顺序无关。
+    返回 E 损失的键（按 loss_dict 的顺序）。
+    """
+    stop_keys = [k for k in loss_dict if k.startswith(stop_prefix)]
+    if not stop_keys:
+        raise RuntimeError(f"POINT_ECOUNT_STOP_BACKBONE=True 但 loss_dict 里没有 {stop_prefix}* 项")
+    losses_stop = sum(loss_dict[k] for k in stop_keys) / accum_steps
+    losses_rest = sum(v for k, v in loss_dict.items() if not k.startswith(stop_prefix)) / accum_steps
+    if losses_stop.requires_grad:
+        torch.autograd.backward(scale(losses_stop), inputs=pass_params, retain_graph=True)
+    scale(losses_rest).backward()
+    return stop_keys
+
+
+class EcountBackboneStopAMPTrainer(AMPTrainer):
+    """POINT_ECOUNT_STOP_BACKBONE=True 时替换 AMPTrainer。
+
+    run_step 照搬 detectron2/engine/train_loop.py 的 AMPTrainer.run_step（含本项目加的 grad_accum_steps：
+    只在累积周期开头 zero_grad、loss 除以 grad_accum_steps、累积满才 grad_scaler.step / update），
+    只把 backward 换成 ecount_backbone_stop_backward。前向、loss_dict 的记录（_write_metrics）、
+    GradScaler 的 unscale_ 与 inf/nan 检查、FullModelGradientClippingOptimizer 的全模型裁剪、
+    AdamW 都不变，后几项在 grad_scaler.step 里作用于合并后的梯度。state_dict / resume 同 AMPTrainer。
+    只支持单进程（不包 DDP）。
+    """
+
+    def __init__(self, model, data_loader, optimizer, **kwargs):
+        super().__init__(model, data_loader, optimizer, **kwargs)
+        named = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+        self._ecount_pass_params = [p for n, p in named if not n.startswith(_BACKBONE_PARAM_PREFIX)]
+        n_stop = len(named) - len(self._ecount_pass_params)
+        if n_stop == 0 or not self._ecount_pass_params:
+            raise RuntimeError(
+                f"POINT_ECOUNT_STOP_BACKBONE：可训练张量 {len(named)} 个，其中 backbone {n_stop} 个；两边都不能为空"
+            )
+        self._ecount_logged = False
+        logging.getLogger("detectron2").info(
+            f"[POINT_ECOUNT_STOP_BACKBONE] {_ECOUNT_LOSS_PREFIX}* 的梯度不进 backbone："
+            f"可训练张量 {len(named)} 个，挡住 {n_stop} 个（{_BACKBONE_PARAM_PREFIX}*），"
+            f"E 损失只反传到其余 {len(self._ecount_pass_params)} 个"
+        )
+
+    def run_step(self):
+        assert self.model.training, "[AMPTrainer] model was changed to eval mode!"
+        assert torch.cuda.is_available(), "[AMPTrainer] CUDA is required for AMP training!"
+
+        start = time.perf_counter()
+        data = next(self._data_loader_iter)
+        data_time = time.perf_counter() - start
+
+        # 只在一个累积周期开始时清空梯度
+        if self.iter % self.grad_accum_steps == 0:
+            self.optimizer.zero_grad()
+
+        with torch.amp.autocast("cuda", dtype=self.precision):
+            loss_dict = self.model(data)
+            if not isinstance(loss_dict, dict):
+                raise TypeError("POINT_ECOUNT_STOP_BACKBONE 需要模型返回 loss dict")
+
+        # 与 AMPTrainer 相同：两份 loss 都乘 grad_scaler 的 scale、都除以 grad_accum_steps
+        stop_keys = ecount_backbone_stop_backward(
+            loss_dict, self.grad_scaler.scale, self._ecount_pass_params, self.grad_accum_steps
+        )
+        if not self._ecount_logged:
+            logging.getLogger("detectron2").info(
+                f"[POINT_ECOUNT_STOP_BACKBONE] 挡住 backbone 的 loss 项 {len(stop_keys)} 个：{stop_keys}"
+            )
+            self._ecount_logged = True
+
+        if self.log_grad_scaler:
+            storage = get_event_storage()
+            storage.put_scalar("[metric]grad_scaler", self.grad_scaler.get_scale())
+
+        self.after_backward()
+
+        if self.async_write_metrics:
+            self.concurrent_executor.submit(
+                self._write_metrics, loss_dict, data_time, iter=self.iter
+            )
+        else:
+            self._write_metrics(loss_dict, data_time)
+
+        # 只有累积满了，才真正更新参数
+        if (self.iter + 1) % self.grad_accum_steps == 0:
+            self.grad_scaler.step(self.optimizer)
+            self.grad_scaler.update()
+
+
 class Trainer(DefaultTrainer):
     """
     Extension of the Trainer class adapted to MaskFormer.
@@ -133,7 +240,21 @@ class Trainer(DefaultTrainer):
 
         model = create_ddp_model(model, broadcast_buffers=False)
 
-        if cfg.SOLVER.AMP.ENABLED:
+        if cfg.MODEL.MaskDINO.POINT_ECOUNT_STOP_BACKBONE:
+            # mini/coral-ecount-bbstop：E 损失的梯度不进 backbone（见 EcountBackboneStopAMPTrainer）
+            if cfg.MODEL.MaskDINO.POINT_ECOUNT_WEIGHT <= 0:
+                raise ValueError("POINT_ECOUNT_STOP_BACKBONE=True 需要 POINT_ECOUNT_WEIGHT > 0（没有 E 损失可挡）")
+            if not cfg.SOLVER.AMP.ENABLED:
+                raise ValueError("POINT_ECOUNT_STOP_BACKBONE=True 只实现了 AMPTrainer 的版本，需要 SOLVER.AMP.ENABLED=True")
+            if comm.get_world_size() != 1:
+                raise ValueError("POINT_ECOUNT_STOP_BACKBONE=True 只支持单卡（两次反传与 DDP 的梯度同步不兼容）")
+            self._trainer = EcountBackboneStopAMPTrainer(
+                model,
+                data_loader,
+                optimizer,
+                grad_accum_steps=cfg.SOLVER.GRAD_ACCUM_STEPS,
+            )
+        elif cfg.SOLVER.AMP.ENABLED:
             self._trainer = AMPTrainer(
                 model,
                 data_loader,
