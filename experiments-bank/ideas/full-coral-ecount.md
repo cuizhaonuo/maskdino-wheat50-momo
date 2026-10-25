@@ -1,5 +1,7 @@
 # 想法（完整集）：CORAL 存在性头 + E 损失，计数读 round(E) · full/coral-ecount
 
+> **结果**（2026-10-26）：[exp-2026-10-24-full-coral-ecount](../experiments/exp-2026-10-24-full-coral-ecount.md) —— 计数过线、护栏未过（不记成立）：主读数 iter 17999 `count_MAE_spike` 1.1312 ≤ 1.18；segm AP 峰值 80.01、读数那次 `matched_F1@8` 0.6257 都过，spike_recall 后半程峰值 0.8711 < 0.9147 没过；归因「无效」（1.1312 > 1.1054），机制「未启动」（r 0.7560 < 0.7576）。
+
 状态：**预注册（跑之前写死），未启动** ｜ 提出 2026-10-24 ｜ 分支 `full/coral-ecount`（从 `full/coral-exist`@`a061dd1` 开出）｜
 代码提交 `409378a` ｜ 配置 `wheat_joint_single_stage_full_coral_ecount.yaml`（`_BASE_` 为 `wheat_joint_single_stage_full_coral_exist.yaml`）｜
 输出 `output_v2/exp-<启动日 MMDD>-full-coral-ecount`（占位，主 agent 定）｜ mini 对应臂：`mini/coral-ecount`（K 臂）
