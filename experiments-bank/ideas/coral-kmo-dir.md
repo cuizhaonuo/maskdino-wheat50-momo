@@ -1,7 +1,7 @@
 # 想法：把方向版 KMO 放进 coral-exist 的前缀内层匹配（方案 A）
 
-状态：**预注册（判定线在跑之前写死）** ｜ 提出 2026-10-22 ｜ 分支 `mini/coral-kmo-dir`（从 `mini/coral-exist`@`f029805` 开出，合并 `mini/kmo-dir` 的代码提交 `f7d1140`，用户批准）｜ 配置
-`wheat_joint_single_stage_mini_coral_kmo_dir.yaml`（`_BASE_` 为 `wheat_joint_single_stage_mini_coral_exist.yaml`）｜ 输出 `output_v2/exp-<启动日期>-mini-coral-kmo-dir`
+状态：**预注册判定：判否**（ΔF1@8 = −0.0181 ≤ −0.015；机制门 M1、M2 过，实现核对的行集合变化率恰为 0；计数严格线未过，1.7500 vs ≤ 1.6655，同 iter 平均差 −0.0335，可能是读数选择效应；segm AP、`spike_recall` 护栏过）｜ 验证于 [exp-2026-10-24-mini-coral-kmo-dir](../experiments/exp-2026-10-24-mini-coral-kmo-dir.md) ｜ 提出 2026-10-22 ｜ 分支 `mini/coral-kmo-dir`（从 `mini/coral-exist`@`f029805` 开出，合并 `mini/kmo-dir` 的代码提交 `f7d1140`，用户批准）｜ 配置
+`wheat_joint_single_stage_mini_coral_kmo_dir.yaml`（`_BASE_` 为 `wheat_joint_single_stage_mini_coral_exist.yaml`）｜ 输出 `output_v2/exp-1024-mini-coral-kmo-dir`（2026-10-24 15:12:58 从 `600206e` 启动）
 
 > 合并（2026-10-22，用户明确批准这一次）：`git merge --no-ff f7d1140`，合并提交 `dfb8cce`。只合 `f7d1140` 这个提交（连同它的祖先，即
 > `mini/kmo-matcher` 的 KMO 实现与文档），不含 `mini/kmo-dir` 之后的配置与文档提交。所以下文提到的 kmo-dir / kmo-detach / kmo-auxonly
@@ -293,3 +293,30 @@ batch 两边相同：2 张图，6 个 wheat_2，Ni = 17 / 19 / 18 / 17 / 23 / 17
 - **合计**：共卡负载如冒烟时约 **25 ~ 27 h**；卡上负载轻时约 10 ~ 14 h。
 - **显存**：max_mem 约 23 GB（冒烟 22,943 MiB；A 臂全程 24.2 GB），在 31.7 GiB 的封顶之内；nvidia-smi 口径本进程约 27 GB。
 - 另加结束后的机制门诊断与行集合核对（各 100 batch）：冒烟上 5 batch 各约 45 s（含建模型），估计合计 10 ~ 15 min。
+
+## 结论（2026-10-25）
+
+**预注册判定：「判否」。** 详见 [exp-2026-10-24-mini-coral-kmo-dir](../experiments/exp-2026-10-24-mini-coral-kmo-dir.md)。
+run 在 xuyu A100 GPU0 上（本批临时用卡，用户原话「我觉得, baiju 和 qiuhao 全部,以及 xuyu 的 gpu 0 和 1 都可以用」），
+与别人的进程共卡、显存封顶 0.40，12500/12500 iter，19:14，5.19 s/iter，0 报错。未做阈值扫描。
+
+| | 本跑 | coral-exist | 线 |
+|:--|--:|--:|:--|
+| 实现核对：被选行集合变化率（最终） | **0**（0 / 1582） | — | 恰为 0 ✅ |
+| M1：e_head / e_proxy / e_const（最终，dir 量纲） | **0.0397** / 0.0548 / 0.0590 | — | e_head 最小 ✅ |
+| M2：前缀内改判率（最终） | **20.0%**（另有平局互换 7.1%） | — | ≥ 1% ✅ |
+| `matched_F1@8`（读数 iter 9999） | **0.5926** | 0.6107 | ΔF1@8 = **−0.0181** ≤ −0.015 → **判否** |
+| ΔF1@3 / ΔF1@5 | −0.0097 / −0.0060 | | 同时报 |
+| `count_MAE_spike`（读数那次） | 1.7500 | 1.6655 | 护栏 ≤ 1.6655 ❌；同 iter 平均差 −0.0335 → 可能是读数选择效应 |
+| segm AP 峰值 | 78.29 | 78.71 | 护栏 ≥ 77.80 ✅ |
+| `spike_recall` 峰值 | 0.9445 | 0.9478 | 护栏 ≥ 0.9311 ✅ |
+| 对 E0 的通用线：`matched_F1@8` | 0.5926 | | ≥ 0.6428 ❌（只照报） |
+
+- **判否是稳的**：后半程 13 次同 iter 的 `matched_F1@8` 全部低于 coral-exist（均值 −0.0157），从 iter 2499 起可比的 21 次也全部更低。
+- **机制按设计运转**：前缀守住了（被选槽集合一次也没变）；方向头学得和单独用时一样好（e_head 0.0397 vs A 的 0.0398，穗内 r 0.722 vs 0.716）；
+  KMO 在前缀内换了 27.1% 实例的排列。但只换排列没有带来定位收益，反而略差。
+- **计数与 coral-exist 持平**（最终评估偏差 +1.52 vs +1.44、r 0.623 vs 0.620），A 臂单独用时的计数副作用没有带进来。
+- **对 A（只作描述）**：读数那次 F1@8 −0.033、计数 −1.10。
+- **对「原理独立」**：在 coral-exist 的前缀里，方向版 KMO 的匹配项没有独立的正贡献。结合 2×2（单独用时 KMO 改变的配对约 85% 在换正样本槽），
+  KMO 的定位收益更可能来自「换哪些槽当正样本」，而这正是 coral-exist 的前缀固定住的东西。这一条是非预注册的推断。
+- 单种子，不补种子。
