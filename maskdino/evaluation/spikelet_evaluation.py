@@ -114,13 +114,13 @@ class SpikeletPointEvaluator(DatasetEvaluator):
             has_points = inst.has("pred_spikelet_points")
             # 每穗计数：有 pred_spikelet_counts 就读它，否则数点（full/coral-ecount，移植自 mini/coral-ecount 的 709059d）。
             # 现有各路径（A 的 CE 前缀、combo 的 top-n_k、阈值 / NMS）里它都等于输出的点数，指标与改动前逐位相同；
-            # TEST.POINT_CORAL_READOUT=expect 下它是 round(E)，小穗点仍是前 K 个 slot。
+            # TEST.POINT_CORAL_READOUT=expect 下它是 round(E)，小穗点不变（A：前 K 个 slot；combo：候选取 top-n_k）。
             counts_all = (inst.pred_spikelet_counts.detach().cpu().numpy()
                           if inst.has("pred_spikelet_counts") else None)
             # 诊断字段（POINT_ECOUNT_WEIGHT > 0 或 expect 读法时模型才输出）：CORAL 头的期望计数 E，只进逐穗明细的 ecount 列
             ecount = (inst.pred_spikelet_ecount.detach().cpu().numpy()
                       if inst.has("pred_spikelet_ecount") else None)
-            # 诊断字段（expect 读法时才有）：threshold 读数的 K，只进逐穗明细的 kcount 列
+            # 诊断字段（expect 读法时才有）：CORAL 头的 K（A：= 输出的点数；combo：n_k），只进逐穗明细的 kcount 列
             kcount = (inst.pred_spikelet_kcount.detach().cpu().numpy()
                       if inst.has("pred_spikelet_kcount") else None)
 
@@ -177,7 +177,7 @@ class SpikeletPointEvaluator(DatasetEvaluator):
         img_pred_tot, img_gt_tot = [], []
         n_gt_spike = n_pred_spike = n_matched_spike = 0
         rows = []
-        # 模型输出了诊断字段时，逐穗明细多 ecount（E）/ kcount（threshold 读数的 K）、out_points 列，不进任何指标
+        # 模型输出了诊断字段时，逐穗明细多 ecount（E）/ kcount（CORAL 头的 K）、out_points 列，不进任何指标
         has_ecount = any("ecounts" in p for p in predictions)
         has_kcount = any("kcounts" in p for p in predictions)
 
@@ -228,7 +228,8 @@ class SpikeletPointEvaluator(DatasetEvaluator):
                 if has_ecount:
                     row = row + (round(pred["ecounts"][pi], 4),)
                 if has_kcount:
-                    # kcount：threshold 读数的 K；out_points：实际输出的点数（expect 下两者相同，后者是自检）
+                    # kcount：CORAL 头的 K；out_points：实际输出的点数。A 的前缀路径（slot 语义）上两者相同，后者是自检；
+                    # combo（full/combo-ecount）里 kcount 是 n_k，点是候选按分数取 top-n_k，候选不足 n_k 时 out_points 更小
                     row = row + (pred["kcounts"][pi], len(pp[pi]))
                 pair_rows.append(row)
 
@@ -287,7 +288,7 @@ class SpikeletPointEvaluator(DatasetEvaluator):
             # 逐 TP 穗明细：与 count_MAE_spike 完全同一批配对（mask IoU 匈牙利 + IoU>=阈值），
             # count_MAE_spike == mean(|pred_points - gt_points|)。供散点/偏差分析。
             # pred_points 是每穗计数（pred_spikelet_counts）；expect 读法下它是 round(E)，
-            # 另有 ecount（E）、kcount（threshold 读数的 K）、out_points（实际输出的点数）三列。
+            # 另有 ecount（E）、kcount（CORAL 头的 K；combo 是 n_k）、out_points（实际输出的点数）三列。
             ppath = os.path.join(self._output_dir, "spikelet_pair_counts.csv")
             with open(ppath, "w", newline="", encoding="utf-8") as f:
                 wcsv = csv.writer(f)

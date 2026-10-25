@@ -177,8 +177,11 @@ def add_maskdino_config(cfg):
     # 0.0 = 关：不建损失、不进 weight_dict，与 full/combo 的合并代码（3bd2071）逐位相同。
     # > 0 时推理多存一个诊断字段 pred_spikelet_ecount（= E），只写进逐穗明细的 ecount 列，不进任何指标。
     # 这个键不改计数读法；读法由 TEST.POINT_CORAL_READOUT 决定。
-    # 分组 decoder（POINT_GROUP_DECODER=True，combo）的 group 层没有 slot 语义的 E，它的计数头是
-    # pred_point_coral。本分支没有接那一层：权重 > 0 与 POINT_GROUP_DECODER 同开时直接报错（留给 full/combo-ecount）。
+    # 分组 decoder（POINT_GROUP_DECODER=True，combo；full/combo-ecount 扩展，预注册见
+    # experiments-bank/ideas/full-combo-ecount.md）：slot 层（layer-0、interm，pred_point_abs 为假）同上；
+    # group 层（主输出与第 1~8 层 aux，pred_point_abs 为真）的 pred_point_logits 是逐 token 的 focal logit、
+    # 不是 CORAL，E 改取 CoralHead 挂在实例 query 上的 pred_point_coral（[B, Q, T]，T = NUM_POINTS），
+    # E = sum_k sigmoid(c_k)，目标 min(Ni, T)，同样 11 份深监督。推理的 ecount 诊断字段也取最终层 pred_point_coral。
     cfg.MODEL.MaskDINO.POINT_ECOUNT_WEIGHT = 0.0
     # FREEZE_EXCEPT_POINT_HEAD=True 时，除点头外额外解冻的参数名子串。
     # 空 = 只训点头（Stage2 原设计）。例：["predictor.decoder"] 解冻 transformer decoder，
@@ -221,8 +224,13 @@ def add_maskdino_config(cfg):
     #                 SpikeletPointEvaluator 的计数指标读 pred_spikelet_counts，点级指标仍按实际输出的点算。
     #                 另存诊断字段 pred_spikelet_ecount（E）与 pred_spikelet_kcount（K），
     #                 只写进 spikelet_pair_counts.csv 的 ecount / kcount 列，不进任何指标。
-    # expect 需要 POINT_CORAL_EXIST=True。分组 decoder（combo）的计数来自 pred_point_coral，本分支没有接，
-    # expect 与 POINT_GROUP_DECODER 同开时直接报错（留给 full/combo-ecount）。
+    # expect 需要 POINT_CORAL_EXIST=True。
+    # 分组 decoder（POINT_GROUP_DECODER=True，combo；full/combo-ecount 扩展）：点照旧是「token 分数 > POINT_THRESHOLD
+    # ∧ 推理 NMS 存活」的候选按分数取 top-n_k，n_k = sum_k 1[sigmoid(c_k) > 0.5]（c = 最终层 pred_point_coral，
+    # 阈值 0.5 代码内固定）。两种读法的点相同，只有计数不同：
+    #   "threshold" = 计数 = 实际输出的点数 min(n_k, 候选数)，与 3bd2071 逐位相同；
+    #   "expect"    = 计数 = clamp(round(E), 0, T)，E = sum_k sigmoid(c_k)（fp32）。
+    #                 诊断字段 pred_spikelet_ecount = E，pred_spikelet_kcount = n_k（候选不足时大于输出的点数）。
     cfg.MODEL.MaskDINO.TEST.POINT_CORAL_READOUT = "threshold"
     # 推理侧小穗点 NMS 的半径 κ（含义与数据依据见 POINT_NMS_KAPPA）。> 0 时 instance_inference 在最后一层
     # 对每个 wheat_2 实例的全部 K 个点做贪心 NMS（分数降序，中心距 < κ·sqrt(w·h) 算重复，w、h 为预测框的

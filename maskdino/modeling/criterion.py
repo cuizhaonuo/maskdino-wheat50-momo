@@ -703,27 +703,38 @@ class SetCriterion(nn.Module):
 
     def loss_point_ecount(self, outputs, targets, indices, num_masks):
         """计数尺度损失（POINT_ECOUNT_WEIGHT > 0 时 losses 里才有 "point_ecount"；要求 POINT_CORAL_EXIST=True）。
-        移植自 mini/coral-ecount 的 47072eb（本分支按完整集代码重写，没有 cherry-pick）。
+        移植自 mini/coral-ecount 的 47072eb（本分支按完整集代码重写，没有 cherry-pick）；group 层由 full/combo-ecount 扩展。
 
-        只作用于 slot 语义的输出（pred_point_abs 为假：pred_point_logits 是 CoralHead 的 P 个 slot logit）。
         外层匹配上的 wheat_2 且 Ni >= 1 的实例：E = sum_k sigmoid(l_k) 是 CORAL 头给出的期望计数，
         目标是 CORAL levels 之和 min(Ni, P)，损失 = sum |E - min(Ni, P)| / 这类实例数。
+        l_k 取哪组 logit 按输出 dict 的语义分派（同 loss_points 的 pred_point_abs）：
+        - slot 语义（pred_point_abs 为假：A 的主输出 / 9 份 aux / interm；combo 的 layer-0 与 interm）：
+          pred_point_logits 是 CoralHead 的 P 个 slot logit；
+        - group 语义（pred_point_abs 为真：combo 的主输出与第 1~8 层 aux）：这些 dict 的 pred_point_logits 是
+          逐 token 的 focal logit，不是 CORAL；E 改取 CoralHead 挂在实例 query 上的序数 logit pred_point_coral
+          （[B, Q, T]，decoder 已去掉 DN 段，与外层匹配的 query 下标对齐），P 即 T。它与 loss_points 里 group 层的
+          loss_point_coral（CORAL BCE，目标 coral_levels(min(Ni, T))）是同一组 logit。
+        两种语义共用下面的 valid 掩码、目标与分母：
         - wheat（Ni = 0）不进这一项，它们仍由 loss_points 里的 CORAL BCE 监督；
-        - 与 loss_points 用同一份外层匹配 indices、同一组输出 dict（A：主输出 / 9 份 aux / interm），
-          不做内层匹配（E 是全部 P 个 slot 之和，与 slot 配给哪个 GT 无关），不消耗随机数；
+        - 与 loss_points 用同一份外层匹配 indices、同一组输出 dict，
+          不做内层匹配（E 是全部 P 个 slot / 任务之和，与 slot 配给哪个 GT 无关），不消耗随机数；
         - logit 先转 fp32 再 sigmoid（AMP 下输出头是 fp16）；
         - 没有这类实例时损失为 0 且保持计算图。
-        group 层（分组 decoder 的小穗 token，pred_point_abs 为真）没有 slot 语义的 E，
-        它的 CORAL 计数头是 pred_point_coral（[B, Q, T]）。本分支不接那一层，直接跳过、不产生这个键；
-        from_config 已拦住「权重 > 0 且 POINT_GROUP_DECODER」，这里只是兜底。扩展见 full/combo-ecount。
         """
+        assert self.point_coral_exist
         if outputs.get('pred_point_abs', False):
-            return {}
-        assert self.point_coral_exist and 'pred_point_logits' in outputs
-        pred_logits = outputs['pred_point_logits']                 # [B, Q, P, 1]
-        P = pred_logits.shape[2]
-        idx = self._get_src_permutation_idx(indices)
-        logits = pred_logits[idx][..., 0].float()                   # [M, P]，M = 本输出外层匹配上的实例数
+            # group 层：实例 query 上的 CORAL 计数头
+            assert 'pred_point_coral' in outputs, "group 层 dict 缺 pred_point_coral（E 损失需要 POINT_CORAL_EXIST）"
+            pred_coral = outputs['pred_point_coral']                # [B, Q, T]
+            P = pred_coral.shape[-1]
+            idx = self._get_src_permutation_idx(indices)
+            logits = pred_coral[idx].float()                        # [M, T]
+        else:
+            assert 'pred_point_logits' in outputs
+            pred_logits = outputs['pred_point_logits']             # [B, Q, P, 1]
+            P = pred_logits.shape[2]
+            idx = self._get_src_permutation_idx(indices)
+            logits = pred_logits[idx][..., 0].float()               # [M, P]，M = 本输出外层匹配上的实例数
         labels = torch.cat([t['labels'][J] for t, (_, J) in zip(targets, indices)])
         n_gt = torch.as_tensor(
             [t['points'][j].shape[0] for t, (_, J) in zip(targets, indices) for j in J.tolist()],
