@@ -1,5 +1,7 @@
 # 想法：E 损失的梯度不进 backbone（K 臂 + backbone stop）
 
+> **结果**（2026-10-26）：[exp-2026-10-25-mini-coral-ecount-bbstop](../experiments/exp-2026-10-25-mini-coral-ecount-bbstop.md) —— 计数过线、护栏未过（三条全挂，不记成立）：主读数 iter 11999 `count_MAE_spike` 1.2428 ≤ 1.28；segm AP 峰值 67.37 < 76.0、读数那次 `matched_F1@8` 0.5908 < 0.600、`spike_recall` 峰值 0.8613 < 0.9311。A1 歧义；A2 未减小（后半程 segm AP 对 K −9.46，方向相反）；M1 启动（r 0.7032，余量 0.0016）；M2 未启动（21.98）。E 损失的压力从 backbone 转到了 pixel decoder，见结果文档。
+
 状态：**预注册（跑之前写死），未启动** ｜ 提出 2026-10-24（用户 10-24 决定开这一臂）｜ 分支 `mini/coral-ecount-bbstop`（从 `mini/coral-ecount`@`0fb4ad6` 开出；代码即 K 启动时的 `709059d`，之后只有文档提交；100 epoch）｜ 配置 `wheat_joint_single_stage_mini_coral_ecount_bbstop.yaml`（`_BASE_` 为 `wheat_joint_single_stage_mini_coral_ecount.yaml`）｜ 输出 `output_v2/exp-<启动日>-mini-coral-ecount-bbstop`（占位，主 agent 定）
 
 ## 来源
