@@ -1,0 +1,11 @@
+# ============================================================================
+# full/sa-sgw · 统一 CA 链路 · SA 顺序 = ss → group → ww
+#   预注册：experiments-bank/ideas/full-sa-sgw.md（判定线跑之前写死）
+#   父配置 wheat_joint_single_stage_mini_sa_order.yaml 已打开 A/B/C 三开关 + POINT_UNIFIED_CA，
+#   本文件唯一变量 = POINT_SA_ORDER。
+# ============================================================================
+_BASE_: wheat_joint_single_stage_mini_sa_order.yaml
+
+MODEL:
+  MaskDINO:
+    POINT_SA_ORDER: ["ss", "group", "ww"]
