@@ -1,0 +1,32 @@
+# ============================================================================
+# 单阶段联合训练 · 500 图小集 · 统一 CA 链路（full/sa-order）
+#   来源：把分组 decoder 的「wheat 一支 / spike 一支」两套 CA+FFN 合成一套：
+#     三个 SA（SA_group / SA_ww / SA_ss）按 POINT_SA_ORDER 依次更新同一对缓冲 (ins, pts)
+#     → 全部 N*(1+K) 个 token 一次可变形 CA → 一次 FFN。
+#   预注册：尚未写（此文件目前只用于 3 iter 冒烟验证，判定线未定，见 experiments-bank/ideas/）。
+#
+# 与 wheat_joint_single_stage_mini_group.yaml 的差异【只有统一 CA 两键 + combo 的 coral/km 四键】：
+#   POINT_UNIFIED_CA: True（走新链路）
+#   POINT_SA_ORDER: ["group", "ww", "ss"]（与现链路同样的先后关系，便于对照）
+#   POINT_CORAL_EXIST / POINT_KMO / POINT_KMO_K / COST_POINT_KNN_WEIGHT / POINT_KNN_WEIGHT：照抄
+#     full_combo，这样 loss_point_coral / loss_point_knn 都会出现（冒烟要检查这两个键）。
+#   POINT_NMS_MODE 保持 none（NMS 是匹配侧的事，与 decoder 链路正交，冒烟不覆盖）。
+# 其余数据 / schedule / 七项损失权重 / 点头旋钮全部继承。
+#
+# 用法（3 iter 冒烟）：
+#   CUDA_VISIBLE_DEVICES=1 python tools/smoke_3iter.py --num-gpus 1 \
+#     --config-file configs/coco/instance-segmentation/wheat_joint_single_stage_mini_sa_order.yaml \
+#     --iters 3 OUTPUT_DIR output/sa-order-smoke
+# 换顺序：追加 MODEL.MaskDINO.POINT_SA_ORDER '["ss", "group", "ww"]'（yacs 按 list 字面量解析）
+# ============================================================================
+_BASE_: wheat_joint_single_stage_mini_group.yaml
+
+MODEL:
+  MaskDINO:
+    POINT_UNIFIED_CA: True
+    POINT_SA_ORDER: ["group", "ww", "ss"]
+    POINT_CORAL_EXIST: True
+    POINT_KMO: True
+    POINT_KMO_K: 3
+    COST_POINT_KNN_WEIGHT: 5.0
+    POINT_KNN_WEIGHT: 5.0

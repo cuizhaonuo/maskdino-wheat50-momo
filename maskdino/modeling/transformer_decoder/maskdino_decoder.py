@@ -78,6 +78,8 @@ class MaskDINODecoder(nn.Module):
             point_across_attn: str = "slot",
             point_dim_feedforward: int = 1024,
             point_within_gate: bool = True,
+            point_unified_ca: bool = False,
+            point_sa_order: tuple = ("group", "ww", "ss"),
     ):
         """
         NOTE: this interface is experimental.
@@ -199,8 +201,14 @@ class MaskDINODecoder(nn.Module):
             self.point_slot_embed = nn.Embedding(num_points, hidden_dim)
             pt_layer = PointGroupLayer(hidden_dim, point_dim_feedforward, dropout, activation,
                                        self.num_feature_levels, nhead, dec_n_points,
-                                       across=point_across_attn, within_gate=point_within_gate)
+                                       across=point_across_attn, within_gate=point_within_gate,
+                                       unified_ca=point_unified_ca)
             self.decoder.pt_layers = _get_clones(pt_layer, self.num_layers)
+            # 统一 CA 链路（POINT_UNIFIED_CA）：非 None 时 decoder 逐层走「三个 SA → ca_all → ffn_all」，
+            # None（默认）时走原 ① 实例内 SA → ② 原层 → ③ 小穗 token 链路，行为与 full/combo 逐位一致。
+            assert set(point_sa_order) == {"group", "ww", "ss"} and len(point_sa_order) == 3, \
+                f"POINT_SA_ORDER 必须是 group/ww/ss 的一个排列，收到 {point_sa_order}"
+            self.decoder.pt_sa_order = tuple(point_sa_order) if point_unified_ca else None
             # 小穗 token 的 query pos：2-D 点的 sine 编码 → MLP（GroupPose 的 half_pose_ref_point_head）
             self.decoder.pt_ref_head = MLP(hidden_dim, hidden_dim, hidden_dim, 2)
             # 初始化与 TransformerDecoder._reset_parameters 相同
@@ -260,6 +268,9 @@ class MaskDINODecoder(nn.Module):
         ret["point_across_attn"] = cfg.MODEL.MaskDINO.POINT_ACROSS_ATTN
         ret["point_dim_feedforward"] = cfg.MODEL.MaskDINO.POINT_DIM_FEEDFORWARD
         ret["point_within_gate"] = cfg.MODEL.MaskDINO.POINT_WITHIN_GATE
+        # 统一 CA 链路（full/sa-order）
+        ret["point_unified_ca"] = cfg.MODEL.MaskDINO.POINT_UNIFIED_CA
+        ret["point_sa_order"] = tuple(cfg.MODEL.MaskDINO.POINT_SA_ORDER)
 
         return ret
 

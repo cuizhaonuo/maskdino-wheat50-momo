@@ -119,6 +119,22 @@ def add_maskdino_config(cfg):
     # 所有层的 pred_point_coords 变为图像归一化绝对坐标（criterion / 推理据此换算）。
     # False：原 MLP 点头，模型逐位不变。
     cfg.MODEL.MaskDINO.POINT_GROUP_DECODER = False
+    # ---- 统一 CA 链路（full/sa-order）：三个 SA 组件 + 一次 CA + 一次 FFN ----
+    # 与上面的「两路」链路的区别：不再分成「实例 token 一支 / 小穗 token 一支」各走一套 CA+FFN，
+    # 而是三个 SA 依次更新同一对缓冲 (ins, pts)，再把 N*(1+K) 个 token 堆起来做一次可变形 CA、一次 FFN。
+    # POINT_UNIFIED_CA=False（默认）：走现有链路（每层 ① 实例内 SA → ② 原 decoder layer 的
+    #   跨实例 SA / 4D 框 CA / FFN → ③ 小穗 token 的同 slot 跨实例 SA / 2D 点 CA / FFN），
+    #   行为与 full/combo 逐位一致（不建任何新参数，初始化随机序也不变）。
+    # POINT_UNIFIED_CA=True：每层按 POINT_SA_ORDER 依次跑 SA_group / SA_ww / SA_ss，然后
+    #   ca_all（全部 N*(1+K) 个 token 一次可变形 CA，新建 self.ca_all_attn）+ ffn_all（复用本层 FFN），
+    #   实例 token 的框参考点与小穗 token 的点参考点在这一步合流。仅在 POINT_GROUP_DECODER=True 时生效。
+    cfg.MODEL.MaskDINO.POINT_UNIFIED_CA = False
+    # 统一链路里三个 SA 组件的执行顺序，元素取 "group"/"ww"/"ss"，三者各出现且仅出现一次（6 种排列）：
+    #   "group" = 实例内 SA（同一实例的 1+K 个 token，含 within_gate 门与 pts 的 LayerNorm）
+    #   "ww"    = 跨实例 SA，复用原 decoder layer 的 self_attn（只作用于 N 个 wheat/实例 token）
+    #   "ss"    = 小穗 token 的同 slot 跨实例 SA（只作用于 N*K 个 spike token）
+    # 默认 ["group", "ww", "ss"] 即现有链路的先后关系，便于与 POINT_UNIFIED_CA=False 对照。
+    cfg.MODEL.MaskDINO.POINT_SA_ORDER = ["group", "ww", "ss"]
     # 小穗 token 的跨实例 SA："slot" = 第 k 号 token 与其它实例的第 k 号交流（GroupPose 原样）；
     # "none" = 不做（只经实例内 SA 间接获得跨实例信息）
     cfg.MODEL.MaskDINO.POINT_ACROSS_ATTN = "slot"
