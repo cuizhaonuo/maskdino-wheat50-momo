@@ -1,0 +1,16 @@
+# ============================================================================
+# full/sa-gsw · 完整集 · 统一 CA 链路 · SA 顺序 = group → ss → ww
+#   预注册：experiments-bank/ideas/full-sa-gsw-full.md（判定线跑之前写死）
+#   父配置 wheat_joint_single_stage_full_combo.yaml（A/B/C 三开关全开），
+#   本文件只改两处：POINT_UNIFIED_CA: True + POINT_SA_ORDER。
+#   用法：
+#     python train_net.py --num-gpus 1 \
+#       --config-file configs/coco/instance-segmentation/wheat_joint_single_stage_full_sa_gsw.yaml \
+#       OUTPUT_DIR <repo>/output_v2/exp-1030-full-sa-gsw
+# ============================================================================
+_BASE_: wheat_joint_single_stage_full_combo.yaml
+
+MODEL:
+  MaskDINO:
+    POINT_UNIFIED_CA: True
+    POINT_SA_ORDER: ["group", "ss", "ww"]
