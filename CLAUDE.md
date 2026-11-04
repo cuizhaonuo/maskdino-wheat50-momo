@@ -119,6 +119,32 @@ encoder (`modeling/pixel_decoder`, the `ops/` CUDA kernel lives here), and trans
   commented out as a history of tried schedules; only the last uncommented block is active.
 - **Outputs:** `output/` (v1) and `output_v2/` (v2) hold experiment dirs, each with `config.yaml` +
   `model_final.pth` — the shape `eval_datasets.sh` and the eval command expect. Both are gitignored.
+- **Every finished `train_net.py` training run gets written into `experiments-bank/`; a run that stopped
+  halfway does not.**
+  - *Finished* means the run reached its own `SOLVER.MAX_ITER` (read it from `<output_dir>/config.yaml`,
+    since CLI overrides can change it): `model_final.pth` exists and `log.txt` shows the last iter plus
+    the final eval. If the run was killed, crashed (OOM / NaN / exception) or stopped early, write
+    **nothing**, not even a partial doc. If it is later `--resume`d and finishes, write it then.
+    `--eval_only` runs are not training and don't count.
+  - Write the doc in the `experiments-bank/` of the branch/worktree the run was launched from. The
+    bank is tracked per branch, not shared. Name it `experiments/exp-YYYY-MM-DD-<name>.md` (date =
+    training start day) and follow the existing docs: a header table (验证想法 / 对照 / 配置 /
+    分支 @ commit / 输出 / 耗时 / 状态 `N/N iter · k/k 评估 · 报错数`), then the results. If a
+    pre-registration exists in `ideas/<name>.md`, judge the run against its 判否线 and link the new
+    doc from that idea file.
+- **No threshold sweep after `train_net.py` training finishes unless I say so.** Once a run is done,
+  write up what training and its built-in eval produced, then stop. Don't start a score-threshold /
+  count-threshold sweep on your own (`seg_infer.py`, a diag `--sweep`, or any other script). Ask first,
+  even when a comparison would only be fair after sweeping; say in the doc that the sweep hasn't been run.
+- **GPU: the only card allowed is the A100 on `ssh qiuhao` (GPU1). If it's busy, queue.**
+  - Every GPU job (training, eval, inference) goes to `ssh qiuhao`, pinned with
+    `CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1`. Never launch without the pin. qiuhao's GPU0
+    (RTX 4090), every card on `xuyu` / `baiju`, and any other machine are off-limits, even when
+    `nvidia-smi` shows them idle. The session's own host varies, so always `ssh qiuhao` explicitly.
+  - *Busy* means the A100 doesn't have enough free memory for the job (other people's processes live
+    on it too, so check `nvidia-smi` free memory rather than whether any process is present).
+    Then **queue**: wait for it to free up, e.g. a `setsid` loop that polls free memory / `kill -0 <pid>`
+    and launches once it fits. Never fall back to another card to avoid waiting.
 - **Branches:** active line is `wheat50-model-v2` (main/PR base is `wheat50-model-v1`). Output dir and
   branch are versioned together (`output_v2`).
 - **`myscripts/`** holds exactly two subdirs, no loose files:

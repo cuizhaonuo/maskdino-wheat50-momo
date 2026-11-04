@@ -81,6 +81,27 @@ for _tag, _ds in _STAGE_DATASETS.items():
             thing_dataset_id_to_contiguous_id={1: 0, 2: 1},
         )
 
+# ====== test2017：人工校正测试集（300 张，2026-10-09 完成修订）======
+# 底稿由 myscripts/wheat50/build_test2017_p30.py 生成（仅 D6/D8 未见原图，
+# 类别感知 NMS + 孪生去重），经 labelme 人工修订后由 labelme_test2017_to_coco.py 回写。
+# 伪标注原版备份在 annotations/instances_test2017_pseudo.json。
+_TEST_NAME = "wheat_cat2_pts_coco_test"
+DatasetCatalog.register(
+    _TEST_NAME,
+    lambda: load_coco_json(
+        "/public/home/zncui/datasets/wheat50/coco_2cat_with_points/annotations/instances_test2017.json",
+        "/public/home/zncui/datasets/wheat50/coco_2cat_with_points/test2017",
+        _TEST_NAME,
+        extra_annotation_keys=["points"],
+    ),
+)
+MetadataCatalog.get(_TEST_NAME).set(
+    thing_classes=["wheat", "wheat_2"],
+    thing_colors=[(255, 0, 0), (0, 0, 255)],
+    evaluator_type="coco",
+    thing_dataset_id_to_contiguous_id={1: 0, 2: 1},
+)
+
 # ====== Stage2 debug：10 图过拟合子集 ======
 # 标注 JSON 放在仓库内便于复现；图片直接复用带点训练集，不重复拷贝 1024x1024 原图。
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
